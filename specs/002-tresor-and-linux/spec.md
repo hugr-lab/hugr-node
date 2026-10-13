@@ -11,6 +11,9 @@
    to sync secrets itself.
 2. **hugr_node ships for Linux only: amd64 and arm64.** No macOS, Windows or WASM artifacts (duckdb-acl, the open
    node, keeps its full platform matrix).
+3. **No single-node mode** (2026-10-13): a hugr_node node is a cluster node, whatever the number of nodes - a
+   cluster may be one. What differs between one node and many is where the policy catalog and tresor's state live
+   (a local file / SQLite or a shared database) - the deployment's composition, not a mode of the node.
 
 ## Design
 
@@ -19,9 +22,14 @@
   `LoadTresorCore(loader)` under `TRESOR_EMBEDDED` (its entry point, extension class and `DUCKDB_EXTENSION_MAIN`
   not compiled). hugr_node's load: `LoadAclCore`, `LoadTresorCore`, then the platform part. Each keeps the OIDC core
   under its own namespace (`acl`, `tresor` - duckdb-ext-common charter R13), so the two copies never collide.
-- **The node's deployment**: with tresor always present, a hugr_node node is a cluster node by construction - the
-  secrets-only-in-the-service rule (spec 118's `acl_deployment = cluster`) becomes the node's default; whether the
-  setting stays as an override is a question for the owner.
+- **The node's deployment - the setting goes**: `acl_deployment` is removed from hugr_node; the `cluster_node` trait
+  is always true. The build is the deployment: duckdb-acl (the open node) registers no trait and is standalone by
+  construction (local secrets when no service is attached, spec 118), hugr_node is a cluster node - the profile,
+  drift, the `cluster` bundle, secrets only in the service. A switch would only re-open local secrets in a node's
+  files on a platform node. `RequireClusterDeployment` and its refusal go; `console_info.deployment` stays (it says
+  the build: `standalone` / `cluster`), so the plugin reads it unchanged. A one-node platform = hugr_node +
+  tresor-server (SQLite) [+ the orchestrator]; without a service attached the node starts and a principal's
+  `CREATE SECRET` is refused ("no secrets service").
 - **Pins**: tresor's submodule follows the same duckdb pin as duckdb-acl (both at bba7360 today) and the same
   duckdb-ext-common tag.
 - **Distribution**: a `distribution.yml` built on extension-ci-tools for `linux_amd64` and `linux_arm64` only
@@ -30,6 +38,8 @@
 
 ## Tests
 
+- The cluster tests stop setting `acl_deployment`; the standalone-refusal cases go; `hugr_node.test` checks that
+  `console_info` says `cluster` with no setting and that `SET GLOBAL acl_deployment` is unknown.
 - hugr-node CI: tresor's surface answers in hugr_node (its functions registered, `ATTACH ... (TYPE tresor)` refused
   without a server, as tresor's own tests do), the existing cluster tests unchanged.
 - The distribution build on both Linux legs: build, the extension loads, the suite.
@@ -48,6 +58,6 @@
 
 ## Open questions
 
-- `acl_deployment` on hugr_node: fixed `cluster`, or a default that can still be set `standalone`?
+- ~~`acl_deployment` on hugr_node~~ - removed: no single-node mode (owner, 2026-10-13; Design above).
 - ~~Which of tresor's own tests run in hugr-node~~ - the scenarios of tresor inside the cluster (above), against a
   real tresor-server on SQLite (owner, 2026-10-13); tresor's own suite stays tresor's.
