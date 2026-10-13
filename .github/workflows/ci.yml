@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    name: Lint (clang-format)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install duckdb's pinned clang-format
+        run: pip install clang_format==11.0.1
+      - name: clang-format check
+        run: |
+          find src test/cpp \( -name '*.cpp' -o -name '*.hpp' \) -print0 \
+            | xargs -0 clang-format --dry-run --Werror
+      - name: yamllint
+        run: |
+          pip install yamllint
+          yamllint -d '{extends: default, rules: {line-length: {max: 140}, document-start: disable, truthy: {check-keys: false}}}' .github/workflows
+
+  build-test-linux:
+    name: Build + test (linux_amd64)
+    runs-on: ubuntu-24.04
+    env:
+      GEN: ninja
+      # the built-in acl's Flight door needs Arrow from vcpkg: the distribution build carries it; this job is the
+      # platform part's tests, which need no door
+      ACL_NO_FLIGHT: 1
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: duckdb-acl's own submodules (the quack embed, the shared contracts - not its duckdb, ours is used)
+        run: git -C duckdb-acl submodule update --init --depth 1 third_party/quack duckdb-ext-common
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache
+
+      - name: Restore ccache
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: ccache-linux_amd64-${{ hashFiles('.gitmodules', 'duckdb/CMakeLists.txt') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-linux_amd64-${{ hashFiles('.gitmodules', 'duckdb/CMakeLists.txt') }}-
+            ccache-linux_amd64-
+
+      - name: Build
+        run: |
+          EXT_FLAGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" make
+          ccache -s
+
+      - name: The platform part's tests
+        run: build/release/test/unittest 'test/sql/*'
+
+      - name: C++ tests
+        run: make test-cpp

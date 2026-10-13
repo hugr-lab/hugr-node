@@ -13,7 +13,20 @@ The hugr platform's part of a node, on top of [duckdb-acl](https://github.com/hu
 duckdb-acl is the open node's access control (MIT). This repository plugs into it through the registration
 points of duckdb-acl's spec 126 and builds one extension with it (design: duckdb-acl `design/080`).
 
-> **Status: in progress** - the code moves here from duckdb-acl (its spec 127) before the duckdb-acl release.
+> **Status: in progress** - the code moved here from duckdb-acl with its history (spec 001; duckdb-acl spec 127).
+
+## Build
+
+```sh
+git submodule update --init
+git -C duckdb-acl submodule update --init third_party/quack duckdb-ext-common
+GEN=ninja make                      # the hugr_node extension (duckdb-acl built in) and its test binary
+build/release/test/unittest 'test/sql/*'
+make test-cpp
+```
+
+The built-in acl's Flight door takes Arrow from vcpkg (`VCPKG_TOOLCHAIN_PATH`, as duckdb-acl); `ACL_NO_FLIGHT=1`
+leaves it out.
 
 ## License
 

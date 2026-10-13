@@ -5,7 +5,7 @@
 #   applied only on the group's nodes, acl_cluster_effective), and what the load report says.
 # group: [sql]
 
-require acl
+require hugr_node
 
 statement ok
 SET GLOBAL acl_jwks_locations = 'test/idp/';

@@ -3,7 +3,7 @@
 #   definitions carry its roles (moved from acl_created_by.test, which runs on an open node too)
 # group: [cluster]
 
-require acl
+require hugr_node
 
 statement ok
 ATTACH ':memory:' AS store;

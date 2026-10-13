@@ -5,7 +5,7 @@
 #   dependency and refuses to remove what something still reads through
 # group: [sql]
 
-require acl
+require hugr_node
 
 # --- no catalog, no profile -------------------------------------------------------------------------
 

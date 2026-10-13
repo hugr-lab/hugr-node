@@ -1,0 +1,70 @@
+# name: test/sql/hugr_node.test
+# description: the platform node's extension is duckdb-acl's acl with the platform part (duckdb-acl spec 127): the
+#   acl surface answers, a principal's query is rewritten, the cluster scope and profile are there
+# group: [hugr_node]
+
+require hugr_node
+
+query I
+SELECT count(*) > 200 FROM duckdb_functions() WHERE function_name LIKE 'acl_%';
+----
+true
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+CREATE TABLE orders(id INTEGER, tenant VARCHAR);
+
+statement ok
+INSERT INTO orders VALUES (1, 'acme'), (2, 'globex');
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG sales;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE sales.orders AS memory.main.orders;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG sales TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT TABLE sales.orders TO ROLE analyst RLS (tenant = 'acme');
+
+# the embedded acl rewrites a principal's read
+query I
+ACL ROLE "analyst" SELECT id FROM orders;
+----
+1
+
+# the platform part is registered: the cluster scope, the profile's view, the CLUSTER grammar
+statement ok
+ACL ADMIN CREATE ROLE fleet;
+
+statement ok
+ACL ADMIN GRANT ADMIN cluster TO ROLE fleet;
+
+query T
+ACL ROLE "fleet" SELECT list_contains(scopes, 'cluster') AND list_contains(my_views, 'cluster_items') FROM platform.console_info();
+----
+true
+
+statement ok
+SET GLOBAL acl_deployment = 'cluster';
+
+statement ok
+ACL ADMIN CLUSTER SET threads = 2;
+
+query T
+SELECT name FROM acl_cluster_items();
+----
+threads

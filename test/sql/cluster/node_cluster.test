@@ -4,7 +4,7 @@
 #   it - ACL NATIVE stays unrestricted, its effect is shown, never refused
 # group: [sql]
 
-require acl
+require hugr_node
 
 statement ok
 SET GLOBAL acl_jwks_locations = 'test/idp/';
