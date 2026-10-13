@@ -1,0 +1,34 @@
+build
+.idea
+cmake-build-debug
+duckdb_unittest_tempdir/
+.DS_Store
+testext
+test/python/__pycache__/
+.Rhistory
+
+# IDE / clangd caches
+.cache/
+.vscode/*.log
+
+# local design / research scratch (not committed)
+design/
+
+# local integration-test environment config (copy of .env.example)
+.env
+
+# local vcpkg checkout + artifacts (make vcpkg-setup)
+vcpkg/
+vcpkg_installed/
+
+# python bytecode (test/bench, scripts)
+__pycache__/
+*.pyc
+
+# the docs site (website/): installed and built locally, deployed by pages.yml
+node_modules/
+.docusaurus/
+website/build/
+website/versioned_docs/
+website/versioned_sidebars/
+website/versions.json

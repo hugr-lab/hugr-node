@@ -1,0 +1,22 @@
+{
+    "dependencies": [
+        {
+            "name": "arrow",
+            "default-features": false,
+            "features": [
+                "flightsql"
+            ],
+            "platform": "!wasm32"
+        }
+    ],
+    "vcpkg-configuration": {
+        "overlay-ports": [
+            "./duckdb-acl/vcpkg_ports",
+            "./extension-ci-tools/vcpkg_ports"
+        ],
+        "overlay-triplets": [
+            "./duckdb-acl/vcpkg_triplets",
+            "./extension-ci-tools/toolchains"
+        ]
+    }
+}
