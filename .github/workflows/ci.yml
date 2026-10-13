@@ -29,7 +29,7 @@ jobs:
       - name: yamllint
         run: |
           pip install yamllint
-          yamllint -d '{extends: default, rules: {line-length: {max: 140}, document-start: disable, truthy: {check-keys: false}}}' .github/workflows
+          yamllint .github/workflows
 
   build-test-linux:
     name: Build + test (linux_amd64)
