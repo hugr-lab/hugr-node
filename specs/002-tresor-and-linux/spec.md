@@ -71,10 +71,11 @@
   `tresor_configure_targets(...)`; the entry is `LoadAclCore`, `LoadTresorCore`, `RegisterAclCluster`. The image
   exports one symbol (`hugr_node_duckdb_cpp_init`) and carries two copies of the OIDC core, `duckdb::acl::oidc` and
   `duckdb::tresor::oidc`, and tresor's keychain. Both submodules are on duckdb-ext-common 21a695d (v0.12.0) - the
-  configure refuses otherwise. acl's target-wide `DUCKDB_EXT_COMMON_OIDC_NAMESPACE=acl` meets tresor's source-level
-  `=tresor` on tresor's TUs: tresor's wins, with a `-Wmacro-redefined` warning per tresor TU (tresor spec 024's
-  follow-up for duckdb-acl; hugr_node does not build with `-Werror`).
-- duckdb-acl at its main d77d11e (spec 127 PR B: the platform part is only here now - the `REMOVE_ITEM` is gone).
+  configure refuses otherwise. At first acl's target-wide `DUCKDB_EXT_COMMON_OIDC_NAMESPACE=acl` met tresor's
+  source-level `=tresor` on tresor's TUs (tresor's won, with a `-Wmacro-redefined` warning per tresor TU); duckdb-acl's
+  spec 127 addendum (#226, 41f6759) puts acl's on acl's own sources, and the build is warning-free.
+- duckdb-acl at its main 41f6759 (spec 127 PR B: the platform part is only here now - the `REMOVE_ITEM` is gone; its
+  addendum: the OIDC definitions per source).
 - **The deployment setting goes**: `acl_deployment`, `RequireClusterDeployment` and drift's standalone refusal are
   removed; the `cluster_node` trait answers true; drift's bootstrap rows list `acl_node_group` alone.
 - **vcpkg in every build**: `openssl` beside Arrow in `vcpkg.json`; the Makefile always takes the toolchain
