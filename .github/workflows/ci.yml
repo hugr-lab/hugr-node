@@ -86,3 +86,21 @@ jobs:
 
       - name: C++ tests
         run: make test-cpp
+
+      # spec 002: tresor inside the cluster - a real tresor-server from its repository (its main), Keycloak in docker,
+      # two nodes of this build. It SKIPs on a developer's machine that lacks a tool; here it must have run
+      - name: tresor-server (its main)
+        uses: actions/checkout@v7
+        with:
+          repository: hugr-lab/tresor-server
+          path: _tresor-server
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: _tresor-server/go.mod
+          cache: false
+
+      - name: End to end - tresor inside the cluster
+        run: |
+          TRESOR_SERVER_DIR=_tresor-server make test-e2e 2>&1 | tee e2e.log
+          grep -q '^PASS: tresor in the cluster' e2e.log

@@ -37,6 +37,12 @@ test-cpp:
 	@$(MAKE) --no-print-directory $(TEST_CPP_BINS)
 	@for t in $(TEST_CPP_BINS); do echo "== $$t"; $$t || exit 1; done
 
+# --- end to end (spec 002): tresor inside the cluster - a real tresor-server (TRESOR_SERVER_DIR=<checkout>, else its
+# main is cloned) on SQLite, Keycloak in docker, two hugr_node nodes. Needs the build, docker, go; SKIPs without them
+.PHONY: test-e2e
+test-e2e:
+	test/e2e/tresor/run.sh
+
 # a local vcpkg checkout, as duckdb-acl's `make vcpkg-setup`
 .PHONY: vcpkg-setup
 vcpkg-setup:

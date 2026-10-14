@@ -1,7 +1,7 @@
 # Spec 002: tresor built in, and the Linux distribution
 
-- **Status**: in progress - part 1 built (tresor built in, the deployment setting gone, CI, the Linux distribution);
-  part 2 is the e2e of tresor inside the cluster
+- **Status**: implemented - part 1 (tresor built in, the deployment setting gone, CI, the Linux distribution) and
+  part 2 (the e2e of tresor inside the cluster); scenarios 2 and 6 are follow-ups (below)
 - **Date**: 2026-10-13
 - **Author**: the agent, from the owner's decisions of 2026-10-13
 
@@ -46,7 +46,8 @@
 - The distribution build on both Linux legs: build, the extension loads, the suite.
 - **e2e - tresor inside an acl cluster** (owner, 2026-10-13): a real tresor-server built from its repository with the
   SQLite state store (`state: {kind: sqlite}`, a local KEK), Keycloak in docker as the IdP (as tresor-server's
-  conformance run does), and two hugr_node nodes sharing one policy catalog. The scenarios:
+  conformance run does), and two hugr_node nodes (as built: each its own policy catalog from one bootstrap - what they
+  share is the service). The scenarios:
   1. **A secret written once reaches every node**: a principal's `CREATE PERSISTENT SECRET` on node A lands in the
      service (spec 082); node B reads it - no sync of its own.
   2. **The cluster profile's sources use the service's secrets**: `ACL CLUSTER ATTACH … (TYPE postgres, SECRET s)` on
@@ -92,3 +93,37 @@
   (tresor's test shell at the same pin): `acl_drain_status()` serving, 269 `acl_*` functions, the override STRICT.
 - Gate (macOS): the build, `test/sql/*` (10 files, 487 assertions), `make test-cpp` (its install case SKIPs without a
   postgres_scanner loadable, as before), yamllint, clang-format.
+
+## As built - part 2: tresor inside the cluster, end to end (2026-10-14)
+
+`test/e2e/tresor/run.sh` (`make test-e2e`; CI runs it after the suites and asserts it passed - on a developer's
+machine a missing tool is a SKIP):
+
+- **The service**: tresor-server built from its repository (`TRESOR_SERVER_DIR`, else its main is cloned; CI checks
+  out its main), state in SQLite with every row's MAC checked, sealed under a local KEK made for the run; Keycloak from
+  tresor's own test compose (`tresor/server/docker-compose.yml`, the realm tresor's suites use, a compose project of
+  its own); tresor-server's `testdata/keycloak/server.yaml` (etl and `role:secrets_admin` are service admins,
+  `client:acl-node` an actor) on this run's ports.
+- **The operator** seeds the service once, as etl: an `oidc_issuer` secret `kc_conn` (Keycloak's URL and its JWKS
+  pasted as `KEYS`), granted `use` to `role:nodes` - the nodes' service account.
+- **Two nodes side by side**: two hugr_node CLI processes, each driven through its stdin, each logged in to the service
+  as `acl-node` (`ATTACH 'tresor:…' AS node`), each with its own in-memory policy catalog from the same bootstrap -
+  `CREATE ISSUER kc FROM SECRET kc_conn IN node`, `node.act_for_sessions()`, a catalog with a `secrets` grant. What
+  they share is the service and nothing else.
+- Checked:
+  1. **the issuer's keys from the service** - a person's token (alice, through acl-door) opens a session on both
+     nodes;
+  2. **a secret written once reaches every node** - under bob's session (a service admin; node A acts for him) node A
+     writes `CREATE PERSISTENT SECRET shared_s (TYPE http, …)` and `ACL GRANT SECRET shared_s TO ROLE nodes`; node B,
+     which never had it, finds it (`which_secret`) within tresor's 30 s list refresh and reads its material
+     (`tresor_secret_param`);
+  3. **rotation reaches the running fleet** - `CREATE OR REPLACE` through A; the running B reads the new material
+     within 45 s, no restart;
+  4. **at rest** - the SQLite database (and its WAL) holds no copy of the secret's bearer token;
+  5. **fail closed** - the operator drops `kc_conn` from the service; on both nodes, after `acl_jwks_refresh('kc')`,
+     a fresh token opens no session.
+- **Not here yet**: scenario 2 of the design (a cluster profile source with the service's secret) needs a scanner that
+  takes a `SECRET` (postgres / mysql / mssql), which hugr-node's build does not carry - with the integration databases,
+  later; scenario 6 (the Flight door's node-group refusal, `test/e2e/flight_node_group.block.sh`) needs a Flight e2e
+  harness here (duckdb-acl's `test/e2e/flight/run.sh` drives its own build). A principal's secret refused without a
+  service (scenario 5) is `node_cluster.test`'s.
