@@ -26,6 +26,8 @@ git -C duckdb-acl submodule update --init third_party/quack duckdb-ext-common
 git -C tresor submodule update --init duckdb-ext-common
 make vcpkg-setup                    # once (or VCPKG_TOOLCHAIN_PATH=<an existing vcpkg>/scripts/buildsystems/vcpkg.cmake)
 GEN=ninja make                      # the hugr_node extension (acl and tresor built in) and its test binary
+HUGR_NODE_DEV=1 GEN=ninja make      # + json, autocomplete and httpfs linked in: the CLI acl-clients' dev node runs
+                                    #   (ACL_CLUSTER=1 dev/node.sh - an IdP's discovery is read through httpfs; spec 004)
 build/release/test/unittest 'test/sql/*'
 make test-cpp
 ```
