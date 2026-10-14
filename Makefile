@@ -4,12 +4,11 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 EXT_NAME=hugr_node
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
-# duckdb-acl's Flight door is part of the built-in acl: Arrow comes from vcpkg (duckdb-acl's Makefile says why),
-# ACL_NO_FLIGHT=1 drops it for a fast local loop
-ifeq ($(ACL_NO_FLIGHT),)
+# vcpkg always: the built-in acl's Flight door needs Arrow (duckdb-acl's Makefile says why) and the built-in tresor
+# OpenSSL (tresor spec 024) - the platform node is one configuration, the one it ships in. Bootstrap once with
+# `make vcpkg-setup`, or point VCPKG_TOOLCHAIN_PATH at an existing vcpkg checkout (duckdb-acl's will do)
 USE_MERGED_VCPKG_MANIFEST := 1
 VCPKG_TOOLCHAIN_PATH ?= $(PROJ_DIR)vcpkg/scripts/buildsystems/vcpkg.cmake
-endif
 
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
@@ -37,3 +36,9 @@ test-cpp:
 	@test -f $(TEST_CPP_DUCKDB_LIB) || { echo "test-cpp: $(TEST_CPP_DUCKDB_LIB) missing - run 'GEN=ninja make' first" >&2; exit 1; }
 	@$(MAKE) --no-print-directory $(TEST_CPP_BINS)
 	@for t in $(TEST_CPP_BINS); do echo "== $$t"; $$t || exit 1; done
+
+# a local vcpkg checkout, as duckdb-acl's `make vcpkg-setup`
+.PHONY: vcpkg-setup
+vcpkg-setup:
+	@test -d vcpkg || git clone https://github.com/microsoft/vcpkg.git vcpkg
+	./vcpkg/bootstrap-vcpkg.sh -disableMetrics

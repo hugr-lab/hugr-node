@@ -1,6 +1,7 @@
 # Spec 002: tresor built in, and the Linux distribution
 
-- **Status**: draft
+- **Status**: in progress - part 1 built (tresor built in, the deployment setting gone, CI, the Linux distribution);
+  part 2 is the e2e of tresor inside the cluster
 - **Date**: 2026-10-13
 - **Author**: the agent, from the owner's decisions of 2026-10-13
 
@@ -61,3 +62,33 @@
 - ~~`acl_deployment` on hugr_node~~ - removed: no single-node mode (owner, 2026-10-13; Design above).
 - ~~Which of tresor's own tests run in hugr-node~~ - the scenarios of tresor inside the cluster (above), against a
   real tresor-server on SQLite (owner, 2026-10-13); tresor's own suite stays tresor's.
+
+## As built - part 1 (2026-10-14)
+
+- **tresor built in** at tresor main e7c7c65 (its spec 024, #43): `set(TRESOR_EMBEDDED ON)` and
+  `include(tresor/tresor_sources.cmake)` after acl's file, `${TRESOR_SOURCES}` among the extension's sources,
+  `tresor_configure_targets(...)`; the entry is `LoadAclCore`, `LoadTresorCore`, `RegisterAclCluster`. The image
+  exports one symbol (`hugr_node_duckdb_cpp_init`) and carries two copies of the OIDC core, `duckdb::acl::oidc` and
+  `duckdb::tresor::oidc`, and tresor's keychain. Both submodules are on duckdb-ext-common 21a695d (v0.12.0) - the
+  configure refuses otherwise. acl's target-wide `DUCKDB_EXT_COMMON_OIDC_NAMESPACE=acl` meets tresor's source-level
+  `=tresor` on tresor's TUs: tresor's wins, with a `-Wmacro-redefined` warning per tresor TU (tresor spec 024's
+  follow-up for duckdb-acl; hugr_node does not build with `-Werror`).
+- duckdb-acl at its main d77d11e (spec 127 PR B: the platform part is only here now - the `REMOVE_ITEM` is gone).
+- **The deployment setting goes**: `acl_deployment`, `RequireClusterDeployment` and drift's standalone refusal are
+  removed; the `cluster_node` trait answers true; drift's bootstrap rows list `acl_node_group` alone.
+- **vcpkg in every build**: `openssl` beside Arrow in `vcpkg.json`; the Makefile always takes the toolchain
+  (`make vcpkg-setup` added); `ACL_NO_FLIGHT` is no longer this repository's (the platform node is one configuration).
+- **CI**: the linux job builds that configuration (Flight and tresor), its vcpkg packages from the family's R2 cache
+  (`vars.VCPKG_BINARY_SOURCES` + the `VCPKG_CACHING_AWS_*` secrets, duckdb's public read-only cache without them).
+- **Distribution** (`distribution.yml`): duckdb-acl's reusable workflow and inputs, `exclude_archs` leaving
+  `linux_amd64` and `linux_arm64` (the musl legs and windows_arm64 are opt-in, so not built), the R2 cache. Publishing
+  to the hugr extension repository is a follow-up for when that repository takes uploads; until then the artifacts
+  are the workflow's.
+- Tests: `hugr_node.test` - autoloading off, `console_info.deployment` = `cluster` with nothing set, tresor's version,
+  neither `acl` nor `tresor` loaded beside, both ATTACH spellings reaching tresor's discovery, the `tresor` secret
+  type, a tresor setting; `node_cluster.test` - `acl_deployment` is an unknown setting, the cluster bundle is offered
+  all of the profile, a principal's `CREATE SECRET` without a service is refused; the other cluster tests no longer
+  set the deployment. The loadable, copied out of the tree, loads into a duckdb CLI that carries neither acl nor tresor
+  (tresor's test shell at the same pin): `acl_drain_status()` serving, 269 `acl_*` functions, the override STRICT.
+- Gate (macOS): the build, `test/sql/*` (10 files, 487 assertions), `make test-cpp` (its install case SKIPs without a
+  postgres_scanner loadable, as before), yamllint, clang-format.

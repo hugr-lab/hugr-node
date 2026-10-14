@@ -9,3 +9,7 @@
 [submodule "duckdb-acl"]
 	path = duckdb-acl
 	url = https://github.com/hugr-lab/duckdb-acl
+[submodule "tresor"]
+	path = tresor
+	url = https://github.com/hugr-lab/tresor
+	branch = main

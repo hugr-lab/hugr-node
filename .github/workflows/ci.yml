@@ -36,22 +36,36 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       GEN: ninja
-      # the built-in acl's Flight door needs Arrow from vcpkg: the distribution build carries it; this job is the
-      # platform part's tests, which need no door
-      ACL_NO_FLIGHT: 1
       CCACHE_DIR: ${{ github.workspace }}/.ccache
+      # The platform node is one configuration (spec 002): the built-in acl's Flight door (Arrow) and the built-in
+      # tresor (OpenSSL) come from vcpkg. Its packages come from the family's R2 cache (duckdb-acl's
+      # docs/vcpkg-cache-r2.md) when this repository has it, else from duckdb's public read-only cache - slow, correct.
+      VCPKG_BINARY_SOURCES: >-
+        ${{ vars.VCPKG_BINARY_SOURCES != '' && vars.VCPKG_BINARY_SOURCES
+        || 'clear;http,https://vcpkg-cache.duckdb.org,read' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.VCPKG_CACHING_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.VCPKG_CACHING_AWS_SECRET_ACCESS_KEY }}
+      AWS_ENDPOINT_URL: ${{ secrets.VCPKG_CACHING_AWS_ENDPOINT_URL }}
+      AWS_DEFAULT_REGION: ${{ secrets.VCPKG_CACHING_AWS_DEFAULT_REGION }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: true
 
-      - name: duckdb-acl's own submodules (the quack embed, the shared contracts - not its duckdb, ours is used)
-        run: git -C duckdb-acl submodule update --init --depth 1 third_party/quack duckdb-ext-common
+      # the nested submodules the build compiles - not their duckdb checkouts: ours is the one used
+      - name: duckdb-acl's and tresor's own submodules (the quack embed, the shared contracts)
+        run: |
+          git -C duckdb-acl submodule update --init --depth 1 third_party/quack duckdb-ext-common
+          git -C tresor submodule update --init --depth 1 duckdb-ext-common
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build ccache
+
+      - name: Setup vcpkg
+        run: make vcpkg-setup
 
       - name: Restore ccache
         uses: actions/cache@v6
@@ -67,7 +81,7 @@ jobs:
           EXT_FLAGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" make
           ccache -s
 
-      - name: The platform part's tests
+      - name: The node's tests
         run: build/release/test/unittest 'test/sql/*'
 
       - name: C++ tests

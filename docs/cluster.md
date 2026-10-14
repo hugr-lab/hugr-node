@@ -36,10 +36,11 @@ CLUSTER SET <setting> = <value> [IN GROUP <group>]
 CLUSTER RESET <setting> [IN GROUP <group>]
 ```
 
-**A cluster node's** (spec 118): the profile exists where the deployment starts the node with `SET
-GLOBAL acl_deployment = 'cluster'` (GLOBAL-only, never the policy's nor the profile's; default
-`standalone`). On a standalone node every `CLUSTER` write is refused - its bootstrap SQL and its admin's
-`ACL NATIVE` configure it - while the profile's listings still read.
+**A cluster node's** (spec 118): every hugr_node node is a cluster node, whatever the number of nodes - a cluster
+may be one (hugr-node spec 002: there is no single-node mode and no setting to choose one). One node and many differ
+only in where the policy catalog and the secrets service's state live - a local file or a shared database - which is
+the deployment's composition, not a mode of the node. The open node - duckdb-acl's own `acl` - has no profile at all:
+its bootstrap SQL and its admin's `ACL NATIVE` configure it.
 
 The cluster profile is the shared part of every node's bootstrap (spec 093): which extensions a node
 runs, which sources it attaches and which settings it carries. It lives in the policy catalog as
@@ -120,13 +121,12 @@ bootstrap. The node agent rolls drain and restart changes out; acl only describe
   windows and timeouts (`acl_max_sessions`, `acl_max_result_rows`, `acl_quack_*` sizes, `acl_*_timeout`,
   `acl_alias_types` / `acl_enum_types`, `acl_lineage_namespace` / `_level`, `acl_profile_level`, ...).
   Anything else - a data path (`http_proxy*`, `temp_directory`, an endpoint, a log or audit sink), a key
-  location, the audit, a repository - is `passthrough`'s. `acl_deployment` and `acl_node_group` are the
-  deployment's, never items.
+  location, the audit, a repository - is `passthrough`'s. `acl_node_group` is the deployment's, never an item.
 - **Drift** (spec 118): `platform.drift` (the `cluster` bundle) lists what this node carries against its
   effective profile - per database, loaded extension and profiled setting a `state`: `same`, `differs`
   (`node_value` / `profile_value`), `node_only` (an `ACL NATIVE` ATTACH, say), `profile_only` (the node
   lacks it) or `bootstrap` (the default database, the policy's, a secrets service, statically linked
-  extensions and acl, `acl_deployment` / `acl_node_group` - listed so nothing is hidden). A source is
+  extensions and acl, `acl_node_group` - listed so nothing is hidden). A source is
   compared by its type (the path is shown, not judged: duckdb shows a file path absolute), a setting by
   the value duckdb would show (`4GB` = `3.7 GiB`); a setting the profile does not name is not compared. A
   database that is not a file shows its type, never its path - an attach written natively may carry a

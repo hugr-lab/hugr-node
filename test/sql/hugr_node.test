@@ -1,9 +1,17 @@
 # name: test/sql/hugr_node.test
-# description: the platform node's extension is duckdb-acl's acl with the platform part (duckdb-acl spec 127): the
-#   acl surface answers, a principal's query is rewritten, the cluster scope and profile are there
+# description: the platform node's extension is duckdb-acl's acl and tresor with the platform part (duckdb-acl spec
+#   127, tresor spec 024, spec 002): the acl surface answers, a principal's query is rewritten, the cluster scope and
+#   profile are there, the node is a cluster node with nothing set, tresor's surface is built in
 # group: [hugr_node]
 
 require hugr_node
+
+# nothing may load acl or tresor beside it: everything below is hugr_node's own copy
+statement ok
+SET autoload_known_extensions = false;
+
+statement ok
+SET autoinstall_known_extensions = false;
 
 query I
 SELECT count(*) > 200 FROM duckdb_functions() WHERE function_name LIKE 'acl_%';
@@ -53,13 +61,12 @@ ACL ADMIN CREATE ROLE fleet;
 statement ok
 ACL ADMIN GRANT ADMIN cluster TO ROLE fleet;
 
-query T
-ACL ROLE "fleet" SELECT list_contains(scopes, 'cluster') AND list_contains(my_views, 'cluster_items') FROM platform.console_info();
+# a cluster node by construction, nothing set (spec 002)
+query TT
+ACL ROLE "fleet" SELECT deployment, list_contains(scopes, 'cluster') AND list_contains(my_views, 'cluster_items')
+FROM platform.console_info();
 ----
-true
-
-statement ok
-SET GLOBAL acl_deployment = 'cluster';
+cluster	true
 
 statement ok
 ACL ADMIN CLUSTER SET threads = 2;
@@ -68,3 +75,39 @@ query T
 SELECT name FROM acl_cluster_items();
 ----
 threads
+
+# --- tresor is built in (spec 002, tresor spec 024) -------------------------------------------------------------
+
+# tresor's own version (tresor_sources.cmake defines it from tresor's git), and no tresor extension loaded beside
+query I
+SELECT tresor_version() <> '';
+----
+true
+
+query I
+SELECT count(*) FROM duckdb_extensions() WHERE extension_name IN ('acl', 'tresor') AND loaded;
+----
+0
+
+# its ATTACH type, both spellings, reaching tresor's discovery
+statement error
+ATTACH 'tresor:secrets.example.invalid' AS corp;
+----
+<REGEX>:.*tresor: discovery of secrets.example.invalid failed.*
+
+statement error
+ATTACH 'secrets.example.invalid:8443/v1' AS corp (TYPE tresor);
+----
+<REGEX>:.*tresor: discovery of secrets.example.invalid:8443/v1 failed.*
+
+# its secret type and its settings
+statement ok
+CREATE SECRET held (TYPE tresor, SCOPE 'tresor:elsewhere', FLOW 'token', TOKEN 'static-token');
+
+query I
+SELECT type FROM duckdb_secrets() WHERE name = 'held';
+----
+tresor
+
+statement ok
+SET tresor_keychain = 'off';

@@ -1,7 +1,7 @@
 # name: test/sql/cluster/node_cluster.test
-# description: spec 118.2 - two deployments (acl_deployment): a standalone node has no cluster profile, a
-#   cluster node's profile is what the fleet runs and platform.drift shows what this node carries against
-#   it - ACL NATIVE stays unrestricted, its effect is shown, never refused
+# description: spec 118.2 - a cluster node's profile is what the fleet runs and platform.drift shows what this node
+#   carries against it - ACL NATIVE stays unrestricted, its effect is shown, never refused. hugr-node spec 002: a
+#   hugr_node node is a cluster node by construction (no acl_deployment: no single-node mode to switch to)
 # group: [sql]
 
 require hugr_node
@@ -39,87 +39,27 @@ ACL ADMIN CREATE ROLE keeper;
 statement ok
 ACL ADMIN GRANT CATALOG c TO ROLE keeper WITH (select, secrets) MAIN;
 
-# --- the deployment's setting: GLOBAL, two values, never a profile item ---------------------------------
-
-query I
-SELECT current_setting('acl_deployment');
-----
-standalone
+# --- the node is a cluster node, whatever the number of nodes: nothing to set ----------------------------
 
 statement error
-SET acl_deployment = 'cluster';
+SET GLOBAL acl_deployment = 'standalone';
 ----
-<REGEX>:.*acl_deployment is global.*
+<REGEX>:.*unrecognized configuration parameter "acl_deployment".*
 
-statement error
-SET GLOBAL acl_deployment = 'fleet';
-----
-<REGEX>:.*acl_deployment is 'standalone' or 'cluster'.*
-
-# --- standalone: no cluster profile, no drift ---------------------------------------------------------
-
-statement error
-ACL ADMIN CLUSTER SET threads = 2;
-----
-<REGEX>:.*this node is standalone \(acl_deployment\) - it has no cluster profile.*
-
-statement error
-ACL ROLE "root" CLUSTER ATTACH ':memory:' AS src (TYPE duckdb);
-----
-<REGEX>:.*this node is standalone.*
-
-statement error
-ACL ROLE "root" SELECT * FROM platform.drift;
-----
-<REGEX>:.*this node is standalone \(acl_deployment\) - drift is a cluster node's.*
-
-# reading the (empty) profile stays possible
+# reading the (empty) profile
 query I
 SELECT acl_cluster_version();
 ----
 0
 
-# spec 125: the node says what it is - and a standalone node does not offer what it refuses (the profile's
-# writes, drift); the profile's reads stay
-query TTTT
-ACL ROLE "fleet" SELECT deployment, scopes, list_contains(my_views, 'drift'), list_contains(my_views, 'cluster_items')
+# spec 125: the node says what it is, and offers the holder of the cluster bundle all of it - the profile's
+# writes and drift
+query TTTI
+ACL ROLE "fleet" SELECT deployment, scopes, list_contains(my_views, 'drift'),
+    len(list_filter(my_functions, lambda f: f LIKE 'cluster_%'))
 FROM platform.console_info();
 ----
-standalone	[observe, operate, cluster, policy, manage, passthrough]	false	true
-
-query I
-ACL ROLE "fleet" SELECT len(list_filter(my_functions, lambda f: f LIKE 'cluster_%')) FROM platform.console_info();
-----
-0
-
-# a standalone node keeps a principal's secret itself (spec 118.1)
-statement ok
-ACL ROLE "keeper" CREATE SECRET s (TYPE http, BEARER_TOKEN 'v');
-
-statement ok
-ACL ROLE "keeper" DROP SECRET s;
-
-# --- a cluster node ----------------------------------------------------------------------------------
-
-statement ok
-SET GLOBAL acl_deployment = 'CLUSTER';
-
-query I
-SELECT current_setting('acl_deployment');
-----
-cluster
-
-# spec 125: on a cluster node the same holder is offered all of it
-query TTI
-ACL ROLE "fleet" SELECT deployment, list_contains(my_views, 'drift'), len(list_filter(my_functions, lambda f: f LIKE 'cluster_%'))
-FROM platform.console_info();
-----
-cluster	true	4
-
-statement error
-ACL ADMIN CLUSTER SET acl_deployment = 'standalone';
-----
-<REGEX>:.*"acl_deployment" is the node's own.*never a cluster profile item.*
+cluster	[observe, operate, cluster, policy, manage, passthrough]	true	4
 
 # secrets only in the secrets service: without one, refused
 statement error
@@ -155,7 +95,6 @@ setting	threads	differs	5	3
 query TT
 ACL ROLE "fleet" SELECT name, state FROM platform.drift WHERE state = 'bootstrap' AND kind IN ('database', 'setting') ORDER BY name;
 ----
-acl_deployment	bootstrap
 acl_node_group	bootstrap
 memory	bootstrap
 store	bootstrap
