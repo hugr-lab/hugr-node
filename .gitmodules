@@ -13,3 +13,7 @@
 	path = tresor
 	url = https://github.com/hugr-lab/tresor
 	branch = main
+[submodule "acl-otel"]
+	path = acl-otel
+	url = https://github.com/hugr-lab/acl-otel
+	branch = main

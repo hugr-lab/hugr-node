@@ -122,6 +122,14 @@ bootstrap. The node agent rolls drain and restart changes out; acl only describe
   `acl_alias_types` / `acl_enum_types`, `acl_lineage_namespace` / `_level`, `acl_profile_level`, ...).
   Anything else - a data path (`http_proxy*`, `temp_directory`, an endpoint, a log or audit sink), a key
   location, the audit, a repository - is `passthrough`'s. `acl_node_group` is the deployment's, never an item.
+- **The telemetry's destination is the cluster's** (spec 005): acl_otel, built into hugr_node, exports nothing until
+  `acl_otel_endpoint` (OTLP) or `acl_otel_lineage` (OpenLineage) is set. Where it goes - `acl_otel_endpoint`,
+  `acl_otel_protocol`, `acl_otel_insecure`, `acl_otel_certificate`, `acl_otel_lineage`, `acl_otel_lineage_endpoint`,
+  `acl_otel_lineage_secret` - is one destination for the whole cluster: a `CLUSTER SET` of them without `IN GROUP`
+  (an endpoint is `passthrough`'s, above), refused with `IN GROUP`. acl_otel's other settings (batching, intervals,
+  series, rules) may be a group's. The lineage key is a secret of the secrets service, named by
+  `acl_otel_lineage_secret` - never a value in the profile. A node's own environment (`OTEL_EXPORTER_OTLP_*`,
+  `OPENLINEAGE_URL`) is its deployment's, as its bootstrap is.
 - **Drift** (spec 118): `platform.drift` (the `cluster` bundle) lists what this node carries against its
   effective profile - per database, loaded extension and profiled setting a `state`: `same`, `differs`
   (`node_value` / `profile_value`), `node_only` (an `ACL NATIVE` ATTACH, say), `profile_only` (the node

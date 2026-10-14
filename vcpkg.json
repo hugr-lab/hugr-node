@@ -2,6 +2,15 @@
     "dependencies": [
         "openssl",
         {
+            "name": "opentelemetry-cpp",
+            "default-features": false,
+            "features": [
+                "otlp-http",
+                "otlp-grpc"
+            ],
+            "platform": "!wasm32"
+        },
+        {
             "name": "arrow",
             "default-features": false,
             "features": [

@@ -38,10 +38,12 @@ test-cpp:
 	@for t in $(TEST_CPP_BINS); do echo "== $$t"; $$t || exit 1; done
 
 # --- end to end (spec 002): tresor inside the cluster - a real tresor-server (TRESOR_SERVER_DIR=<checkout>, else its
-# main is cloned) on SQLite, Keycloak in docker, two hugr_node nodes. Needs the build, docker, go; SKIPs without them
+# main is cloned) on SQLite, Keycloak in docker, two hugr_node nodes. Needs the build, docker, go; SKIPs without them.
+# spec 005: acl_otel's export from a node to a fake OTLP receiver (python) - inert with no endpoint, records after one
 .PHONY: test-e2e
 test-e2e:
 	test/e2e/tresor/run.sh
+	test/e2e/otel/run.sh
 
 # a local vcpkg checkout, as duckdb-acl's `make vcpkg-setup`
 .PHONY: vcpkg-setup

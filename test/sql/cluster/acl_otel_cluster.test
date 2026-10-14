@@ -1,0 +1,115 @@
+# name: test/sql/cluster/acl_otel_cluster.test
+# description: spec 005 - where the cluster's telemetry goes is one destination for the whole cluster: acl_otel's
+#   endpoint, protocol, TLS and lineage backend are profile items of the cluster's scope, never of a group's; the
+#   rest of acl_otel's settings may be a group's
+# group: [sql]
+
+require hugr_node
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP etl (window_start 8);
+
+# --- the destination: the cluster's, never a group's -----------------------------------------------
+
+foreach name acl_otel_endpoint acl_otel_protocol acl_otel_certificate acl_otel_lineage acl_otel_lineage_endpoint acl_otel_lineage_secret
+
+statement error
+ACL ADMIN CLUSTER SET {name} = 'x' IN GROUP etl;
+----
+<REGEX>:.*" is where the cluster's telemetry goes - one destination for the whole cluster: write it without IN GROUP.*
+
+endloop
+
+statement error
+ACL ADMIN CLUSTER SET acl_otel_insecure = true IN GROUP etl;
+----
+<REGEX>:.*"acl_otel_insecure" is where the cluster's telemetry goes.*
+
+# the case of the name changes nothing
+statement error
+SELECT acl_cluster_setting('set', 'etl', 'ACL_OTEL_ENDPOINT', 'http://collector:4318');
+----
+<REGEX>:.*one destination for the whole cluster.*
+
+# for the whole cluster: written, the restart class (the node agent rolls it out), nothing applied here
+query TT
+SELECT r.class, r.applied_here FROM (SELECT acl_cluster_setting('set', '', 'acl_otel_endpoint', 'http://collector.example:4318') AS r);
+----
+restart	false
+
+statement ok
+ACL ADMIN CLUSTER SET acl_otel_lineage = 'http://marquez.example:5000';
+
+query TT
+SELECT name, spec FROM acl_cluster_items() WHERE name LIKE 'acl_otel_%' ORDER BY name;
+----
+acl_otel_endpoint	{"value": "http://collector.example:4318"}
+acl_otel_lineage	{"value": "http://marquez.example:5000"}
+
+query T
+SELECT current_setting('acl_otel_endpoint');
+----
+(empty)
+
+# a group's RESET of a destination is no write either - there is none to remove
+statement error
+ACL ADMIN CLUSTER RESET acl_otel_endpoint IN GROUP etl;
+----
+<REGEX>:.*setting "acl_otel_endpoint" is not in the profile.*
+
+# --- who writes the destination: passthrough, not the cluster bundle (an endpoint is a data path) --------
+
+statement ok
+ACL ADMIN CREATE ROLE fleet;
+
+statement ok
+ACL ADMIN GRANT ADMIN cluster TO ROLE fleet;
+
+statement error
+ACL ROLE "fleet" CLUSTER SET acl_otel_endpoint = 'http://collector.example:4318';
+----
+<REGEX>:.*"acl_otel_endpoint" is not among the settings the cluster bundle sets.*
+
+statement ok
+ACL ADMIN CREATE ROLE root;
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE root;
+
+statement ok
+ACL ROLE "root" CLUSTER SET acl_otel_endpoint = 'http://collector.example:4318';
+
+query T
+SELECT spec FROM acl_cluster_items() WHERE name = 'acl_otel_endpoint';
+----
+{"value": "http://collector.example:4318"}
+
+# --- what is not the destination may be a group's -------------------------------------------------
+
+statement ok
+ACL ADMIN CLUSTER SET acl_otel_flush_interval = 2 IN GROUP etl;
+
+query TTT
+SELECT scope, name, spec FROM acl_cluster_items() WHERE scope = 'etl';
+----
+etl	acl_otel_flush_interval	{"value": "2"}
+
+statement ok
+ACL ADMIN CLUSTER RESET acl_otel_endpoint;
+
+statement ok
+ACL ADMIN CLUSTER RESET acl_otel_lineage;
+
+query I
+SELECT count(*) FROM acl_cluster_items() WHERE scope = '' AND name LIKE 'acl_otel_%';
+----
+0

@@ -1,14 +1,16 @@
 // hugr_node: duckdb-acl's acl, loaded whole (LoadAclCore - duckdb-acl spec 127), tresor loaded whole (LoadTresorCore -
 // tresor spec 024: a platform node's secrets live in the secrets service, spec 002), then the platform part registered
 // on acl's store through acl's registration points (duckdb-acl spec 126): the cluster profile, node groups' traits,
-// drift and the cluster bundle (acl_cluster.cpp). A platform node loads this instead of acl and tresor, never beside
-// either.
+// drift and the cluster bundle (acl_cluster.cpp). acl_otel is loaded whole after both (LoadAclOtelCore - acl-otel spec
+// 024, spec 005): it attaches to acl's and tresor's hook registries and exports nothing until an endpoint is set. A
+// platform node loads this instead of acl, tresor and acl_otel, never beside any of them.
 #define DUCKDB_EXTENSION_MAIN
 
 #include "hugr_node_extension.hpp"
 
 #include "acl_cluster.hpp"
 #include "acl_extension.hpp"
+#include "acl_otel_extension.hpp"
 #include "tresor_extension.hpp"
 
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -20,6 +22,7 @@ namespace {
 void LoadInternal(ExtensionLoader &loader) {
 	auto store = LoadAclCore(loader);
 	LoadTresorCore(loader);
+	LoadAclOtelCore(loader);
 	acl::RegisterAclCluster(loader, store);
 }
 
