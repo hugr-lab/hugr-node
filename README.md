@@ -6,12 +6,15 @@ The hugr platform's part of a node, on top of [duckdb-acl](https://github.com/hu
   policy catalog as desired state (`ACL CLUSTER …`);
 - **node groups** - a resource group as a set of nodes, and placement of principals onto them;
 - **drift** - what a node carries against its profile;
-- the node's **deployment** (a platform node keeps secrets only in its secrets service) and the **`cluster`**
-  admin bundle;
+- the **`cluster`** admin bundle; a hugr_node node is a cluster node by construction (a cluster may be one node) and
+  keeps secrets only in its secrets service - tresor, built in;
 - later: the node agent that converges a fleet with the platform's control plane.
 
-duckdb-acl is the open node's access control (MIT). This repository plugs into it through the registration
-points of duckdb-acl's spec 126 and builds one extension with it (design: duckdb-acl `design/080`).
+duckdb-acl is the open node's access control (MIT), tresor its client of the secrets service (MIT). This repository
+builds one extension, `hugr_node`, from both and its own part, which plugs into acl through the registration points
+of duckdb-acl's spec 126 (design: duckdb-acl `design/080`). A platform node loads `hugr_node` instead of `acl` and
+`tresor`, never beside them. Distributed for Linux amd64 and arm64 only (spec 002); it builds anywhere duckdb-acl
+does, for development.
 
 > **Status: in progress** - the code moved here from duckdb-acl with its history (spec 001; duckdb-acl spec 127).
 
@@ -20,13 +23,15 @@ points of duckdb-acl's spec 126 and builds one extension with it (design: duckdb
 ```sh
 git submodule update --init
 git -C duckdb-acl submodule update --init third_party/quack duckdb-ext-common
-GEN=ninja make                      # the hugr_node extension (duckdb-acl built in) and its test binary
+git -C tresor submodule update --init duckdb-ext-common
+make vcpkg-setup                    # once (or VCPKG_TOOLCHAIN_PATH=<an existing vcpkg>/scripts/buildsystems/vcpkg.cmake)
+GEN=ninja make                      # the hugr_node extension (acl and tresor built in) and its test binary
 build/release/test/unittest 'test/sql/*'
 make test-cpp
 ```
 
-The built-in acl's Flight door takes Arrow from vcpkg (`VCPKG_TOOLCHAIN_PATH`, as duckdb-acl); `ACL_NO_FLIGHT=1`
-leaves it out.
+vcpkg is part of every build: the built-in acl's Flight door takes Arrow from it, the built-in tresor OpenSSL. duckdb-acl
+and tresor must carry the same duckdb-ext-common (tresor's configure refuses otherwise).
 
 ## License
 

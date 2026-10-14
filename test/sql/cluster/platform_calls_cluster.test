@@ -13,9 +13,6 @@ statement ok
 SELECT acl_use_db('store', 'acl', true);
 
 statement ok
-SET GLOBAL acl_deployment = 'cluster';
-
-statement ok
 SET GLOBAL acl_allow_anonymous_admin=true;
 
 statement ok

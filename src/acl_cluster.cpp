@@ -299,17 +299,6 @@ void RequireClusterCatalog(const unique_ptr<CatalogBackend> &catalog, const char
 	}
 }
 
-//! spec 118: a standalone node has no cluster profile - its bootstrap SQL and its admin's ACL NATIVE
-//! configure it; the profile is a cluster node's (acl_deployment, set by the deployment)
-void RequireClusterDeployment(PolicyStore &store, const char *what) {
-	if (!store.ClusterNode()) {
-		throw BinderException("%s: this node is standalone (acl_deployment) - it has no cluster profile; its "
-		                      "bootstrap and ACL NATIVE configure it, or its deployment starts it with SET GLOBAL "
-		                      "acl_deployment = 'cluster'",
-		                      what);
-	}
-}
-
 using ReadFn = std::function<unique_ptr<QueryResult>(const string &)>;
 
 void RequireScope(const ReadFn &read, CatalogBackend &catalog, const string &scope) {
@@ -392,7 +381,6 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, con
                                                          const string &version, const string &repository,
                                                          const string &comment) {
 	RequireClusterCatalog(catalog, "acl_cluster_extension");
-	RequireClusterDeployment(*this, "acl_cluster_extension");
 	auto db = instance.lock();
 	if (!db) {
 		throw BinderException("acl cluster: the instance is gone");
@@ -500,7 +488,6 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
                                                       const string &options_json, const vector<string> &depends_on,
                                                       const string &comment, const string &lineage) {
 	RequireClusterCatalog(catalog, "acl_cluster_attach");
-	RequireClusterDeployment(*this, "acl_cluster_attach");
 	auto db = instance.lock();
 	if (!db) {
 		throw BinderException("acl cluster: the instance is gone");
@@ -622,7 +609,6 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const string &alias, bool cascade,
                                                       bool force) {
 	RequireClusterCatalog(catalog, "acl_cluster_detach");
-	RequireClusterDeployment(*this, "acl_cluster_detach");
 	auto db = instance.lock();
 	if (!db) {
 		throw BinderException("acl cluster: the instance is gone");
@@ -829,7 +815,6 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const
 PolicyStore::ClusterAnswer PolicyStore::ClusterSetting(const string &verb, const string &scope, const string &name,
                                                        const string &value) {
 	RequireClusterCatalog(catalog, "acl_cluster_setting");
-	RequireClusterDeployment(*this, "acl_cluster_setting");
 	auto db = instance.lock();
 	if (!db) {
 		throw BinderException("acl cluster: the instance is gone");
@@ -842,10 +827,6 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterSetting(const string &verb, const
 		throw BinderException("acl cluster: \"%s\" is the node's hardening, fixed by its bootstrap - never a "
 		                      "cluster profile item",
 		                      name);
-	}
-	if (StringUtil::CIEquals(name, "acl_deployment")) {
-		throw BinderException("acl cluster: \"acl_deployment\" is the node's own (its deployment sets it) - never a "
-		                      "cluster profile item");
 	}
 	if (StringUtil::CIEquals(name, "acl_node_group")) {
 		// spec 096: which group a node is in is its deployment's, never the policy's - a profile item
@@ -894,10 +875,6 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterSetting(const string &verb, const
 
 vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 	RequireClusterCatalog(catalog, "acl_platform_drift");
-	if (!ClusterNode()) {
-		throw BinderException("acl_platform_drift: this node is standalone (acl_deployment) - drift is a cluster "
-		                      "node's, measured against its cluster profile");
-	}
 	auto db = instance.lock();
 	if (!db) {
 		throw BinderException("acl cluster: the instance is gone");
@@ -1014,7 +991,7 @@ vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 			out.push_back({"setting", item.first, same ? "same" : "differs", value, wanted, item.second->scope});
 		}
 	}
-	for (auto name : {"acl_deployment", "acl_node_group"}) {
+	for (auto name : {"acl_node_group"}) {
 		Value value;
 		db->TryGetCurrentSetting(name, value);
 		out.push_back({"setting", name, "bootstrap", value.IsNull() ? string() : value.ToString(), "", ""});
@@ -1574,28 +1551,8 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	RegisterMgmtGrammar("cluster", ParseCluster);
 	RegisterAdminScope(AdminScope::CLUSTER);
 
-	// spec 126: the node's deployment and group are the platform part's settings and traits
+	// spec 126: the node's group is the platform part's setting and trait
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
-	// spec 118: what this node is - a standalone node (its bootstrap SQL and its admin's ACL NATIVE configure
-	// it; no cluster profile) or a cluster node (the profile configures the fleet, tresor keeps its secrets).
-	// A security mode never follows from the policy's contents: the deployment sets it
-	config.AddExtensionOption(
-	    "acl_deployment",
-	    "acl: 'standalone' (the default - configured by its bootstrap, no cluster profile) or 'cluster' (the "
-	    "cluster profile, drift, secrets only in the secrets service). Set by the deployment, never by the policy",
-	    LogicalType::VARCHAR, Value("standalone"),
-	    [](ClientContext &, SetScope scope, Value &value) {
-		    if (scope != SetScope::GLOBAL) {
-			    throw InvalidInputException("acl_deployment is global - use SET GLOBAL");
-		    }
-		    auto text = StringUtil::Lower(value.ToString());
-		    if (text != "standalone" && text != "cluster") {
-			    throw InvalidInputException("acl_deployment is 'standalone' or 'cluster', not \"%s\"",
-			                                value.ToString());
-		    }
-		    value = Value(text);
-	    },
-	    SetScope::GLOBAL);
 	config.AddExtensionOption(
 	    "acl_node_group",
 	    "acl: the resource group this node belongs to (spec 096) - it serves the sessions of principals "
@@ -1609,11 +1566,11 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	    },
 	    SetScope::GLOBAL);
 	auto *node = store.get(); // the traits live in the store: no reference back to it is kept
-	node->node_traits.cluster_node = [node]() {
-		auto db = node->instance.lock();
-		Value value;
-		return db && db->TryGetCurrentSetting("acl_deployment", value) && !value.IsNull() &&
-		       StringUtil::CIEquals(value.ToString(), "cluster");
+	// hugr-node spec 002: a hugr_node node is a cluster node by construction, whatever the number of nodes - the
+	// profile, drift, the cluster bundle, secrets only in the service. There is no single-node mode to switch to:
+	// the open node is duckdb-acl's own build, which registers no trait
+	node->node_traits.cluster_node = []() {
+		return true;
 	};
 	node->node_traits.node_group = [node]() {
 		auto db = node->instance.lock();
