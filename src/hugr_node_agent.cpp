@@ -313,8 +313,10 @@ string DocumentFetchSql(const AgentEnvironment &env) {
 
 vector<PlanStep> RepositoryAndCatalogSteps(const BootstrapDocument &doc) {
 	vector<PlanStep> steps;
-	steps.push_back({"4 repository", "CREATE EXTENSION REPOSITORY " + Ident(doc.repository_name) + " WITH PREFIX " +
-	                                     Quoted(doc.repository_prefix)});
+	// OR REPLACE: a restarted container keeps its emptyDir, and every start reads the keys again (rotation is the
+	// discovery document's, design/017 item 15)
+	steps.push_back({"4 repository", "CREATE OR REPLACE EXTENSION REPOSITORY " + Ident(doc.repository_name) +
+	                                     " WITH PREFIX " + Quoted(doc.repository_prefix)});
 	if (!doc.catalog_extension.empty()) {
 		steps.push_back(
 		    {"5 policy catalog", "INSTALL " + Ident(doc.catalog_extension) + " FROM " + Ident(doc.repository_name)});
@@ -463,19 +465,23 @@ unique_ptr<FunctionData> ProfileBind(ClientContext &, TableFunctionBindInput &in
 	return std::move(bind);
 }
 
-//! one bootstrap statement on its own connection; a failure names its step
+void Log(const string &line) {
+	fprintf(stderr, "hugr_node: %s\n", line.c_str());
+	fflush(stderr);
+}
+
+//! one bootstrap statement on its own connection; a failure names its step. The log names the step, never the
+//! statement's values (they are addresses and file paths, but a log line has no business carrying them)
 unique_ptr<QueryResult> RunStep(DatabaseInstance &db, const string &step, const string &sql) {
 	Connection con(db);
 	auto result = con.Query(sql);
 	if (result->HasError()) {
 		throw InvalidInputException("hugr_node: bootstrap step \"%s\" failed: %s", step, result->GetError());
 	}
+	if (step != "stop") {
+		Log("step " + step + ": ok");
+	}
 	return result;
-}
-
-void Log(const string &line) {
-	fprintf(stderr, "hugr_node: %s\n", line.c_str());
-	fflush(stderr);
 }
 
 struct RunBind : public TableFunctionData {

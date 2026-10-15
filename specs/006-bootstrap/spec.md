@@ -123,8 +123,9 @@ there), granted `use` to the node's role. The operator defines it in tresor-serv
    `ATTACH 'tresor:<HUGR_TRESOR>' AS hugr_tresor (SECRET hugr_node_identity, ACT_FOR_SESSIONS true)`. tresor is built
    in; nothing is loaded.
 3. **The bootstrap document** from the control plane (above).
-4. **The repository.** `CREATE EXTENSION REPOSITORY <name> WITH PREFIX '<prefix>'`: the keys by discovery (design/017
-   item 15). A private channel's `http` secret comes from tresor by its SCOPE.
+4. **The repository.** `CREATE OR REPLACE EXTENSION REPOSITORY <name> WITH PREFIX '<prefix>'`: the keys by discovery
+   (design/017 item 15), read again at every start - `OR REPLACE` because a restarted container keeps its emptyDir. A
+   private channel's `http` secret comes from tresor by its SCOPE.
 5. **The policy catalog.** `INSTALL <extension> FROM <repository>; LOAD <extension> FROM <repository>` when an
    extension is named; `ATTACH '<path>' AS hugr_policy (TYPE <type>, SECRET <secret>)` with the secret from tresor;
    `SET GLOBAL acl_node_group = '<group>'` when the document names one; `SELECT acl_use_db('hugr_policy', '<schema>')`.
@@ -179,9 +180,9 @@ grows, and the artifact size is measured in the PR.
   `lock_configuration`.
 - **https only**: the control plane, tresor-server and the repository. A non-public CA comes through `HUGR_CA_FILE`.
   Verified 2026-10-15 at the f702a1f pin: discovery over https with a private CA works only with `ca_cert_file`, and
-  `SSL_CERT_FILE` is ignored. tresor talks to tresor-server through its own transport (the OIDC core's TLS, not
-  httpfs): whether it trusts the same CA from `HUGR_CA_FILE` is to verify in the implementation, and if not it gets
-  the same file through its own option.
+  `SSL_CERT_FILE` is ignored. tresor reaches tresor-server and the IdP through duckdb's HTTP client and takes
+  `ca_cert_file` from the instance (tresor_http.cpp:53-69), so `HUGR_CA_FILE` covers it too; https there needs httpfs,
+  which this build links.
 - `hugr_node_run()` and `hugr_node_bootstrap_plan()` are refused to a principal by the function gate.
 - `ACL NATIVE` stays the break-glass. Nothing here vetoes what it loads (design/017 item 18).
 
