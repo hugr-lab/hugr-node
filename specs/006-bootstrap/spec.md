@@ -1,6 +1,6 @@
 # Spec 006: the node process and its bootstrap
 
-- **Status**: draft - for the owner's acceptance before code
+- **Status**: accepted (owner, 2026-10-15: "в целом да") - implementation in progress
 - **Date**: 2026-10-15
 - **Author**: the agent, at the owner's ask (platform phase 1, step 1); the design and the owner's decisions are in
   the Claude Doc "Платформа, фаза 1: флот из одного профиля"
@@ -55,6 +55,34 @@ Only what is needed to log in to tresor and to find the control plane. No value 
 | `HUGR_FLIGHT`, `HUGR_FLIGHT_CERT`, `HUGR_FLIGHT_KEY` | the Flight door's address (the pod's port) and its TLS files |
 | `HUGR_QUACK`, `HUGR_QUACK_CERT`, `HUGR_QUACK_KEY` | optional: the quack door |
 | `HUGR_DRAIN_DEADLINE` | seconds to wait for sessions on SIGTERM (default 25; below the pod's `terminationGracePeriodSeconds`) |
+
+**The projected token.** The node's identity is Kubernetes' service-account token volume projection. kubelet writes a
+short-lived JWT for the pod's service account into a file: the cluster signs it, the audience is the IdP's, it lasts
+an hour, and kubelet renews it before it expires. The file lives on an in-memory volume. Nobody creates or stores
+it, and it is in neither the image nor the env. tresor (FLOW `federated`) re-reads it at every mint and sends it to
+the IdP as a client assertion. The IdP trusts the cluster: Keycloak 26.7+ through its Kubernetes identity provider,
+Entra through a federated credential. It works in any Kubernetes, the abstract one included, and in Azure it is what
+`AZURE_FEDERATED_TOKEN_FILE` names.
+
+```yaml
+spec:
+  serviceAccountName: hugr-node          # the node group's identity
+  containers:
+  - name: node
+    env:
+    - name: HUGR_IDENTITY_ASSERTION_FILE
+      value: /var/run/secrets/hugr/token
+    volumeMounts:
+    - { name: hugr-identity, mountPath: /var/run/secrets/hugr, readOnly: true }
+  volumes:
+  - name: hugr-identity
+    projected:
+      sources:
+      - serviceAccountToken:
+          path: token
+          audience: <the IdP's audience>   # a Keycloak realm, or api://AzureADTokenExchange
+          expirationSeconds: 3600
+```
 
 ### The bootstrap document: the contract with the control plane
 
