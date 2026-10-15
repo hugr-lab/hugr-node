@@ -27,7 +27,9 @@ TEST_CPP_DUCKDB_LIB := build/release/src/libduckdb.so
 endif
 TEST_CPP_LINK = -L build/release/src -lduckdb -Wl,-rpath,$(abspath build/release/src)
 
-$(TEST_CPP_DIR)/%: test/cpp/%.cpp
+# the built library is a prerequisite: a binary compiled against another duckdb's headers aborts when it loads this
+# one (found re-pinning to 7304f7b, spec 007), so a rebuilt duckdb rebuilds the tests
+$(TEST_CPP_DIR)/%: test/cpp/%.cpp $(TEST_CPP_DUCKDB_LIB)
 	@mkdir -p $(TEST_CPP_DIR)
 	$(CXX) -std=c++17 -O2 -DNDEBUG -pthread $(TEST_CPP_INCLUDES) $< -o $@ $(TEST_CPP_LINK)
 
