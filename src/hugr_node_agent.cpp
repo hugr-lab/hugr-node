@@ -144,6 +144,7 @@ AgentEnvironment AgentEnvironment::FromProcess() {
 	env.quack_cert = EnvOr("HUGR_QUACK_CERT");
 	env.quack_key = EnvOr("HUGR_QUACK_KEY");
 	env.drain_deadline = ParseSeconds(EnvOr("HUGR_DRAIN_DEADLINE"), "HUGR_DRAIN_DEADLINE");
+	env.tresor_insecure_http = EnvOr("HUGR_TRESOR_INSECURE_HTTP") == "1";
 	return env;
 }
 
@@ -167,6 +168,7 @@ AgentEnvironment AgentEnvironment::FromJson(const string &json) {
 	env.quack_cert = StrField(root, "HUGR_QUACK_CERT");
 	env.quack_key = StrField(root, "HUGR_QUACK_KEY");
 	env.drain_deadline = ParseSeconds(StrField(root, "HUGR_DRAIN_DEADLINE"), "HUGR_DRAIN_DEADLINE");
+	env.tresor_insecure_http = StrField(root, "HUGR_TRESOR_INSECURE_HTTP") == "1";
 	return env;
 }
 
@@ -183,6 +185,15 @@ void AgentEnvironment::Validate() const {
 		throw InvalidInputException("hugr_node: the node's identity is HUGR_IDENTITY_ASSERTION_FILE (the projected "
 		                            "service-account token) or, for development only, HUGR_IDENTITY_PRIVATE_KEY_FILE - "
 		                            "exactly one of them");
+	}
+	if (tresor_insecure_http) {
+		auto colon = tresor.rfind(':');
+		auto host = colon == string::npos ? tresor : tresor.substr(0, colon);
+		if (host != "127.0.0.1" && host != "localhost" && host != "[::1]") {
+			throw InvalidInputException("hugr_node: HUGR_TRESOR_INSECURE_HTTP is for a tresor-server on loopback only, "
+			                            "not \"%s\"",
+			                            tresor);
+		}
 	}
 	require(control_plane, "HUGR_CONTROL_PLANE");
 	if (!StringUtil::StartsWith(control_plane, "https://")) {
@@ -276,6 +287,9 @@ vector<PlanStep> HardeningSteps(const AgentEnvironment &env) {
 	add("SET GLOBAL autoinstall_known_extensions = false");
 	add("SET GLOBAL autoload_known_extensions = false");
 	add("SET GLOBAL allow_persistent_secrets = false");
+	// every request of tresor's - discovery, the IdP, the service - through duckdb's HTTP client, which verifies
+	// against ca_cert_file; tresor's builtin client trusts only the system roots (reported to tresor 2026-10-15)
+	add("SET GLOBAL tresor_http_client = 'duckdb'");
 	if (!env.ca_file.empty()) {
 		add("SET GLOBAL ca_cert_file = " + Quoted(env.ca_file));
 	}
@@ -304,7 +318,8 @@ vector<PlanStep> TresorSteps(const AgentEnvironment &env) {
 	}
 	return {{"2 tresor", "CREATE SECRET " + string(IDENTITY_SECRET) + " (" + StringUtil::Join(params, ", ") + ")"},
 	        {"2 tresor", "ATTACH " + Quoted("tresor:" + env.tresor) + " AS " + TRESOR_ALIAS + " (SECRET " +
-	                         IDENTITY_SECRET + ", ACT_FOR_SESSIONS true)"}};
+	                         IDENTITY_SECRET + ", ACT_FOR_SESSIONS true" +
+	                         (env.tresor_insecure_http ? ", INSECURE_HTTP true" : "") + ")"}};
 }
 
 string DocumentFetchSql(const AgentEnvironment &env) {
@@ -573,6 +588,10 @@ void RunScan(ClientContext &context, TableFunctionInput &data, DataChunk &output
 	env.Validate();
 	if (env.DevIdentity()) {
 		Log("WARNING: the node runs on a DEVELOPMENT identity (HUGR_IDENTITY_PRIVATE_KEY_FILE), never in production");
+	}
+	if (env.tresor_insecure_http) {
+		Log("WARNING: tresor over plain http on loopback (HUGR_TRESOR_INSECURE_HTTP) - development only, never in "
+		    "production");
 	}
 	auto quack_token = env.quack.empty() ? string() : RandomToken();
 

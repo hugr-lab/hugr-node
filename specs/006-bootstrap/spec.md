@@ -1,6 +1,6 @@
 # Spec 006: the node process and its bootstrap
 
-- **Status**: accepted (owner, 2026-10-15: "в целом да") - implementation in progress
+- **Status**: implemented (accepted by the owner 2026-10-15: "в целом да")
 - **Date**: 2026-10-15
 - **Author**: the agent, at the owner's ask (platform phase 1, step 1); the design and the owner's decisions are in
   the Claude Doc "Платформа, фаза 1: флот из одного профиля"
@@ -48,8 +48,10 @@ Only what is needed to log in to tresor and to find the control plane. No value 
 | --- | --- |
 | `HUGR_TRESOR` | tresor-server's host (`tresor:<host>`) |
 | `HUGR_IDENTITY_ISSUER`, `HUGR_IDENTITY_CLIENT_ID` | the node's issuer and client id at the IdP |
+| `HUGR_IDENTITY_SCOPE` | optional: the OAuth scope of the login (tresor's `OAUTH_SCOPE`) |
 | `HUGR_IDENTITY_ASSERTION_FILE` | the workload identity: the projected service-account token (tresor FLOW `federated`) |
-| `HUGR_IDENTITY_PRIVATE_KEY_FILE` | **dev only**, instead of the assertion: private_key_jwt (FLOW `client_credentials`) for compose and the e2e, where there is no Kubernetes. The node logs that it runs on a dev identity |
+| `HUGR_IDENTITY_PRIVATE_KEY_FILE`, `HUGR_IDENTITY_KEY_ID` | **dev only**, instead of the assertion: private_key_jwt (FLOW `client_credentials`) for compose and the e2e, where there is no Kubernetes. The node logs that it runs on a dev identity |
+| `HUGR_TRESOR_INSECURE_HTTP` | **dev only**, `1`: tresor-server and its IdP over plain http, loopback only (refused otherwise, logged). For a test environment that cannot give them a trusted certificate - a Go service on macOS ignores `SSL_CERT_FILE`; the node itself trusts `HUGR_CA_FILE` for tresor |
 | `HUGR_CONTROL_PLANE` | the control plane's base URL (https) |
 | `HUGR_CA_FILE` | optional: a CA bundle for https to non-public certificates (`ca_cert_file`); it replaces the system roots, so it holds them too when the node reaches public services |
 | `HUGR_FLIGHT`, `HUGR_FLIGHT_CERT`, `HUGR_FLIGHT_KEY` | the Flight door's address (the pod's port) and its TLS files |
@@ -114,10 +116,14 @@ there), granted `use` to the node's role. The operator defines it in tresor-serv
 ### The bootstrap, in order
 
 1. **Hardening.** `allow_extension_repositories` from `undecided` to `allowed`; `autoinstall_known_extensions` and
-   `autoload_known_extensions` off; `ca_cert_file` from `HUGR_CA_FILE`; `allow_persistent_secrets` off. Unsigned and
-   community stay off (duckdb cannot turn them on at runtime). duckdb accepts `allow_persistent_secrets` only before
-   the secret manager is first used: if loading tresor has already used it, hugr_node sets it in its load, before
-   `LoadTresorCore` (to verify in the implementation).
+   `autoload_known_extensions` off; `allow_persistent_secrets` off; `tresor_http_client = 'duckdb'`; `ca_cert_file`
+   from `HUGR_CA_FILE`. Unsigned and community stay off (duckdb cannot turn them on at runtime).
+   - duckdb accepts `allow_persistent_secrets` only before the secret manager is first used. At this point it has not
+     been used, and the e2e passes.
+   - `tresor_http_client = 'duckdb'` sends every request of tresor's (discovery, the IdP, the service) through
+     duckdb's HTTP client, which verifies against `ca_cert_file`. tresor's default `builtin` client trusts only the
+     system roots (the OIDC core's own https client, `oidc_core.cpp:160`). Reported to tresor 2026-10-15; their fix
+     adds a CA bundle to that client.
 2. **tresor.** `CREATE SECRET hugr_node_identity (TYPE tresor, SCOPE 'tresor:<HUGR_TRESOR>', FLOW 'federated',
    ISSUER …, CLIENT_ID …, ASSERTION_FILE …)` (or the dev flow), then
    `ATTACH 'tresor:<HUGR_TRESOR>' AS hugr_tresor (SECRET hugr_node_identity, ACT_FOR_SESSIONS true)`. tresor is built
@@ -150,9 +156,10 @@ SIGTERM during the wait skips straight to stopping the doors.
 ### The hardening list (acl_cluster.cpp)
 
 `HARDENING_SETTINGS` gains `ca_cert_file`, `autoinstall_known_extensions`, `autoload_known_extensions`,
-`custom_extension_repository` and `autoinstall_extension_repository`. They decide which certificates the node trusts
-and where code may come from: the bootstrap sets them from the environment, and no profile item may change them on the
-fleet (found 2026-10-15: `ca_cert_file` was missing, so a passthrough admin could hand every node a new CA).
+`custom_extension_repository`, `autoinstall_extension_repository` and `tresor_http_client`. They decide which
+certificates the node trusts and where code may come from: the bootstrap sets them from the environment, and no
+profile item may change them on the fleet (found 2026-10-15: `ca_cert_file` was missing, so a passthrough admin could
+hand every node a new CA).
 
 ### The build
 
@@ -180,8 +187,8 @@ grows, and the artifact size is measured in the PR.
   `lock_configuration`.
 - **https only**: the control plane, tresor-server and the repository. A non-public CA comes through `HUGR_CA_FILE`.
   Verified 2026-10-15 at the f702a1f pin: discovery over https with a private CA works only with `ca_cert_file`, and
-  `SSL_CERT_FILE` is ignored. tresor reaches tresor-server and the IdP through duckdb's HTTP client and takes
-  `ca_cert_file` from the instance (tresor_http.cpp:53-69), so `HUGR_CA_FILE` covers it too; https there needs httpfs,
+  `SSL_CERT_FILE` is ignored. tresor follows the same `ca_cert_file` once `tresor_http_client = 'duckdb'` (step 1):
+  verified against a private CA, where the default `builtin` client fails verification. https there needs httpfs,
   which this build links.
 - `hugr_node_run()` and `hugr_node_bootstrap_plan()` are refused to a principal by the function gate.
 - `ACL NATIVE` stays the break-glass. Nothing here vetoes what it loads (design/017 item 18).
@@ -193,21 +200,28 @@ grows, and the artifact size is measured in the PR.
   - `hugr_node_bootstrap_plan()` on documents: the full order, an extension-less catalog type, no node group, an
     unknown version refused, a missing field named;
   - the new hardening settings refused as profile items (each, case-insensitive).
-- **e2e** `test/e2e/bootstrap/run.sh`, which SKIPs without docker or go:
-  - **the setup:** Keycloak (dev identity via private_key_jwt), tresor-server (static secrets: the catalog's Postgres
-    login and the control plane's http token), Postgres as the policy catalog, kista in its dev profile (a channel for
-    the build's duckdb version, our postgres_scanner published into it), and a static https bootstrap document behind
-    a test CA;
-  - **checks 1-3:** the node starts with nothing but the environment, fetches the bootstrap document with the control
-    plane's token from tresor, installs postgres_scanner from the repository, and attaches the catalog with the secret
-    from tresor (the unverified paths from the phase-1 doc);
-  - **checks 4-5:** it applies a profile (a setting, a source), and `acl_node_load()` shows `config.applied =
-    config.target`;
-  - **check 6:** it serves Flight;
-  - **check 7:** on SIGTERM it drains, stops and exits 0;
-  - **check 8:** a broken step (a wrong secret name) stops the bootstrap with the step named, and no port opens.
-- **CI:** the e2e runs in the linux job, like `test/e2e/tresor`. postgres_scanner is built as a loadable for it, from
-  the duckdb submodule's pin, as duckdb-acl's integration build does.
+- **e2e** `test/e2e/bootstrap/run.sh` (in `make test-e2e`; SKIPs without docker or go):
+  - **the setup:**
+    - Keycloak, with the node's key registered per run on the realm's `keynode` client (private_key_jwt);
+    - tresor-server holding the catalog's Postgres login and the control plane's http token, as static secrets;
+    - Postgres as the policy catalog;
+    - kista from source in its dev profile, over https: a channel for the build's duckdb version, with our
+      postgres_scanner published into it;
+    - a fake control plane over https that serves the bootstrap document only to the token tresor hands out;
+    - kista and the control plane sit behind a CA made for the run. Keycloak and tresor-server run over loopback http
+      (`HUGR_TRESOR_INSECURE_HTTP`, see above).
+  - **the checks** (7, all pass on macOS arm64):
+    1. the document is fetched with the control plane's token from tresor;
+    2. the repository is trusted by discovery over https and postgres_scanner installed from it;
+    3. the catalog is attached with the secret from tresor;
+    4. the profile is applied (a setting, a source) at the version the operator wrote;
+    5. Flight serves;
+    6. SIGTERM drains, stops and exits 0;
+    7. a secret the service does not have stops the bootstrap at "5 policy catalog", with no port open.
+- **CI:** the e2e runs in the linux job, like `test/e2e/tresor`. postgres_scanner is built as a loadable for it
+  (`HUGR_NODE_E2E=1`, never linked), from the duckdb submodule's pin. With it, `test_acl_cluster_install` (an extension
+  installed through the profile from a trusted repository) runs instead of skipping.
+- Run on macOS arm64: the suite (12 files, 616 assertions), test-cpp, and all three e2e (tresor, otel, bootstrap) pass.
 
 ## Alternatives
 

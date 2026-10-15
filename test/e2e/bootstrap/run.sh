@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # A node bootstraps itself (spec 006): `duckdb -c "CALL hugr_node_run()"` with nothing but its environment. Around it:
 # Keycloak (the node's identity - the realm's keynode client, private_key_jwt: the dev flow, as there is no Kubernetes
-# here), tresor-server over https (the catalog's Postgres login and the control plane's token, static secrets), a
+# here), tresor-server (the catalog's Postgres login and the control plane's token, static secrets - it and Keycloak
+# over plain http on loopback, HUGR_TRESOR_INSECURE_HTTP: a Go service on macOS cannot be made to trust a test CA), a
 # Postgres holding the policy catalog and its cluster profile, kista in its dev profile over https (a channel for the
 # build's duckdb version, our postgres_scanner published into it) and a fake control plane over https serving the
 # bootstrap document - every https server behind a CA made for this run. Checked:
@@ -92,7 +93,7 @@ curl -sf -o /dev/null -X PUT -H "Authorization: Bearer $kc_admin" -H 'Content-Ty
 	-d '{"clientId":"keynode","clientAuthenticatorType":"client-jwt","attributes":{"jwt.credential.certificate":"'"$node_cert"'","use.jwks.url":"false"}}' ||
 	fail "the node's key could not be registered on Keycloak"
 
-# --- tresor-server over https: the operator (etl) admin, the node (keynode) an actor ------------------------------------
+# --- tresor-server on loopback http (see above): the operator (etl) admin, the node (keynode) an actor -----------------
 if [ -n "${TRESOR_SERVER_DIR:-}" ]; then
 	server_src="$(cd "$TRESOR_SERVER_DIR" && pwd)"
 else
@@ -103,8 +104,7 @@ fi
 	fail "tresor-server did not build"
 cat >"$TMP/server.yaml" <<EOF
 listen: $TS_HOST
-public_url: https://$TS_HOST
-tls: {cert: $TMP/tls.crt, key: $TMP/tls.key}
+public_url: http://$TS_HOST
 state: {kind: memory}
 issuers:
   - issuer: $ISSUER
@@ -120,11 +120,11 @@ policy:
   actors:
     - {principal: client:keynode, verbs: [use]}
 EOF
-echo "  tresor-server on https://$TS_HOST"
+echo "  tresor-server on http://$TS_HOST"
 "$TMP/bin/tresor-server" -config "$TMP/server.yaml" >"$TMP/server.log" 2>&1 &
 SERVER_PID=$!
-for _ in $(seq 150); do curl -sf --cacert "$TMP/ca.pem" "https://$TS_HOST/.well-known/duckdb-secrets" >/dev/null && break; sleep 0.2; done
-curl -sf --cacert "$TMP/ca.pem" "https://$TS_HOST/.well-known/duckdb-secrets" >/dev/null || {
+for _ in $(seq 150); do curl -sf "http://$TS_HOST/.well-known/duckdb-secrets" >/dev/null && break; sleep 0.2; done
+curl -sf "http://$TS_HOST/.well-known/duckdb-secrets" >/dev/null || {
 	cat "$TMP/server.log" >&2
 	fail "tresor-server did not come up"
 }
@@ -157,7 +157,7 @@ serve:
       scheme: https
       tls: {cert_file: $TMP/tls.crt, key_file: $TMP/tls.key}
 EOF
-kista() { env $(env | sed -n "s/^\(KISTA_[A-Za-z0-9_]*\)=.*/-u \1/p") "$TMP/bin/kista" "$@"; }
+kista() { exec_kista=(env $(env | sed -n "s/^\(KISTA_[A-Za-z0-9_]*\)=.*/-u \1/p") "$TMP/bin/kista"); "${exec_kista[@]}" "$@"; }
 ka() {
 	kista admin -config "$TMP/kista/kista.yaml" "$@" 2>>"$TMP/kista-admin.log" || {
 		cat "$TMP/kista-admin.log" >&2
@@ -174,7 +174,8 @@ ka channel versions hugr/e2e -add "$duckdb_version" >/dev/null
 ka key add hugr/e2e -signer file:e2e.pem -active >/dev/null
 ka release add hugr/e2e "$PGEXT" -name postgres_scanner >/dev/null
 echo "  kista on https://127.0.0.1:$REPO_PORT (channel hugr/e2e, duckdb $duckdb_version)"
-kista serve -config "$TMP/kista/kista.yaml" >"$TMP/kista.log" 2>&1 &
+(exec env $(env | sed -n "s/^\(KISTA_[A-Za-z0-9_]*\)=.*/-u \1/p") "$TMP/bin/kista" serve -config "$TMP/kista/kista.yaml") \
+	>"$TMP/kista.log" 2>&1 &
 KISTA_PID=$!
 PREFIX="https://127.0.0.1:$REPO_PORT/hugr/e2e"
 for _ in $(seq 100); do curl -sf --cacert "$TMP/ca.pem" "$PREFIX/.well-known/duckdb-extension-repo.json" >/dev/null && break; sleep 0.2; done
@@ -188,7 +189,8 @@ cat >"$TMP/seed.sql" <<EOF
 LOAD '$PGEXT';
 SET GLOBAL ca_cert_file = '$TMP/ca.pem';
 CREATE SECRET etl (TYPE tresor, SCOPE 'tresor:$TS_HOST', FLOW 'client_credentials', CLIENT_ID 'etl', CLIENT_SECRET 'etl-secret', ISSUER '$ISSUER');
-ATTACH 'tresor:$TS_HOST' AS owner (SECRET etl);
+SET GLOBAL tresor_http_client = 'duckdb';
+ATTACH 'tresor:$TS_HOST' AS owner (INSECURE_HTTP true, SECRET etl);
 CREATE PERSISTENT SECRET policy_catalog IN owner (TYPE postgres, HOST '127.0.0.1', PORT '$PG_PORT', DATABASE 'postgres', USER 'postgres', PASSWORD 'pg-e2e');
 CREATE PERSISTENT SECRET control_plane IN owner (TYPE http, SCOPE 'https://127.0.0.1:$CP_PORT/', BEARER_TOKEN 'cp-e2e-token');
 CALL owner.grant_secret('policy_catalog', 'role:default-roles-tresor', ['use']);
@@ -237,7 +239,7 @@ for _ in $(seq 50); do curl -s -o /dev/null --cacert "$TMP/ca.pem" "https://127.
 
 # --- the node: nothing but its environment ---------------------------------------------------------------------------
 node_env=(env -i PATH="$PATH" HOME="$TMP/node-home"
-	HUGR_TRESOR="$TS_HOST" HUGR_IDENTITY_ISSUER="$ISSUER" HUGR_IDENTITY_CLIENT_ID=keynode
+	HUGR_TRESOR="$TS_HOST" HUGR_TRESOR_INSECURE_HTTP=1 HUGR_IDENTITY_ISSUER="$ISSUER" HUGR_IDENTITY_CLIENT_ID=keynode
 	HUGR_IDENTITY_PRIVATE_KEY_FILE="$TMP/node-key.pem" HUGR_CONTROL_PLANE="https://127.0.0.1:$CP_PORT"
 	HUGR_CA_FILE="$TMP/ca.pem" HUGR_FLIGHT="grpc://localhost:$FLIGHT_PORT" HUGR_DRAIN_DEADLINE=5)
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$FLIGHT_PORT") 2>/dev/null; }

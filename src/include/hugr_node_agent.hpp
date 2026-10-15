@@ -30,6 +30,10 @@ struct AgentEnvironment {
 	string flight, flight_cert, flight_key;
 	string quack, quack_cert, quack_key;
 	int64_t drain_deadline = 25; // HUGR_DRAIN_DEADLINE, seconds
+	//! HUGR_TRESOR_INSECURE_HTTP=1: development only, a tresor-server (and its IdP) over plain http on loopback - for a
+	//! test environment that cannot give the service and the IdP a trusted certificate (a Go service on macOS ignores
+	//! SSL_CERT_FILE); never needed by the node itself, which trusts HUGR_CA_FILE through tresor_http_client = duckdb
+	bool tresor_insecure_http = false;
 
 	static AgentEnvironment FromProcess();
 	//! the same variables as a JSON object (hugr_node_bootstrap_plan's `environment :=`)

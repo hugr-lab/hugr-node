@@ -73,7 +73,7 @@ const case_insensitive_set_t HARDENING_SETTINGS = {
     // spec 006: which certificates the node trusts and where code may come from - the bootstrap sets them from
     // the environment, never a profile item (found 2026-10-15: ca_cert_file could hand every node a new CA)
     "ca_cert_file", "autoinstall_known_extensions", "autoload_known_extensions", "custom_extension_repository",
-    "autoinstall_extension_repository"};
+    "autoinstall_extension_repository", "tresor_http_client"};
 
 //! Where the cluster's telemetry goes (spec 005): one destination for the whole cluster (the owner, 2026-10-14) - a
 //! profile item of the cluster's scope, never of a group's
