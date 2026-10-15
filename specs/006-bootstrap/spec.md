@@ -9,9 +9,9 @@
 ## Problem
 
 A platform node today is a duckdb CLI fed through a FIFO, with bootstrap SQL written by hand (test/e2e/tresor,
-acl-clients' dev/node.sh). Phase 1 needs a node that builds itself in a pod: it starts with no key and no secret in its image, env
-or profile, gets everything else from tresor and the control plane, applies the cluster profile, serves, and stops
-cleanly on SIGTERM. Nothing does that now:
+acl-clients' dev/node.sh). Phase 1 needs a node that builds itself in a pod: it starts with no key and no secret in
+its image, env or profile, gets everything else from tresor and the control plane, applies the cluster profile,
+serves, and stops cleanly on SIGTERM. Nothing does that now:
 
 - no code applies the cluster profile at startup - only the node that writes a hot item applies it
   (`acl_cluster.cpp`), and `acl_cluster_applied` is never called;
