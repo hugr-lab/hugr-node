@@ -201,6 +201,17 @@ ACL ADMIN CLUSTER SET lock_configuration = true;
 ----
 <REGEX>:.*node's hardening.*
 
+# spec 006: which certificates the node trusts and where code may come from are its bootstrap's (found 2026-10-15:
+# ca_cert_file was missing, so a profile item could hand every node a new CA)
+foreach name ca_cert_file autoinstall_known_extensions autoload_known_extensions custom_extension_repository autoinstall_extension_repository tresor_http_client CA_CERT_FILE
+
+statement error
+SELECT acl_cluster_setting('set', '', '${name}', 'x');
+----
+<REGEX>:.*is the node's hardening, fixed by its bootstrap.*
+
+endloop
+
 # spec 097's opt-out is the node's own (moved from acl_observe.test)
 statement error
 ACL ADMIN CLUSTER SET acl_observe_unauthenticated = true;

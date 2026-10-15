@@ -36,7 +36,8 @@ list(APPEND EXTENSION_SOURCES
     ${TRESOR_SOURCES}
     ${ACL_OTEL_SOURCES}
     ${CMAKE_CURRENT_LIST_DIR}/src/hugr_node_extension.cpp
-    ${CMAKE_CURRENT_LIST_DIR}/src/acl_cluster.cpp)
+    ${CMAKE_CURRENT_LIST_DIR}/src/acl_cluster.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/hugr_node_agent.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

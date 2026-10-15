@@ -8,6 +8,9 @@ The hugr platform's part of a node, on top of [duckdb-acl](https://github.com/hu
 - **drift** - what a node carries against its profile;
 - the **`cluster`** admin bundle; a hugr_node node is a cluster node by construction (a cluster may be one node) and
   keeps secrets only in its secrets service - tresor, built in;
+- **the node process** - `duckdb -c "PRAGMA hugr_node_run"` bootstraps the node from its pod's environment and the
+  control plane, applies the profile, serves and stops on SIGTERM; no key or secret in the image, env or profile
+  (spec 006, [docs/node.md](docs/node.md));
 - **OpenTelemetry** - acl_otel built in (spec 005): the audit, metrics, spans and lineage of acl and tresor exported
   over OTLP and OpenLineage, nothing until an endpoint is set; the destination is one for the whole cluster (a cluster
   profile item, never a group's);
@@ -34,11 +37,13 @@ HUGR_NODE_DEV=1 GEN=ninja make      # + json, autocomplete and httpfs linked in:
                                     #   (ACL_CLUSTER=1 dev/node.sh - an IdP's discovery is read through httpfs; spec 004)
 build/release/test/unittest 'test/sql/*'
 make test-cpp
-make test-e2e                       # tresor inside the cluster (docker, go), acl_otel's export (python)
+make test-e2e                       # tresor inside the cluster (docker, go), acl_otel's export (python), the bootstrap
+                                    #   (docker, go; HUGR_NODE_E2E=1 GEN=ninja make first, for its postgres_scanner)
 ```
 
 vcpkg is part of every build: the built-in acl's Flight door takes Arrow from it, the built-in tresor OpenSSL, the
-built-in acl_otel the OpenTelemetry SDK (its gRPC is the Flight door's). duckdb-acl, tresor and acl-otel must carry the
+built-in acl_otel the OpenTelemetry SDK (its gRPC is the Flight door's), the linked azure extension the Azure SDK.
+httpfs and azure are linked into the node's duckdb until duckdb 2.0 (spec 006). duckdb-acl, tresor and acl-otel must carry the
 same duckdb-ext-common (tresor's and acl-otel's configure refuse otherwise).
 
 ## License

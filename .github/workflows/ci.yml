@@ -36,6 +36,9 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       GEN: ninja
+      # spec 006: postgres_scanner built as a loadable (never linked) for the bootstrap e2e, which publishes it into
+      # its repository
+      HUGR_NODE_E2E: 1
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       # The platform node is one configuration (spec 002): the built-in acl's Flight door (Arrow) and the built-in
       # tresor (OpenSSL) come from vcpkg. Its packages come from the family's R2 cache (duckdb-acl's
@@ -101,9 +104,11 @@ jobs:
           go-version-file: _tresor-server/go.mod
           cache: false
 
-      # spec 005: acl_otel's export, from the same make target
-      - name: End to end - tresor inside the cluster, acl_otel's export
+      # spec 005: acl_otel's export; spec 006: a node bootstraps itself - from the same make target (kista is cloned
+      # from its main by the script)
+      - name: End to end - tresor inside the cluster, acl_otel's export, the bootstrap
         run: |
           TRESOR_SERVER_DIR=_tresor-server make test-e2e 2>&1 | tee e2e.log
           grep -q '^PASS: tresor in the cluster' e2e.log
           grep -q '^PASS: acl_otel in hugr_node' e2e.log
+          grep -q '^PASS: a node bootstraps itself' e2e.log
