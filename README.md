@@ -8,12 +8,15 @@ The hugr platform's part of a node, on top of [duckdb-acl](https://github.com/hu
 - **drift** - what a node carries against its profile;
 - the **`cluster`** admin bundle; a hugr_node node is a cluster node by construction (a cluster may be one node) and
   keeps secrets only in its secrets service - tresor, built in;
+- **OpenTelemetry** - acl_otel built in (spec 005): the audit, metrics, spans and lineage of acl and tresor exported
+  over OTLP and OpenLineage, nothing until an endpoint is set; the destination is one for the whole cluster (a cluster
+  profile item, never a group's);
 - later: the node agent that converges a fleet with the platform's control plane.
 
-duckdb-acl is the open node's access control (MIT), tresor its client of the secrets service (MIT). This repository
-builds one extension, `hugr_node`, from both and its own part, which plugs into acl through the registration points
-of duckdb-acl's spec 126 (design: duckdb-acl `design/080`). A platform node loads `hugr_node` instead of `acl` and
-`tresor`, never beside them. Distributed for Linux amd64 and arm64 only (spec 002); it builds anywhere duckdb-acl
+duckdb-acl is the open node's access control (MIT), tresor its client of the secrets service (MIT), acl-otel its
+OpenTelemetry export (BUSL). This repository builds one extension, `hugr_node`, from the three and its own part, which plugs into acl through the registration points
+of duckdb-acl's spec 126 (design: duckdb-acl `design/080`). A platform node loads `hugr_node` instead of `acl`, `tresor`
+and `acl_otel`, never beside them. Distributed for Linux amd64 and arm64 only (spec 002); it builds anywhere duckdb-acl
 does, for development.
 
 > **Status: in progress** - the code moved here from duckdb-acl with its history (spec 001; duckdb-acl spec 127).
@@ -24,16 +27,19 @@ does, for development.
 git submodule update --init
 git -C duckdb-acl submodule update --init third_party/quack duckdb-ext-common
 git -C tresor submodule update --init duckdb-ext-common
+git -C acl-otel submodule update --init duckdb-ext-common
 make vcpkg-setup                    # once (or VCPKG_TOOLCHAIN_PATH=<an existing vcpkg>/scripts/buildsystems/vcpkg.cmake)
-GEN=ninja make                      # the hugr_node extension (acl and tresor built in) and its test binary
+GEN=ninja make                      # the hugr_node extension (acl, tresor and acl_otel built in) and its test binary
 HUGR_NODE_DEV=1 GEN=ninja make      # + json, autocomplete and httpfs linked in: the CLI acl-clients' dev node runs
                                     #   (ACL_CLUSTER=1 dev/node.sh - an IdP's discovery is read through httpfs; spec 004)
 build/release/test/unittest 'test/sql/*'
 make test-cpp
+make test-e2e                       # tresor inside the cluster (docker, go), acl_otel's export (python)
 ```
 
-vcpkg is part of every build: the built-in acl's Flight door takes Arrow from it, the built-in tresor OpenSSL. duckdb-acl
-and tresor must carry the same duckdb-ext-common (tresor's configure refuses otherwise).
+vcpkg is part of every build: the built-in acl's Flight door takes Arrow from it, the built-in tresor OpenSSL, the
+built-in acl_otel the OpenTelemetry SDK (its gRPC is the Flight door's). duckdb-acl, tresor and acl-otel must carry the
+same duckdb-ext-common (tresor's and acl-otel's configure refuse otherwise).
 
 ## License
 

@@ -71,6 +71,12 @@ const case_insensitive_set_t HARDENING_SETTINGS = {
     "acl_allow_anonymous_admin", "acl_quack_authentication_function", "acl_quack_authorization_function",
     "enable_server_cert_verification", "enable_curl_server_cert_verification", "disabled_filesystems"};
 
+//! Where the cluster's telemetry goes (spec 005): one destination for the whole cluster (the owner, 2026-10-14) - a
+//! profile item of the cluster's scope, never of a group's
+const case_insensitive_set_t CLUSTER_WIDE_SETTINGS = {
+    "acl_otel_endpoint", "acl_otel_protocol",         "acl_otel_insecure",      "acl_otel_certificate",
+    "acl_otel_lineage",  "acl_otel_lineage_endpoint", "acl_otel_lineage_secret"};
+
 //! Source types whose connection needs a credential: written without SECRET, refused
 const case_insensitive_set_t TYPES_NEEDING_SECRET = {"postgres", "postgres_scanner", "mysql", "mysql_scanner", "mssql"};
 
@@ -833,6 +839,11 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterSetting(const string &verb, const
 		// would let a catalog write move nodes between groups
 		throw BinderException("acl cluster: \"acl_node_group\" is the node's own (its deployment sets it) - never a "
 		                      "cluster profile item");
+	}
+	if (v == "set" && !scope.empty() && CLUSTER_WIDE_SETTINGS.count(name)) {
+		throw BinderException("acl cluster: \"%s\" is where the cluster's telemetry goes - one destination for the "
+		                      "whole cluster: write it without IN GROUP",
+		                      name);
 	}
 	LintKey(name, "a setting's name");
 	auto known = NodeQuery(*db, "SELECT scope FROM duckdb_settings() WHERE lower(name) = lower(" + Quoted(name) + ")");
