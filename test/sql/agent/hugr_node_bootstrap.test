@@ -169,18 +169,18 @@ ACL ROLE "analyst" SELECT * FROM hugr_node_bootstrap_plan('{}');
 <REGEX>:.*hugr_node_bootstrap_plan.*
 
 statement error
-ACL ROLE "analyst" CALL hugr_node_run();
+ACL ROLE "analyst" PRAGMA hugr_node_run;
 ----
-<REGEX>:.*not permitted under ACL.*
+<REGEX>:.*PRAGMA "hugr_node_run" is not permitted under ACL.*
 
 # --- once per process: a failed run is not retried in place -------------------------------------------------------
 
 statement error
-CALL hugr_node_run();
+PRAGMA hugr_node_run;
 ----
 <REGEX>:.*HUGR_TRESOR is not set.*
 
 statement error
-CALL hugr_node_run();
+PRAGMA hugr_node_run;
 ----
 <REGEX>:.*runs once per process.*

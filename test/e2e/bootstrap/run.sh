@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A node bootstraps itself (spec 006): `duckdb -c "CALL hugr_node_run()"` with nothing but its environment. Around it:
+# A node bootstraps itself (spec 006): `duckdb -c "PRAGMA hugr_node_run"` with nothing but its environment. Around it:
 # Keycloak (the node's identity - the realm's keynode client, private_key_jwt: the dev flow, as there is no Kubernetes
 # here), tresor-server (the catalog's Postgres login and the control plane's token, static secrets - it and Keycloak
 # over plain http on loopback, HUGR_TRESOR_INSECURE_HTTP: a Go service on macOS cannot be made to trust a test CA), a
@@ -198,6 +198,7 @@ CALL owner.grant_secret('control_plane', 'role:default-roles-tresor', ['use']);
 ATTACH 'host=127.0.0.1 port=$PG_PORT dbname=postgres user=postgres password=pg-e2e' AS pg (TYPE postgres);
 SELECT acl_use_db('pg', 'acl', true);
 SET GLOBAL acl_allow_anonymous_admin = true;
+-- a thread-count change joins every scheduler worker, so it proves the node does not run on one (spec 006)
 ACL ADMIN CLUSTER SET threads = 3;
 ACL ADMIN CLUSTER ATTACH ':memory:' AS e2e_src (TYPE duckdb);
 SELECT 'version:' || acl_cluster_version();
@@ -245,7 +246,7 @@ node_env=(env -i PATH="$PATH" HOME="$TMP/node-home"
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$FLIGHT_PORT") 2>/dev/null; }
 start_node() { # <log>
 	mkdir -p "$TMP/node-home"
-	"${node_env[@]}" "$DUCKDB" -no-agent -c "CALL hugr_node_run()" >"$1" 2>&1 &
+	"${node_env[@]}" "$DUCKDB" -no-agent -c "PRAGMA hugr_node_run" >"$1" 2>&1 &
 	NODE_PID=$!
 }
 wait_ready_or_exit() { # <log>: 0 ready, 1 exited

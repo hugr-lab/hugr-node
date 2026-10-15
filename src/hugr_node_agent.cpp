@@ -1,6 +1,6 @@
 // Spec 006: the node process and its bootstrap.
 //
-// `duckdb -c "CALL hugr_node_run()"` is a platform node's entrypoint. The function reads the local part from the
+// `duckdb -c "PRAGMA hugr_node_run"` is a platform node's entrypoint. The function reads the local part from the
 // pod's environment (the way into tresor and the control plane - no credential), logs in to tresor with the node's
 // workload identity, takes the bootstrap document from the control plane, trusts the extension repository by its
 // discovery document, attaches the policy catalog with a secret from tresor, applies the cluster profile, locks the
@@ -17,6 +17,7 @@
 #include "acl_result_rows.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/function/pragma_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
@@ -37,7 +38,7 @@ namespace hugr_node {
 namespace {
 
 //! The one run of this process and the signal that ends it. Process-wide by nature: a signal reaches the process, and
-//! the node is one per process (a second hugr_node_run() is refused). The handler only stores (async-signal-safe).
+//! the node is one per process (a second PRAGMA hugr_node_run is refused). The handler only stores (async-signal-safe).
 std::atomic<bool> g_running {false};
 std::atomic<int> g_stop_signal {0};
 
@@ -499,27 +500,6 @@ unique_ptr<QueryResult> RunStep(DatabaseInstance &db, const string &step, const 
 	return result;
 }
 
-struct RunBind : public TableFunctionData {
-	shared_ptr<acl::PolicyStore> store;
-};
-
-struct RunState : public GlobalTableFunctionState {
-	bool done = false;
-};
-
-unique_ptr<FunctionData> RunBindFn(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
-                                   vector<Identifier> &names) {
-	names = {Identifier("reason"), Identifier("sessions_left")};
-	types = {LogicalType::VARCHAR, LogicalType::BIGINT};
-	auto bind = make_uniq<RunBind>();
-	bind->store = input.info->Cast<AgentInfo>().store;
-	return std::move(bind);
-}
-
-unique_ptr<GlobalTableFunctionState> RunInit(ClientContext &, TableFunctionInitInput &) {
-	return make_uniq<RunState>();
-}
-
 int64_t LiveSessions(DatabaseInstance &db) {
 	auto result = RunStep(db, "stop", "SELECT acl_drain()");
 	acl::ResultRows rows(*result);
@@ -569,20 +549,25 @@ int64_t Stop(DatabaseInstance &db, const AgentEnvironment &env) {
 	return live;
 }
 
-void RunScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	auto &state = data.global_state->Cast<RunState>();
-	if (state.done) {
-		output.SetChildCardinality(0);
-		return;
+struct AgentPragmaInfo : public PragmaFunctionInfo {
+	explicit AgentPragmaInfo(shared_ptr<acl::PolicyStore> store_p) : store(std::move(store_p)) {
 	}
-	state.done = true;
+	shared_ptr<acl::PolicyStore> store;
+};
+
+//! PRAGMA hugr_node_run: a pragma that returns a query runs in the statement preprocessor, on the calling connection's
+//! own thread - never on a scheduler worker. That matters: a thread-count change (`SET threads`, a profile item)
+//! joins every worker, and a node blocked on a worker for its whole life would be one of them (found in CI as
+//! "Resource deadlock avoided" when the profile set `threads`). Answers a one-row query: why the node stopped and the
+//! sessions still live when the doors stopped.
+string RunPragma(ClientContext &context, const FunctionParameters &parameters) {
 	// once per process, whatever happens next: a bootstrap that failed half-way is not retried in place (the CLI
 	// exits non-zero and the pod restarts), and a node that ran is not started again
 	if (g_running.exchange(true)) {
 		throw InvalidInputException("hugr_node_run: runs once per process - the previous run ended or failed; start a "
 		                            "new process");
 	}
-	auto &bind = data.bind_data->Cast<RunBind>();
+	auto &store = parameters.function->function_info->Cast<AgentPragmaInfo>().store;
 	auto &db = *context.db;
 	auto env = AgentEnvironment::FromProcess();
 	env.Validate();
@@ -611,8 +596,8 @@ void RunScan(ClientContext &context, TableFunctionInput &data, DataChunk &output
 	for (auto &step : RepositoryAndCatalogSteps(document)) {
 		RunStep(db, step.step, step.sql);
 	}
-	auto version = bind.store->ClusterVersion();
-	for (auto &item : bind.store->ClusterEffective()) {
+	auto version = store->ClusterVersion();
+	for (auto &item : store->ClusterEffective()) {
 		for (auto &sql : acl::ClusterItemApplyStatements(item)) {
 			RunStep(db, "6 profile: " + item.kind + " " + item.name, sql);
 		}
@@ -635,9 +620,8 @@ void RunScan(ClientContext &context, TableFunctionInput &data, DataChunk &output
 	auto left = Stop(db, env);
 	std::signal(SIGTERM, previous_term);
 	std::signal(SIGINT, previous_int);
-	output.data[0].SetValue(0, Value(signal_number == SIGINT ? "SIGINT" : "SIGTERM"));
-	output.data[1].SetValue(0, Value::BIGINT(left));
-	output.SetChildCardinality(1);
+	return "SELECT " + Quoted(signal_number == SIGINT ? "SIGINT" : "SIGTERM") + " AS reason, " + std::to_string(left) +
+	       "::BIGINT AS sessions_left";
 }
 
 } // namespace
@@ -645,8 +629,8 @@ void RunScan(ClientContext &context, TableFunctionInput &data, DataChunk &output
 void RegisterHugrNodeAgent(ExtensionLoader &loader, const shared_ptr<acl::PolicyStore> &store) {
 	auto info = make_shared_ptr<AgentInfo>(store);
 
-	TableFunction run(Identifier("hugr_node_run"), {}, RunScan, RunBindFn, RunInit);
-	run.function_info = info;
+	auto run = PragmaFunction::PragmaStatement(Identifier("hugr_node_run"), RunPragma);
+	run.function_info = make_shared_ptr<AgentPragmaInfo>(store);
 	loader.RegisterFunction(run);
 
 	TableFunction plan(Identifier("hugr_node_bootstrap_plan"), {LogicalType::VARCHAR}, StepsScan, PlanBind, StepsInit);

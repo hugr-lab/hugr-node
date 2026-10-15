@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
 // hugr_node_agent.hpp
 //
-// Spec 006: the node process and its bootstrap. hugr_node_run() builds a platform node from its pod's environment
+// Spec 006: the node process and its bootstrap. PRAGMA hugr_node_run builds a platform node from its pod's environment
 // and the control plane's bootstrap document, serves, and stops on SIGTERM; hugr_node_bootstrap_plan(document) answers
 // the statements the bootstrap would run; hugr_node_profile_statements() the ones that apply this node's profile.
 // The plan is pure (the environment and the document in, statements out) - the tests and an operator read it.

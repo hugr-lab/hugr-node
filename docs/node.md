@@ -3,10 +3,10 @@
 A platform node is one process: the node's duckdb build with `hugr_node` linked in, started as
 
 ```sh
-duckdb -c "CALL hugr_node_run()"
+duckdb -c "PRAGMA hugr_node_run"
 ```
 
-`hugr_node_run()` builds the node from its environment and the control plane's bootstrap document, applies the cluster
+`PRAGMA hugr_node_run` builds the node from its environment and the control plane's bootstrap document, applies the cluster
 profile, locks the configuration, opens the doors and blocks. On SIGTERM it drains and exits 0. Nothing in the image,
 the environment or the profile is a key or a secret: the node's identity is its workload identity, and every
 credential comes from tresor when it is used (spec 006).

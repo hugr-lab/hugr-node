@@ -8,7 +8,7 @@ The hugr platform's part of a node, on top of [duckdb-acl](https://github.com/hu
 - **drift** - what a node carries against its profile;
 - the **`cluster`** admin bundle; a hugr_node node is a cluster node by construction (a cluster may be one node) and
   keeps secrets only in its secrets service - tresor, built in;
-- **the node process** - `duckdb -c "CALL hugr_node_run()"` bootstraps the node from its pod's environment and the
+- **the node process** - `duckdb -c "PRAGMA hugr_node_run"` bootstraps the node from its pod's environment and the
   control plane, applies the profile, serves and stops on SIGTERM; no key or secret in the image, env or profile
   (spec 006, [docs/node.md](docs/node.md));
 - **OpenTelemetry** - acl_otel built in (spec 005): the audit, metrics, spans and lineage of acl and tresor exported

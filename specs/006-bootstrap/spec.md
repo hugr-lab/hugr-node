@@ -21,20 +21,23 @@ serves, and stops cleanly on SIGTERM. Nothing does that now:
 
 ## Design
 
-### The entry: `hugr_node_run()`
+### The entry: `PRAGMA hugr_node_run`
 
-The image's entrypoint is `duckdb -c "CALL hugr_node_run()"`. `hugr_node_run()` is a table function that:
+The image's entrypoint is `duckdb -c "PRAGMA hugr_node_run"`. It is a pragma that returns a query, and duckdb runs such
+a pragma in the statement preprocessor, on the calling connection's own thread. A table function would run on a
+scheduler worker, and CI found why that is wrong: a thread-count change (`SET threads`, a profile item) joins every
+worker, and a node blocked on one for its whole life deadlocks the change ("Resource deadlock avoided"). The pragma:
 
 1. reads the local part from the environment;
 2. runs the bootstrap below, in order - the first failure raises an error that names the step, nothing listens, and
    the CLI exits non-zero (the pod restarts, the reason is in its log);
 3. opens the doors and blocks;
-4. on SIGTERM (or SIGINT) drains, stops the doors and returns one row (`reason`, `sessions_left`). The CLI then exits 0,
+4. on SIGTERM (or SIGINT) drains, stops the doors and answers one row (`reason`, `sessions_left`). The CLI then exits 0,
    which is what gives the database its final checkpoint (spec 084 of duckdb-acl: an unstopped door gets none).
 
 The signal handler only sets an atomic flag (async-signal-safe); the blocked call polls it every 250 ms. It runs once
-per process (a second call is refused) and only outside a principal: under `ACL ROLE|TOKEN|SESSION` the function gate
-refuses it like any uncategorized function, and a test proves it.
+per process (a second call is refused) and only outside a principal: under `ACL ROLE|TOKEN|SESSION` the rewriter
+refuses every PRAGMA but `table_info` and `show_tables`, and a test proves it.
 
 The bootstrap is split into a pure **plan** and its **execution**. `hugr_node_bootstrap_plan(document_json)` is a table
 function that returns the statements the bootstrap would run for a document and the current environment, without
@@ -190,13 +193,14 @@ grows, and the artifact size is measured in the PR.
   `SSL_CERT_FILE` is ignored. tresor follows the same `ca_cert_file` once `tresor_http_client = 'duckdb'` (step 1):
   verified against a private CA, where the default `builtin` client fails verification. https there needs httpfs,
   which this build links.
-- `hugr_node_run()` and `hugr_node_bootstrap_plan()` are refused to a principal by the function gate.
+- `PRAGMA hugr_node_run` is refused to a principal (the rewriter admits only `table_info` and `show_tables`), and
+  `hugr_node_bootstrap_plan()` / `hugr_node_profile_statements()` by the function gate.
 - `ACL NATIVE` stays the break-glass. Nothing here vetoes what it loads (design/017 item 18).
 
 ## Testing
 
 - **sqllogictest:**
-  - `hugr_node_run()` refused under a principal and refused a second time;
+  - `PRAGMA hugr_node_run` refused under a principal and refused a second time;
   - `hugr_node_bootstrap_plan()` on documents: the full order, an extension-less catalog type, no node group, an
     unknown version refused, a missing field named;
   - the new hardening settings refused as profile items (each, case-insensitive).
