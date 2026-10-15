@@ -1,0 +1,165 @@
+# name: test/sql/agent/hugr_node_bootstrap.test
+# description: spec 006 - the bootstrap's plan: the statements in order for an environment and a bootstrap document,
+#   the refusals that name what is wrong, the profile's statements, the run once per process, and none of it under a
+#   principal
+# group: [hugr_node]
+
+require hugr_node
+
+# --- the plan: the whole order, a federated identity, a named group, a catalog extension -------------------------
+
+query II
+SELECT step, sql FROM hugr_node_bootstrap_plan('{"version": 1, "node_group": "analytics",
+  "repository": {"name": "hugr", "prefix": "https://ext.example/t/prod/"},
+  "catalog": {"type": "postgres", "extension": "postgres_scanner", "path": "", "secret": "policy_catalog", "schema": "acl"}}',
+  environment := '{"HUGR_TRESOR": "tresor:secrets.example", "HUGR_IDENTITY_ISSUER": "https://idp.example/realms/r",
+  "HUGR_IDENTITY_CLIENT_ID": "hugr-node", "HUGR_IDENTITY_ASSERTION_FILE": "/var/run/secrets/hugr/token",
+  "HUGR_CONTROL_PLANE": "https://cp.example/", "HUGR_CA_FILE": "/etc/hugr/ca.pem",
+  "HUGR_FLIGHT": "grpc+tls://0.0.0.0:32010", "HUGR_FLIGHT_CERT": "/etc/hugr/tls.crt", "HUGR_FLIGHT_KEY": "/etc/hugr/tls.key"}');
+----
+1 hardening	SET GLOBAL allow_extension_repositories = 'allowed'
+1 hardening	SET GLOBAL autoinstall_known_extensions = false
+1 hardening	SET GLOBAL autoload_known_extensions = false
+1 hardening	SET GLOBAL allow_persistent_secrets = false
+1 hardening	SET GLOBAL ca_cert_file = '/etc/hugr/ca.pem'
+2 tresor	CREATE SECRET hugr_node_identity (TYPE tresor, SCOPE 'tresor:secrets.example', FLOW 'federated', ISSUER 'https://idp.example/realms/r', CLIENT_ID 'hugr-node', ASSERTION_FILE '/var/run/secrets/hugr/token')
+2 tresor	ATTACH 'tresor:secrets.example' AS hugr_tresor (SECRET hugr_node_identity, ACT_FOR_SESSIONS true)
+3 bootstrap document	SELECT content FROM read_text('https://cp.example/v1/bootstrap')
+4 repository	CREATE EXTENSION REPOSITORY "hugr" WITH PREFIX 'https://ext.example/t/prod'
+5 policy catalog	INSTALL "postgres_scanner" FROM "hugr"
+5 policy catalog	LOAD "postgres_scanner" FROM "hugr"
+5 policy catalog	ATTACH '' AS hugr_policy (TYPE postgres, SECRET "policy_catalog")
+5 policy catalog	SET GLOBAL acl_node_group = 'analytics'
+5 policy catalog	SELECT acl_use_db('hugr_policy', 'acl')
+6 profile	-- each item of acl_cluster_effective() in its order: hugr_node_profile_statements()
+7 lock	SET GLOBAL lock_configuration = true
+8 serve	SELECT acl_cluster_applied(<the profile version read in step 6>)
+8 serve	SELECT acl_flight_serve('grpc+tls://0.0.0.0:32010', '/etc/hugr/tls.crt', '/etc/hugr/tls.key')
+
+# the dev identity (private_key_jwt), no CA, no group, a catalog type without an extension, a quack door
+query II
+SELECT step, sql FROM hugr_node_bootstrap_plan('{"version": 1, "repository": {"prefix": "https://ext.example/t/dev"},
+  "catalog": {"type": "duckdb", "path": "/data/policy.duckdb", "secret": "unused"}}',
+  environment := '{"HUGR_TRESOR": "secrets.example", "HUGR_IDENTITY_ISSUER": "https://idp.example/realms/r",
+  "HUGR_IDENTITY_CLIENT_ID": "hugr-node", "HUGR_IDENTITY_PRIVATE_KEY_FILE": "/dev/key.pem",
+  "HUGR_CONTROL_PLANE": "https://cp.example", "HUGR_FLIGHT": "grpc://localhost:32010", "HUGR_QUACK": "quack:localhost:9494"}')
+WHERE step IN ('2 tresor', '4 repository', '5 policy catalog', '8 serve');
+----
+2 tresor	CREATE SECRET hugr_node_identity (TYPE tresor, SCOPE 'tresor:secrets.example', FLOW 'client_credentials', ISSUER 'https://idp.example/realms/r', CLIENT_ID 'hugr-node', PRIVATE_KEY_FILE '/dev/key.pem')
+2 tresor	ATTACH 'tresor:secrets.example' AS hugr_tresor (SECRET hugr_node_identity, ACT_FOR_SESSIONS true)
+4 repository	CREATE EXTENSION REPOSITORY "hugr" WITH PREFIX 'https://ext.example/t/dev'
+5 policy catalog	ATTACH '/data/policy.duckdb' AS hugr_policy (TYPE duckdb, SECRET "unused")
+5 policy catalog	SELECT acl_use_db('hugr_policy', 'acl')
+8 serve	SELECT acl_cluster_applied(<the profile version read in step 6>)
+8 serve	SELECT acl_flight_serve('grpc://localhost:32010')
+8 serve	SELECT acl_quack_serve('quack:localhost:9494', '<random per process>')
+
+# --- refusals, each naming what is wrong --------------------------------------------------------------------------
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 1}', environment := '{"HUGR_IDENTITY_ISSUER": "i"}');
+----
+<REGEX>:.*HUGR_TRESOR is not set.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 1}', environment := '{"HUGR_TRESOR": "t", "HUGR_IDENTITY_ISSUER": "i",
+  "HUGR_IDENTITY_CLIENT_ID": "c", "HUGR_IDENTITY_ASSERTION_FILE": "/a", "HUGR_IDENTITY_PRIVATE_KEY_FILE": "/k",
+  "HUGR_CONTROL_PLANE": "https://cp", "HUGR_FLIGHT": "grpc://localhost:1"}');
+----
+<REGEX>:.*exactly one of them.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 1}', environment := '{"HUGR_TRESOR": "t", "HUGR_IDENTITY_ISSUER": "i",
+  "HUGR_IDENTITY_CLIENT_ID": "c", "HUGR_IDENTITY_ASSERTION_FILE": "/a", "HUGR_CONTROL_PLANE": "http://cp",
+  "HUGR_FLIGHT": "grpc://localhost:1"}');
+----
+<REGEX>:.*HUGR_CONTROL_PLANE is an https URL.*
+
+statement ok
+CREATE MACRO plan_env() AS '{"HUGR_TRESOR": "t", "HUGR_IDENTITY_ISSUER": "i", "HUGR_IDENTITY_CLIENT_ID": "c",
+  "HUGR_IDENTITY_ASSERTION_FILE": "/a", "HUGR_CONTROL_PLANE": "https://cp", "HUGR_FLIGHT": "grpc://localhost:1"}';
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 2}', environment := plan_env());
+----
+<REGEX>:.*version 2 is not one this node reads.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 1, "catalog": {"type": "duckdb", "secret": "s"}}', environment := plan_env());
+----
+<REGEX>:.*has no repository.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 1, "repository": {"prefix": "http://ext"}, "catalog": {"type": "duckdb", "secret": "s"}}', environment := plan_env());
+----
+<REGEX>:.*prefix is an https URL.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 1, "repository": {"prefix": "https://ext"}, "catalog": {"type": "duckdb"}}', environment := plan_env());
+----
+<REGEX>:.*names no secret.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 1, "repository": {"prefix": "https://ext"}, "catalog": {"type": "duckdb, SECRET x", "secret": "s"}}', environment := plan_env());
+----
+<REGEX>:.*catalog type "duckdb, SECRET x" is not a plain name.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('not json', environment := plan_env());
+----
+<REGEX>:.*the bootstrap document is not a JSON object.*
+
+# --- the profile's statements, in the profile's order -------------------------------------------------------------
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+ACL ADMIN CLUSTER SET threads = 2;
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS src (TYPE duckdb);
+
+query II
+SELECT step, sql FROM hugr_node_profile_statements();
+----
+6 profile: setting threads	SET GLOBAL "threads" = '2'
+6 profile: source src	ATTACH ':memory:' AS "src" (TYPE duckdb)
+
+# --- none of it under a principal ---------------------------------------------------------------------------------
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement error
+ACL ROLE "analyst" SELECT * FROM hugr_node_profile_statements();
+----
+<REGEX>:.*hugr_node_profile_statements.*
+
+statement error
+ACL ROLE "analyst" SELECT * FROM hugr_node_bootstrap_plan('{}');
+----
+<REGEX>:.*hugr_node_bootstrap_plan.*
+
+statement error
+ACL ROLE "analyst" CALL hugr_node_run();
+----
+<REGEX>:.*not permitted under ACL.*
+
+# --- once per process: a failed run is not retried in place -------------------------------------------------------
+
+statement error
+CALL hugr_node_run();
+----
+<REGEX>:.*HUGR_TRESOR is not set.*
+
+statement error
+CALL hugr_node_run();
+----
+<REGEX>:.*runs once per process.*

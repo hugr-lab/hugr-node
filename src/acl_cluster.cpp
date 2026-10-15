@@ -69,7 +69,11 @@ const case_insensitive_set_t HARDENING_SETTINGS = {
     // statement, whether the anonymous hatch opens, what a TLS peer
     // must prove, which filesystems exist
     "acl_allow_anonymous_admin", "acl_quack_authentication_function", "acl_quack_authorization_function",
-    "enable_server_cert_verification", "enable_curl_server_cert_verification", "disabled_filesystems"};
+    "enable_server_cert_verification", "enable_curl_server_cert_verification", "disabled_filesystems",
+    // spec 006: which certificates the node trusts and where code may come from - the bootstrap sets them from
+    // the environment, never a profile item (found 2026-10-15: ca_cert_file could hand every node a new CA)
+    "ca_cert_file", "autoinstall_known_extensions", "autoload_known_extensions", "custom_extension_repository",
+    "autoinstall_extension_repository"};
 
 //! Where the cluster's telemetry goes (spec 005): one destination for the whole cluster (the owner, 2026-10-14) - a
 //! profile item of the cluster's scope, never of a group's
@@ -361,6 +365,42 @@ string JsonField(const string &json, const char *field) {
 }
 
 } // namespace
+
+vector<string> ClusterItemApplyStatements(const PolicyStore::ClusterItem &item) {
+	using namespace duckdb_yyjson; // NOLINT
+	if (item.kind == "setting") {
+		return {"SET GLOBAL " + Ident(item.name) + " = " + Quoted(JsonField(item.spec, "value"))};
+	}
+	if (item.kind == "extension") {
+		auto version = JsonField(item.spec, "version");
+		auto repo = JsonField(item.spec, "repository");
+		if (version.empty() || repo.empty()) {
+			throw InvalidInputException("acl cluster: extension \"%s\" in the profile names no version or repository",
+			                            item.name);
+		}
+		return {"INSTALL " + Ident(item.name) + " FROM " + Ident(repo) + " VERSION " + Quoted(version),
+		        "LOAD " + Ident(item.name) + " FROM " + Ident(repo)};
+	}
+	if (item.kind == "source") {
+		vector<std::pair<string, string>> options;
+		auto doc = yyjson_read(item.spec.c_str(), item.spec.size(), 0);
+		if (!doc) {
+			throw InvalidInputException("acl cluster: source \"%s\" has an unreadable spec", item.name);
+		}
+		auto opts = yyjson_obj_get(yyjson_doc_get_root(doc), "options");
+		if (opts && yyjson_is_obj(opts)) {
+			size_t idx, max;
+			yyjson_val *key, *val;
+			yyjson_obj_foreach(opts, idx, max, key, val) {
+				options.emplace_back(yyjson_get_str(key), yyjson_is_str(val) ? yyjson_get_str(val) : "");
+			}
+		}
+		yyjson_doc_free(doc);
+		return {AttachStatement(item.name, JsonField(item.spec, "path"), JsonField(item.spec, "type"),
+		                        JsonField(item.spec, "secret"), options, JsonField(item.spec, "lineage"))};
+	}
+	throw InvalidInputException("acl cluster: profile item \"%s\" has an unknown kind \"%s\"", item.name, item.kind);
+}
 
 bool ClusterBundleMaySet(const string &name) {
 	// an allowlist (review 118.2: a denylist of data paths left the ACL's own trust settings open) - the
