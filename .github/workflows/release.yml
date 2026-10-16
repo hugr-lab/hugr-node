@@ -6,12 +6,20 @@
 #   a tag v*          -> ghcr.io/hugr-lab/hugr-node:<tag> (both platforms), a GitHub Release with the assets,
 #                        build provenance for both
 #   workflow_dispatch -> the dry run: the same builds and tests, nothing pushed
+#   a pull request that touches the release's machinery -> the dry run, so a release is proven before it is needed
 name: Release
 
 on:
   push:
     tags:
       - 'v*'
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - docker/**
+      - scripts/**
+      - extension_config.cmake
+      - test/e2e/bootstrap/**
   workflow_dispatch:
 
 concurrency:

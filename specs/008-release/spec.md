@@ -27,7 +27,9 @@ release's assets: a repository takes them in and signs them.
 
 ### The workflow (`.github/workflows/release.yml`)
 
-- **Triggers**: a pushed tag `v*`, or `workflow_dispatch` for a dry run, which builds and tests but publishes nothing.
+- **Triggers**: a pushed tag `v*`. The dry run, which builds and tests but publishes nothing, comes from
+  `workflow_dispatch` and from any pull request that touches the release's machinery (the workflow, `docker/`,
+  `scripts/`, `extension_config.cmake`, the bootstrap e2e): a release is proven before it is needed.
 - **Matrix**: linux_amd64 on `ubuntu-24.04` and linux_arm64 on `ubuntu-24.04-arm`, both native (the repository is
   public, so the arm runners are free). Each runs `HUGR_NODE_RELEASE=1 GEN=ninja make` at the submodule pins, with
   vcpkg from the family's R2 cache.
@@ -79,8 +81,8 @@ Trusted publishing to a hosted repository is a job that waits for decision 7.
 
 ## Testing
 
-- A `workflow_dispatch` dry run on this branch: both platforms build, the e2e passes against the image, the arm64
-  smoke test passes, and nothing is pushed.
+- The dry run on this spec's pull request: both platforms build, the e2e passes against the image, the arm64 smoke
+  test passes, and nothing is pushed.
 - The e2e's `NODE_IMAGE` mode on CI. Locally the binary path stays as it is, because macOS builds no Linux image.
 
 ## Open decisions (owner)
