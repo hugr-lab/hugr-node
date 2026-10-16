@@ -1,6 +1,6 @@
 # Spec 008: the release - the node's image and the profile's extensions
 
-- **Status**: implemented (the dry run on CI pending)
+- **Status**: implemented
 - **Date**: 2026-10-16
 
 ## Summary
@@ -85,7 +85,23 @@ Trusted publishing to a hosted repository is a job that waits for decision 7.
   test passes, and nothing is pushed.
 - The e2e's `NODE_IMAGE` mode on CI. Locally the binary path stays as it is, because macOS builds no Linux image.
 
-## Open decisions (owner)
+## As built
+
+- **The dry run passed on the PR** (both platforms).
+  - amd64: the image bootstrapped itself against a kista seeded with the four extensions, which kista's intake
+    accepted (linux_amd64, duckdb 7304f7b115). It served, drained on SIGTERM through docker and tini with exit 0, and
+    the broken step stopped it.
+  - arm64: the suite passed, and the image listed its linked extensions.
+- **Found while building it**:
+  - **The pins.** `duckdb_extension_load` called inside a CMake *function* registers in the function's scope, so the
+    scanners were announced ("Load extension …") and never built. The loader is a macro.
+  - **The key's mode.** tresor refuses a key that others may read, and the e2e's first pass made the key 0644 so the
+    image's user could read it. The image's e2e now reads the key as a pod's fsGroup would: 0640 plus
+    `--group-add`.
+- **`workflow_dispatch` needs the workflow on the default branch.** Until the merge, the dry run comes from the pull
+  request's own trigger.
+
+## Open decisions (owner, decided 2026-10-16)
 
 | # | question | proposal |
 | --- | --- | --- |
