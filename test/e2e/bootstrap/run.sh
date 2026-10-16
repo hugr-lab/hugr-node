@@ -270,16 +270,17 @@ start_node() { # <log>
 		NODE_PID=$!
 		return
 	fi
-	# the image as a pod runs it: its own user, HOME in the image, only the HUGR_* variables; the files they name are
-	# this run's, read-only - and readable by the image's user (test material: a test CA, a dev key)
+	# the image as a pod runs it: its own user, HOME in the image, only the HUGR_* variables. The files they name are
+	# this run's, mounted read-only and readable the way a pod's fsGroup makes a secret volume readable: the group may
+	# read (0640), others nothing - tresor refuses a key others may read
 	local docker_env=() kv
 	for kv in "${node_env[@]}"; do
 		case "$kv" in HUGR_*) docker_env+=(-e "$kv") ;; esac
 	done
-	chmod 755 "$TMP" && chmod 644 "$TMP/ca.pem" "$TMP/node-key.pem"
+	chmod 750 "$TMP" && chmod 640 "$TMP/ca.pem" "$TMP/node-key.pem"
 	NODE_CONTAINER="hugr-node-e2e-$$-$RANDOM"
-	docker run --rm --name "$NODE_CONTAINER" --network host -v "$TMP:$TMP:ro" "${docker_env[@]}" "$NODE_IMAGE" \
-		>"$1" 2>&1 &
+	docker run --rm --name "$NODE_CONTAINER" --network host --group-add "$(id -g)" -v "$TMP:$TMP:ro" \
+		"${docker_env[@]}" "$NODE_IMAGE" >"$1" 2>&1 &
 	NODE_PID=$! # the docker client: it hands SIGTERM to the container (tini, then the node) and returns its exit code
 }
 wait_ready_or_exit() { # <log>: 0 ready, 1 exited
