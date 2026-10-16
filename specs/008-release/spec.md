@@ -1,6 +1,6 @@
 # Spec 008: the release - the node's image and the profile's extensions
 
-- **Status**: draft
+- **Status**: implemented (the dry run on CI pending)
 - **Date**: 2026-10-16
 
 ## Summary

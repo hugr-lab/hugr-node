@@ -19,10 +19,23 @@
 #
 #   test/e2e/bootstrap/run.sh   # TRESOR_SERVER_DIR / REPOSITORY_DIR = checkouts to build; otherwise their main is cloned
 #   (no KISTA_* variable here: kista reads its configuration from them)
+#
+# The release (spec 008) runs it on what it is about to publish: NODE_IMAGE=<image> starts the node as that image's
+# container (docker run --network host, its own user, tini as PID 1 - Linux only), and ASSETS_DIR=<release assets>
+# seeds the repository with every extension of the release - through scripts/publish_to_kista.sh, so kista's intake
+# checks each of them - and installs the catalog's from there.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 DUCKDB="${DUCKDB:-$ROOT/build/release/duckdb}"
-PGEXT="${PGEXT:-$ROOT/build/release/extension/postgres_scanner/postgres_scanner.duckdb_extension}"
+NODE_IMAGE="${NODE_IMAGE:-}"
+ASSETS_DIR="${ASSETS_DIR:-}"
+if [ -n "$ASSETS_DIR" ]; then
+	PGEXT="$ASSETS_DIR/postgres_scanner.duckdb_extension"
+	SEED=("$ASSETS_DIR"/*.duckdb_extension)
+else
+	PGEXT="${PGEXT:-$ROOT/build/release/extension/postgres_scanner/postgres_scanner.duckdb_extension}"
+	SEED=("$PGEXT")
+fi
 KC_PORT="${KEYCLOAK_PORT:-18680}"
 TS_PORT="${TRESOR_SERVER_PORT:-18643}"
 REPO_PORT="${REPOSITORY_PORT:-18744}"
@@ -46,6 +59,9 @@ for tool in docker go python3 curl openssl; do command -v "$tool" >/dev/null || 
 docker info >/dev/null 2>&1 || skip "docker is not running"
 [ -x "$DUCKDB" ] || skip "no hugr_node build at $DUCKDB (GEN=ninja make)"
 [ -f "$PGEXT" ] || skip "no postgres_scanner loadable at $PGEXT (HUGR_NODE_E2E=1 GEN=ninja make)"
+if [ -n "$NODE_IMAGE" ]; then
+	docker image inspect "$NODE_IMAGE" >/dev/null 2>&1 || fail "no image $NODE_IMAGE"
+fi
 [ -f "$ROOT/tresor/server/docker-compose.yml" ] || skip "no tresor submodule (git submodule update --init tresor)"
 for port in "$TS_PORT" "$REPO_PORT" "$CP_PORT" "$PG_PORT" "$FLIGHT_PORT"; do
 	if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then fail "127.0.0.1:$port is taken"; fi
@@ -59,6 +75,7 @@ cleanup() {
 		[ -n "$pid" ] && kill "$pid" 2>/dev/null || true
 	done
 	docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
+	[ -z "${NODE_CONTAINER:-}" ] || docker rm -f "$NODE_CONTAINER" >/dev/null 2>&1 || true
 	[ "${KEEP_KEYCLOAK:-0}" = 1 ] || "${COMPOSE[@]}" down >/dev/null 2>&1 || true
 	rm -rf "$TMP"
 }
@@ -164,16 +181,18 @@ ka() {
 		fail "kista admin $1 failed"
 	}
 }
-duckdb_version="$(kista ext inspect "$PGEXT" | sed -n 's/^duckdb version: *//p')"
-[ -n "$duckdb_version" ] || fail "kista could not read the build's duckdb version from $PGEXT"
 ka migrate >/dev/null
 ka tenant create hugr >/dev/null
 ka channel create hugr/e2e -kind signed >/dev/null
-ka version add "$duckdb_version" -kind dev >/dev/null
-ka channel versions hugr/e2e -add "$duckdb_version" >/dev/null
 ka key add hugr/e2e -signer file:e2e.pem -active >/dev/null
-ka release add hugr/e2e "$PGEXT" -name postgres_scanner >/dev/null
-echo "  kista on https://127.0.0.1:$REPO_PORT (channel hugr/e2e, duckdb $duckdb_version)"
+# the duckdb version and the releases: what a dev or test repository is seeded with (spec 008)
+"$ROOT/scripts/publish_to_kista.sh" "$TMP/bin/kista" "$TMP/kista/kista.yaml" hugr/e2e "${SEED[@]}" \
+	>"$TMP/publish.log" 2>&1 || {
+	cat "$TMP/publish.log" >&2
+	fail "publishing the build's extensions into kista failed"
+}
+sed -n 's/^published/  published/p' "$TMP/publish.log"
+echo "  kista on https://127.0.0.1:$REPO_PORT (channel hugr/e2e)"
 (exec env $(env | sed -n "s/^\(KISTA_[A-Za-z0-9_]*\)=.*/-u \1/p") "$TMP/bin/kista" serve -config "$TMP/kista/kista.yaml") \
 	>"$TMP/kista.log" 2>&1 &
 KISTA_PID=$!
@@ -246,8 +265,22 @@ node_env=(env -i PATH="$PATH" HOME="$TMP/node-home"
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$FLIGHT_PORT") 2>/dev/null; }
 start_node() { # <log>
 	mkdir -p "$TMP/node-home"
-	"${node_env[@]}" "$DUCKDB" -no-agent -c "PRAGMA hugr_node_run" >"$1" 2>&1 &
-	NODE_PID=$!
+	if [ -z "$NODE_IMAGE" ]; then
+		"${node_env[@]}" "$DUCKDB" -no-agent -c "PRAGMA hugr_node_run" >"$1" 2>&1 &
+		NODE_PID=$!
+		return
+	fi
+	# the image as a pod runs it: its own user, HOME in the image, only the HUGR_* variables; the files they name are
+	# this run's, read-only - and readable by the image's user (test material: a test CA, a dev key)
+	local docker_env=() kv
+	for kv in "${node_env[@]}"; do
+		case "$kv" in HUGR_*) docker_env+=(-e "$kv") ;; esac
+	done
+	chmod 755 "$TMP" && chmod 644 "$TMP/ca.pem" "$TMP/node-key.pem"
+	NODE_CONTAINER="hugr-node-e2e-$$-$RANDOM"
+	docker run --rm --name "$NODE_CONTAINER" --network host -v "$TMP:$TMP:ro" "${docker_env[@]}" "$NODE_IMAGE" \
+		>"$1" 2>&1 &
+	NODE_PID=$! # the docker client: it hands SIGTERM to the container (tini, then the node) and returns its exit code
 }
 wait_ready_or_exit() { # <log>: 0 ready, 1 exited
 	for _ in $(seq 120); do

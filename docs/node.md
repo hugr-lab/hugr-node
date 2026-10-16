@@ -11,6 +11,23 @@ profile, locks the configuration, opens the doors and blocks. On SIGTERM it drai
 the environment or the profile is a key or a secret: the node's identity is its workload identity, and every
 credential comes from tresor when it is used (spec 006).
 
+## The image
+
+A release (a tag `v*`, spec 008) publishes `ghcr.io/hugr-lab/hugr-node:<tag>` for linux amd64 and arm64.
+
+- **What is inside**: the node's duckdb CLI, with hugr_node (acl, tresor and acl_otel built in), httpfs, azure and icu
+  linked in. There is no other extension, no key and no secret: the profile's extensions come from the repository at
+  start.
+- **The base** is `ubuntu:24.04`, the glibc the CLI is built against.
+- **The process**: it runs as uid 10001. `tini` is PID 1, so a SIGTERM reaches the node: one still bootstrapping ends
+  at once, and one serving drains.
+- **The emptyDir**: `HOME=/var/lib/hugr-node` is where duckdb installs extensions, so mount an emptyDir there.
+- **The release's other assets**: one archive per platform holds the same CLI and the extensions a profile installs
+  (`hugr_node`, `postgres_scanner`, `mssql`, `ducklake`), unsigned, with `manifest.json` and `SHA256SUMS`.
+  - The extensions are built at the pins duckdb-acl tests and at the image's duckdb version.
+  - A repository signs them when it takes them in.
+  - `scripts/publish_to_kista.sh <kista> <config> <tenant/channel> <files>` seeds a dev or test kista with them.
+
 ## The environment
 
 | variable | what |
@@ -44,12 +61,16 @@ spec:
   serviceAccountName: hugr-node          # the node group's identity
   containers:
   - name: node
+    image: ghcr.io/hugr-lab/hugr-node:<tag>
     env:
     - name: HUGR_IDENTITY_ASSERTION_FILE
       value: /var/run/secrets/hugr/token
     volumeMounts:
     - { name: hugr-identity, mountPath: /var/run/secrets/hugr, readOnly: true }
+    - { name: home, mountPath: /var/lib/hugr-node }   # what duckdb installs from the repository
   volumes:
+  - name: home
+    emptyDir: {}
   - name: hugr-identity
     projected:
       sources:

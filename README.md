@@ -11,6 +11,9 @@ The hugr platform's part of a node, on top of [duckdb-acl](https://github.com/hu
 - **the node process** - `duckdb -c "PRAGMA hugr_node_run"` bootstraps the node from its pod's environment and the
   control plane, applies the profile, serves and stops on SIGTERM; no key or secret in the image, env or profile
   (spec 006, [docs/node.md](docs/node.md));
+- **the release** - a tag `v*` publishes the image `ghcr.io/hugr-lab/hugr-node:<tag>` (linux amd64 and arm64) after
+  the bootstrap e2e has passed on it, and the extensions a profile installs (postgres_scanner, mssql, ducklake, the
+  hugr_node loadable) as the release's assets, for a repository to take in (spec 008);
 - **OpenTelemetry** - acl_otel built in (spec 005): the audit, metrics, spans and lineage of acl and tresor exported
   over OTLP and OpenLineage, nothing until an endpoint is set; the destination is one for the whole cluster (a cluster
   profile item, never a group's);
