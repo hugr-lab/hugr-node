@@ -1,0 +1,219 @@
+# The release (spec 008): what a platform node runs, built at the submodule pins (not the branch head the distribution
+# build tracks) on each platform's own runner - the image (the node's CLI) and the extensions a profile installs from
+# a repository (postgres_scanner, mssql, ducklake, plus the hugr_node loadable). Nothing is published until the
+# bootstrap e2e has passed on the image itself (amd64) and the image has answered (arm64).
+#
+#   a tag v*          -> ghcr.io/hugr-lab/hugr-node:<tag> (both platforms), a GitHub Release with the assets,
+#                        build provenance for both
+#   workflow_dispatch -> the dry run: the same builds and tests, nothing pushed
+#   a pull request that touches the release's machinery -> the dry run, so a release is proven before it is needed
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - docker/**
+      - scripts/**
+      - extension_config.cmake
+      - test/e2e/bootstrap/**
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE: ghcr.io/hugr-lab/hugr-node
+
+jobs:
+  build:
+    name: Build + gate (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux_amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux_arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GEN: ninja
+      # the profile's extensions as loadables, at the pins duckdb-acl tests (extension_config.cmake)
+      HUGR_NODE_RELEASE: 1
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      VCPKG_BINARY_SOURCES: >-
+        ${{ vars.VCPKG_BINARY_SOURCES != '' && vars.VCPKG_BINARY_SOURCES
+        || 'clear;http,https://vcpkg-cache.duckdb.org,read' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.VCPKG_CACHING_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.VCPKG_CACHING_AWS_SECRET_ACCESS_KEY }}
+      AWS_ENDPOINT_URL: ${{ secrets.VCPKG_CACHING_AWS_ENDPOINT_URL }}
+      AWS_DEFAULT_REGION: ${{ secrets.VCPKG_CACHING_AWS_DEFAULT_REGION }}
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+    steps:
+      # no token left in .git/config: this job builds third-party code (the scanners at their mains) and holds
+      # packages: write for the push
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+          persist-credentials: false
+
+      - name: duckdb-acl's, tresor's and acl-otel's own submodules (the quack embed, the shared contracts)
+        run: |
+          git -C duckdb-acl submodule update --init --depth 1 third_party/quack duckdb-ext-common
+          git -C tresor submodule update --init --depth 1 duckdb-ext-common
+          git -C acl-otel submodule update --init --depth 1 duckdb-ext-common
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache
+
+      - name: Setup vcpkg
+        run: make vcpkg-setup
+
+      - name: Restore ccache
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: ccache-release-${{ matrix.platform }}-${{ hashFiles('.gitmodules', 'duckdb/CMakeLists.txt') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-release-${{ matrix.platform }}-
+            ccache-${{ matrix.platform }}-
+
+      - name: Build
+        run: |
+          EXT_FLAGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" make
+          ccache -s
+
+      # the node's own suite on each platform (the only test the arm64 build gets before it ships)
+      - name: The node's tests
+        run: build/release/test/unittest 'test/sql/*'
+
+      - name: The release's assets
+        run: scripts/release_assets.sh "dist/${{ matrix.platform }}"
+
+      - name: The image
+        run: |
+          manifest="dist/${{ matrix.platform }}/manifest.json"
+          duckdb_version="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["duckdb_version"])' "$manifest")"
+          docker build -f docker/Dockerfile -t "hugr-node:${{ matrix.arch }}" \
+            --build-arg VERSION="${GITHUB_REF_NAME}" --build-arg REVISION="${GITHUB_SHA}" \
+            --build-arg DUCKDB_VERSION="$duckdb_version" "dist/${{ matrix.platform }}"
+
+      # --- the gate: amd64 bootstraps the image itself, against a repository seeded with this release's extensions ---
+      - name: tresor-server (its main)
+        if: matrix.arch == 'amd64'
+        uses: actions/checkout@v7
+        with:
+          repository: hugr-lab/tresor-server
+          path: _tresor-server
+          persist-credentials: false
+
+      - uses: actions/setup-go@v6
+        if: matrix.arch == 'amd64'
+        with:
+          go-version-file: _tresor-server/go.mod
+          cache: false
+
+      - name: The bootstrap e2e on the image
+        if: matrix.arch == 'amd64'
+        run: |
+          NODE_IMAGE="hugr-node:amd64" ASSETS_DIR="dist/${{ matrix.platform }}" TRESOR_SERVER_DIR=_tresor-server \
+            test/e2e/bootstrap/run.sh 2>&1 | tee e2e.log
+          grep -q '^PASS: a node bootstraps itself' e2e.log
+          grep -q '^  published mssql' e2e.log && grep -q '^  published ducklake' e2e.log
+
+      - name: The image answers
+        if: matrix.arch == 'arm64'
+        run: |
+          got="$(docker run --rm --entrypoint /usr/local/bin/duckdb "hugr-node:${{ matrix.arch }}" -noheader -csv \
+            -c "SELECT string_agg(extension_name, ',' ORDER BY extension_name) FROM duckdb_extensions()
+                WHERE loaded AND extension_name IN ('hugr_node', 'httpfs', 'azure', 'icu')")"
+          echo "linked: $got"
+          [ "$got" = '"azure,httpfs,hugr_node,icu"' ]
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.platform }}
+          path: dist/${{ matrix.platform }}
+          if-no-files-found: error
+
+      # --- a tag only: the platform's image, by tag and platform; the publish job makes the manifest list ------------
+      - name: Push the platform's image
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag "hugr-node:${{ matrix.arch }}" "$IMAGE:${GITHUB_REF_NAME}-${{ matrix.arch }}"
+          docker push "$IMAGE:${GITHUB_REF_NAME}-${{ matrix.arch }}"
+
+  publish:
+    name: Publish
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      - name: One archive per platform
+        run: |
+          mkdir -p out
+          for dir in dist/dist-*; do
+            platform="${dir#dist/dist-}"
+            tar -C "$dir" -czf "out/hugr-node-${GITHUB_REF_NAME}-${platform}.tar.gz" .
+          done
+          (cd out && sha256sum ./*.tar.gz | sed 's| \./| |' >SHA256SUMS)
+          cat out/SHA256SUMS
+
+      - name: The image for both platforms
+        id: image
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker buildx imagetools create -t "$IMAGE:${GITHUB_REF_NAME}" \
+            "$IMAGE:${GITHUB_REF_NAME}-amd64" "$IMAGE:${GITHUB_REF_NAME}-arm64"
+          echo "digest=$(docker buildx imagetools inspect "$IMAGE:${GITHUB_REF_NAME}" --format '{{.Manifest.Digest}}')" \
+            >>"$GITHUB_OUTPUT"
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: out/*.tar.gz
+
+      - name: The GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "hugr-node $GITHUB_REF_NAME" \
+            --notes "The image: \`$IMAGE:$GITHUB_REF_NAME\` (${{ steps.image.outputs.digest }}).
+          Each archive holds one platform's node CLI and the extensions a profile installs from a repository
+          (hugr_node, postgres_scanner, mssql, ducklake - unsigned: a repository signs them at intake), with
+          manifest.json and SHA256SUMS. Seed a dev repository with scripts/publish_to_kista.sh." \
+            out/*.tar.gz out/SHA256SUMS
