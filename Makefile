@@ -11,6 +11,11 @@ USE_MERGED_VCPKG_MANIFEST := 1
 VCPKG_TOOLCHAIN_PATH ?= $(PROJ_DIR)vcpkg/scripts/buildsystems/vcpkg.cmake
 
 # Include the Makefile from extension-ci-tools
+# Spec 009: extension-ci-tools a90d6d4 (2026-10-15) hands the distribution build a prebuilt static duckdb whose
+# version (the release's alpha) is not the one the loadable names (the branch): duckdb-acl (spec 133) and acl-otel
+# (spec 026) found it. hugr_node builds duckdb from the pinned source, as they do.
+override DUCKDB_PREBUILT_LIBRARY :=
+override DUCKDB_PREBUILT_EXTENSIONS :=
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # --- the platform part's C++ test (duckdb-acl's style: one program per test/cpp/test_*.cpp, linked against the
