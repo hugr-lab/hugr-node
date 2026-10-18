@@ -116,6 +116,35 @@ ACL ROLE "fleet" SELECT name, state FROM platform.drift WHERE name IN ('memory_l
 filesrc	same
 memory_limit	same
 
+# hugr-node spec 010 review: an extension's setting the scratch cannot render (it loads no extension) is compared as a
+# number (`1e3` as written, `1000` on the node; `2` and `2.0` for httpfs' float) - else every node would wait for a
+# restart that never clears it
+statement ok
+ACL ADMIN CLUSTER SET acl_max_sessions = '1e3';
+
+statement ok
+SET GLOBAL acl_max_sessions = '1e3';
+
+query TTT
+ACL ROLE "fleet" SELECT state, node_value, profile_value FROM platform.drift WHERE name = 'acl_max_sessions';
+----
+same	1000	1e3
+
+statement ok
+ACL ADMIN CLUSTER RESET acl_max_sessions;
+
+# ...and a thread count is never set on the scratch: a profile's '1e6' would start a million threads on every read
+statement ok
+ACL ADMIN CLUSTER SET threads = '1e6';
+
+query T
+ACL ROLE "fleet" SELECT state FROM platform.drift WHERE name = 'threads';
+----
+differs
+
+statement ok
+ACL ADMIN CLUSTER SET threads = 3;
+
 # the profile names what the node lacks: profile_only
 statement ok
 ACL ROLE "root" ACL NATIVE DETACH src;

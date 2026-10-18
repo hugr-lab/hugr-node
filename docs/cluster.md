@@ -80,7 +80,8 @@ The class says how each kind of change reaches a running node:
 | `UPDATE` / `REMOVE EXTENSION`, `SET` / `RESET` | restart |
 
 duckdb cannot unload an extension from a running process. A node's configuration is locked after its
-bootstrap. The node agent rolls drain and restart changes out; acl only describes them.
+bootstrap. Each node applies hot changes on its own tick and reports drain and restart changes pending
+in its heartbeat; the orchestrator rolls the nodes (hugr-node spec 010, hugr-platform spec 001).
 
 - **No credentials, anywhere.** A path with a credential key is refused. That covers a conninfo
   `password=`, a URI's `user:password@`, a SAS `sig=` and the like, and so does an option with such a
@@ -90,7 +91,9 @@ bootstrap. The node agent rolls drain and restart changes out; acl only describe
   `allow_persistent_secrets`, `allow_extension_repositories`, the extension and secret directories
   and the like are refused - and (spec 118) the node's trust: `acl_allow_anonymous_admin`, the quack door's
   `acl_quack_authentication_function` / `acl_quack_authorization_function`,
-  `enable_server_cert_verification` / `enable_curl_server_cert_verification`, `disabled_filesystems`.
+  `enable_server_cert_verification` / `enable_curl_server_cert_verification`, `disabled_filesystems` - and
+  (spec 010) `temp_directory` (the pod's spill volume), `httpfs_client_implementation` and `redact_http_logs` (the
+  path the node's tokens travel).
   Only a GLOBAL setting may be profiled.
 - **Extensions come from a trusted repository.** `FROM` names a repository created with duckdb's
   `CREATE EXTENSION REPOSITORY`; with exactly one, it may be left out. A path, a URL, `core` and
@@ -120,7 +123,7 @@ bootstrap. The node agent rolls drain and restart changes out; acl only describe
   ordering defaults, the http client's timeouts and retries, `TimeZone` / `Calendar`, and acl's limits,
   windows and timeouts (`acl_max_sessions`, `acl_max_result_rows`, `acl_quack_*` sizes, `acl_*_timeout`,
   `acl_alias_types` / `acl_enum_types`, `acl_lineage_namespace` / `_level`, `acl_profile_level`, ...).
-  Anything else - a data path (`http_proxy*`, `temp_directory`, an endpoint, a log or audit sink), a key
+  Anything else - a data path (`http_proxy*`, an endpoint, a log or audit sink), a key
   location, the audit, a repository - is `passthrough`'s. `acl_node_group` is the deployment's, never an item.
 - **The telemetry's destination is the cluster's** (spec 005): acl_otel, built into hugr_node, exports nothing until
   `acl_otel_endpoint` (OTLP) or `acl_otel_lineage` (OpenLineage) is set. Where it goes - `acl_otel_endpoint`,

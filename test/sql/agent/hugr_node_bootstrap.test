@@ -22,6 +22,7 @@ SELECT step, sql FROM hugr_node_bootstrap_plan('{"version": 1, "node_group": "an
 1 hardening	SET GLOBAL autoload_known_extensions = false
 1 hardening	SET GLOBAL allow_persistent_secrets = false
 1 hardening	SET GLOBAL tresor_http_client = 'duckdb'
+1 hardening	SET GLOBAL enable_server_cert_verification = true
 1 hardening	SET GLOBAL ca_cert_file = '/etc/hugr/ca.pem'
 2 tresor	CREATE SECRET hugr_node_identity (TYPE tresor, SCOPE 'tresor:secrets.example', FLOW 'federated', ISSUER 'https://idp.example/realms/r', CLIENT_ID 'hugr-node', ASSERTION_FILE '/var/run/secrets/hugr/token')
 2 tresor	ATTACH 'tresor:secrets.example' AS hugr_tresor (SECRET hugr_node_identity, ACT_FOR_SESSIONS true)
@@ -73,7 +74,16 @@ SELECT * FROM hugr_node_bootstrap_plan('{"version": 1}',
   "HUGR_IDENTITY_CLIENT_ID": "c", "HUGR_IDENTITY_PRIVATE_KEY_FILE": "/k", "HUGR_CONTROL_PLANE": "https://cp",
   "HUGR_FLIGHT": "grpc://localhost:1"}');
 ----
-<REGEX>:.*HUGR_TRESOR_INSECURE_HTTP is for a tresor-server on loopback only, not "secrets.example:443".*
+<REGEX>:.*HUGR_TRESOR_INSECURE_HTTP is for a tresor-server on loopback only.*
+
+# ...a host and a port: userinfo would send the request elsewhere while the host still reads as loopback
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 1}',
+  environment := '{"HUGR_TRESOR": "localhost:1@evil.example", "HUGR_TRESOR_INSECURE_HTTP": "1", "HUGR_IDENTITY_ISSUER": "i",
+  "HUGR_IDENTITY_CLIENT_ID": "c", "HUGR_IDENTITY_PRIVATE_KEY_FILE": "/k", "HUGR_CONTROL_PLANE": "https://cp",
+  "HUGR_FLIGHT": "grpc://localhost:1"}');
+----
+<REGEX>:.*HUGR_TRESOR_INSECURE_HTTP is for a tresor-server on loopback only.*
 
 # --- refusals, each naming what is wrong --------------------------------------------------------------------------
 
@@ -101,9 +111,9 @@ CREATE MACRO plan_env() AS '{"HUGR_TRESOR": "t", "HUGR_IDENTITY_ISSUER": "i", "H
   "HUGR_IDENTITY_ASSERTION_FILE": "/a", "HUGR_CONTROL_PLANE": "https://cp", "HUGR_FLIGHT": "grpc://localhost:1"}';
 
 statement error
-SELECT * FROM hugr_node_bootstrap_plan('{"version": 2}', environment := plan_env());
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 3}', environment := plan_env());
 ----
-<REGEX>:.*version 2 is not one this node reads.*
+<REGEX>:.*version 3 is not one this node reads \(1, 2\).*
 
 statement error
 SELECT * FROM hugr_node_bootstrap_plan('{"version": 1, "catalog": {"type": "duckdb", "secret": "s"}}', environment := plan_env());
@@ -130,6 +140,176 @@ SELECT * FROM hugr_node_bootstrap_plan('not json', environment := plan_env());
 ----
 <REGEX>:.*the bootstrap document is not a JSON object.*
 
+# --- spec 010: the orchestrated entry - the document first, with the pod's token; tresor from it; the engine from the pod
+
+query II
+SELECT step, sql FROM hugr_node_bootstrap_plan('{"version": 2, "node_group": "etl", "node_label": "hugr-node-etl-7f9c-x2k8p",
+  "tresor": {"host": "tresor.example:443", "identity": {"issuer": "https://login.example/t/v2.0", "client_id": "etl-app",
+  "scope": "api://tresor/.default"}},
+  "repository": {"name": "hugr", "prefix": "https://kista.example/t/prod"},
+  "catalog": {"secret": "hugr_policy_catalog", "schema": "acl"}, "heartbeat": {"interval_seconds": 15}}',
+  environment := '{"HUGR_ORCHESTRATOR": "https://hugr-platform.hugr.svc:8443/",
+  "HUGR_ORCHESTRATOR_TOKEN_FILE": "/var/run/secrets/hugr/orchestrator/token",
+  "HUGR_IDENTITY_ASSERTION_FILE": "/var/run/secrets/hugr/idp/token", "HUGR_FLIGHT": "grpc+tls://0.0.0.0:32010",
+  "HUGR_FLIGHT_CERT": "/tls/tls.crt", "HUGR_FLIGHT_KEY": "/tls/tls.key", "HUGR_POD_MEMORY": "137438953472", "HUGR_POD_CPU": "16",
+  "HUGR_TEMP_DIRECTORY": "/var/lib/hugr-node/tmp", "HUGR_TEMP_SIZE": "600GiB"}');
+----
+1 hardening	SET GLOBAL allow_extension_repositories = 'allowed'
+1 hardening	SET GLOBAL autoinstall_known_extensions = false
+1 hardening	SET GLOBAL autoload_known_extensions = false
+1 hardening	SET GLOBAL allow_persistent_secrets = false
+1 hardening	SET GLOBAL tresor_http_client = 'duckdb'
+1 hardening	SET GLOBAL enable_server_cert_verification = true
+1 hardening	SET GLOBAL temp_directory = '/var/lib/hugr-node/tmp'
+2 bootstrap document	-- GET https://hugr-platform.hugr.svc:8443/v1/bootstrap with Authorization: Bearer <the content of /var/run/secrets/hugr/orchestrator/token>
+3 tresor	CREATE SECRET hugr_node_identity (TYPE tresor, SCOPE 'tresor:tresor.example:443', FLOW 'federated', ISSUER 'https://login.example/t/v2.0', CLIENT_ID 'etl-app', ASSERTION_FILE '/var/run/secrets/hugr/idp/token', OAUTH_SCOPE 'api://tresor/.default')
+3 tresor	ATTACH 'tresor:tresor.example:443' AS hugr_tresor (SECRET hugr_node_identity, ACT_FOR_SESSIONS true)
+4 repository	CREATE OR REPLACE EXTENSION REPOSITORY "hugr" WITH PREFIX 'https://kista.example/t/prod'
+5 policy catalog	-- the catalog's type: the type of secret 'hugr_policy_catalog' in duckdb_secrets(), its extension from "hugr"
+5 policy catalog	ATTACH '' AS hugr_policy (TYPE <the secret's type>, SECRET "hugr_policy_catalog")
+5 policy catalog	SET GLOBAL acl_node_group = 'etl'
+5 policy catalog	SET GLOBAL acl_node_label = 'hugr-node-etl-7f9c-x2k8p'
+5 policy catalog	SELECT acl_use_db('hugr_policy', 'acl')
+6 engine	SET GLOBAL memory_limit = '104857MiB'
+6 engine	SET GLOBAL threads = '16'
+6 engine	SET GLOBAL max_temp_directory_size = '552960MiB'
+6 profile	-- each item of acl_cluster_effective() in its order: hugr_node_profile_statements()
+7 lock	SET GLOBAL lock_configuration = true
+8 serve	SELECT acl_cluster_applied(<the profile version read in step 6>)
+8 serve	SELECT acl_flight_serve('grpc+tls://0.0.0.0:32010', '/tls/tls.crt', '/tls/tls.key')
+
+statement ok
+CREATE MACRO doc_v2() AS '{"version": 2, "node_group": "g", "node_label": "n1", "tresor": {"host": "t", "identity": {"issuer": "i",
+  "client_id": "c"}}, "repository": {"prefix": "https://ext"}, "catalog": {"secret": "hugr_policy_catalog"}}';
+
+statement ok
+CREATE MACRO orchestrated_env() AS '{"HUGR_ORCHESTRATOR": "https://o", "HUGR_ORCHESTRATOR_TOKEN_FILE": "/o",
+  "HUGR_IDENTITY_ASSERTION_FILE": "/a", "HUGR_FLIGHT": "grpc://localhost:1"}';
+
+# a pod that says nothing about its resources gets no engine line (DuckDB's own defaults stay)
+query I
+SELECT count(*) FROM hugr_node_bootstrap_plan(doc_v2(), environment := orchestrated_env()) WHERE step = '6 engine';
+----
+0
+
+# one source per value: what the document names is refused in the environment
+foreach variable HUGR_TRESOR HUGR_IDENTITY_ISSUER HUGR_IDENTITY_CLIENT_ID HUGR_IDENTITY_SCOPE HUGR_CONTROL_PLANE
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(doc_v2(), environment := '{"HUGR_ORCHESTRATOR": "https://o",
+  "HUGR_ORCHESTRATOR_TOKEN_FILE": "/o", "HUGR_IDENTITY_ASSERTION_FILE": "/a", "HUGR_FLIGHT": "grpc://localhost:1",
+  "{variable}": "x"}');
+----
+<REGEX>:.*comes in the orchestrator's document when HUGR_ORCHESTRATOR is set.*
+
+endloop
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(doc_v2(), environment := '{"HUGR_ORCHESTRATOR": "http://o",
+  "HUGR_ORCHESTRATOR_TOKEN_FILE": "/o", "HUGR_IDENTITY_ASSERTION_FILE": "/a", "HUGR_FLIGHT": "grpc://localhost:1"}');
+----
+<REGEX>:.*HUGR_ORCHESTRATOR is an https URL without userinfo.*
+
+# the bearer goes there: no userinfo either (and the refusal never repeats the URL)
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(doc_v2(), environment := '{"HUGR_ORCHESTRATOR": "https://u:p@o",
+  "HUGR_ORCHESTRATOR_TOKEN_FILE": "/o", "HUGR_IDENTITY_ASSERTION_FILE": "/a", "HUGR_FLIGHT": "grpc://localhost:1"}');
+----
+<REGEX>:.*HUGR_ORCHESTRATOR is an https URL without userinfo.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(doc_v2(), environment := '{"HUGR_ORCHESTRATOR": "https://o",
+  "HUGR_IDENTITY_ASSERTION_FILE": "/a", "HUGR_FLIGHT": "grpc://localhost:1"}');
+----
+<REGEX>:.*HUGR_ORCHESTRATOR_TOKEN_FILE is not set.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(doc_v2(), environment := '{"HUGR_ORCHESTRATOR": "https://o",
+  "HUGR_ORCHESTRATOR_TOKEN_FILE": "/o", "HUGR_IDENTITY_ASSERTION_FILE": "/a", "HUGR_FLIGHT": "grpc://localhost:1",
+  "HUGR_TEMP_DIRECTORY": "/tmp/spill"}');
+----
+<REGEX>:.*HUGR_TEMP_DIRECTORY and HUGR_TEMP_SIZE go together.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(doc_v2(), environment := '{"HUGR_ORCHESTRATOR": "https://o",
+  "HUGR_ORCHESTRATOR_TOKEN_FILE": "/o", "HUGR_IDENTITY_ASSERTION_FILE": "/a", "HUGR_FLIGHT": "grpc://localhost:1",
+  "HUGR_POD_CPU": "1.5"}');
+----
+<REGEX>:.*HUGR_POD_CPU is a whole number of cores.*
+
+# a size below 1 MiB is no pod's - a Downward API divisor other than 1
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(doc_v2(), environment := '{"HUGR_ORCHESTRATOR": "https://o",
+  "HUGR_ORCHESTRATOR_TOKEN_FILE": "/o", "HUGR_IDENTITY_ASSERTION_FILE": "/a", "HUGR_FLIGHT": "grpc://localhost:1",
+  "HUGR_POD_MEMORY": "4096"}');
+----
+<REGEX>:.*HUGR_POD_MEMORY is a size of at least 1 MiB.*
+
+# the spill volume's size as Kubernetes writes a sizeLimit (binary units) reads like duckdb's own
+query II
+SELECT step, sql FROM hugr_node_bootstrap_plan(doc_v2(), environment := '{"HUGR_ORCHESTRATOR": "https://o",
+  "HUGR_ORCHESTRATOR_TOKEN_FILE": "/o", "HUGR_IDENTITY_ASSERTION_FILE": "/a", "HUGR_FLIGHT": "grpc://localhost:1",
+  "HUGR_TEMP_DIRECTORY": "/spill", "HUGR_TEMP_SIZE": "600Gi"}') WHERE step = '6 engine';
+----
+6 engine	SET GLOBAL max_temp_directory_size = '552960MiB'
+
+# each document goes with its own entry
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 1, "repository": {"prefix": "https://ext"},
+  "catalog": {"type": "duckdb", "secret": "s"}}', environment := orchestrated_env());
+----
+<REGEX>:.*an orchestrated node reads version 2.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(doc_v2(), environment := plan_env());
+----
+<REGEX>:.*a bootstrap document of version 2 is the orchestrator's.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 2, "node_group": "g", "tresor": {"host": "t", "identity": {"issuer": "i",
+  "client_id": "c"}}, "repository": {"prefix": "https://ext"}, "catalog": {"secret": "s"}}', environment := orchestrated_env());
+----
+<REGEX>:.*version 2\) names no node_label that is a DNS label.*
+
+# the label is what the node's sessions carry (duckdb-acl spec 134): a DNS label, refused here rather than at step 5
+foreach label Node-1 hugr.node.1 -n1 n_1
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 2, "node_group": "g", "node_label": "{label}", "tresor": {"host": "t",
+  "identity": {"issuer": "i", "client_id": "c"}}, "repository": {"prefix": "https://ext"}, "catalog": {"secret": "s"}}',
+  environment := orchestrated_env());
+----
+<REGEX>:.*version 2\) names no node_label that is a DNS label.*
+
+endloop
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 2, "node_label": "n1", "tresor": {"host": "t", "identity":
+  {"issuer": "i", "client_id": "c"}}, "repository": {"prefix": "https://ext"}, "catalog": {"secret": "s"}}',
+  environment := orchestrated_env());
+----
+<REGEX>:.*version 2\) names no node_group - an orchestrated node always belongs to its group.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 2, "node_group": "g", "node_label": "n1", "tresor": {"host": "t"},
+  "repository": {"prefix": "https://ext"}, "catalog": {"secret": "s"}}', environment := orchestrated_env());
+----
+<REGEX>:.*names no tresor host, issuer and client_id.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 2, "node_group": "g", "node_label": "n1", "tresor": {"host": "t",
+  "identity": {"issuer": "i", "client_id": "c"}}, "repository": {"prefix": "https://ext"}, "catalog": {"secret": "s"},
+  "heartbeat": {"interval_seconds": 0}}', environment := orchestrated_env());
+----
+<REGEX>:.*heartbeat interval_seconds is 1..3600, not 0.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 2, "node_group": "g", "node_label": "n1", "tresor": {"host": "t",
+  "identity": {"issuer": "i", "client_id": "c"}}, "repository": {"prefix": "https://ext"}, "catalog": {"secret": "s"},
+  "heartbeat": {"interval_seconds": "15s"}}', environment := orchestrated_env());
+----
+<REGEX>:.*heartbeat interval_seconds is a whole number of seconds.*
+
 # --- the profile's statements, in the profile's order -------------------------------------------------------------
 
 statement ok
@@ -152,6 +332,67 @@ SELECT step, sql FROM hugr_node_profile_statements();
 ----
 6 profile: setting threads	SET GLOBAL "threads" = '2'
 6 profile: source src	ATTACH ':memory:' AS "src" (TYPE duckdb)
+
+# spec 010: an engine setting past the pod is cut to its ceiling - 90% of the pod's memory, its CPU
+statement ok
+ACL ADMIN CLUSTER SET memory_limit = '500GB';
+
+query II
+SELECT step, sql FROM hugr_node_profile_statements(environment := '{"HUGR_POD_MEMORY": "100GiB", "HUGR_POD_CPU": "1"}')
+WHERE step LIKE '%setting%' ORDER BY step;
+----
+6 profile: setting memory_limit (cut to the pod)	SET GLOBAL "memory_limit" = '92160MiB'
+6 profile: setting threads (cut to the pod)	SET GLOBAL "threads" = '1'
+
+# ...and one under the ceiling is applied as written
+query II
+SELECT step, sql FROM hugr_node_profile_statements(environment := '{"HUGR_POD_MEMORY": "1000GiB", "HUGR_POD_CPU": "8"}')
+WHERE step LIKE '%setting%' ORDER BY step;
+----
+6 profile: setting memory_limit	SET GLOBAL "memory_limit" = '500GB'
+6 profile: setting threads	SET GLOBAL "threads" = '2'
+
+# ...and a value that is no amount - unlimited, a percentage, '1e2' threads - asks for everything: the ceiling cuts
+# it (fails closed), where duckdb would take the whole machine
+foreach memory -1 none 95%
+
+statement ok
+ACL ADMIN CLUSTER SET memory_limit = '{memory}';
+
+query II
+SELECT step, sql FROM hugr_node_profile_statements(environment := '{"HUGR_POD_MEMORY": "100GiB", "HUGR_POD_CPU": "8"}')
+WHERE step LIKE '%memory_limit%';
+----
+6 profile: setting memory_limit (cut to the pod)	SET GLOBAL "memory_limit" = '92160MiB'
+
+endloop
+
+statement ok
+ACL ADMIN CLUSTER SET max_temp_directory_size = '90% of available disk space';
+
+query II
+SELECT step, sql FROM hugr_node_profile_statements(environment := '{"HUGR_TEMP_SIZE": "100GiB"}')
+WHERE step LIKE '%max_temp%';
+----
+6 profile: setting max_temp_directory_size (cut to the pod)	SET GLOBAL "max_temp_directory_size" = '92160MiB'
+
+statement ok
+ACL ADMIN CLUSTER RESET max_temp_directory_size;
+
+statement ok
+ACL ADMIN CLUSTER SET threads = '1e2';
+
+query II
+SELECT step, sql FROM hugr_node_profile_statements(environment := '{"HUGR_POD_MEMORY": "100GiB", "HUGR_POD_CPU": "8"}')
+WHERE step LIKE '%threads%';
+----
+6 profile: setting threads (cut to the pod)	SET GLOBAL "threads" = '8'
+
+statement ok
+ACL ADMIN CLUSTER SET threads = 2;
+
+statement ok
+ACL ADMIN CLUSTER RESET memory_limit;
 
 # --- none of it under a principal ---------------------------------------------------------------------------------
 

@@ -119,6 +119,44 @@ The first failing step stops the bootstrap. The error names the step, no port op
 `hugr_node_bootstrap_plan('<document>')` shows the statements a document would run, and `hugr_node_profile_statements()`
 shows the ones that apply this node's profile - both run nothing.
 
+## In an orchestrated cluster
+
+With `HUGR_ORCHESTRATOR` set, the node asks the orchestrator first (spec 010; the orchestrator is
+hugr-platform's operator).
+
+| variable | what |
+| --- | --- |
+| `HUGR_ORCHESTRATOR` | the operator's https base URL (no userinfo) |
+| `HUGR_ORCHESTRATOR_TOKEN_FILE` | a projected service-account token with the audience `hugr-platform`: the entry and the heartbeat |
+| `HUGR_IDENTITY_ASSERTION_FILE` | a second projected token, with the IdP's federation audience: the login to tresor |
+| `HUGR_POD_MEMORY`, `HUGR_POD_CPU` | the container's memory limit and CPU request, through the Downward API (`limits.memory`, `requests.cpu`, divisor 1) |
+| `HUGR_TEMP_DIRECTORY`, `HUGR_TEMP_SIZE` | the spill volume's mount and its size (bytes, `600GiB` or `600Gi`) |
+
+`HUGR_TRESOR`, `HUGR_IDENTITY_ISSUER`, `HUGR_IDENTITY_CLIENT_ID`, `HUGR_IDENTITY_SCOPE` and `HUGR_CONTROL_PLANE` are
+refused then: the orchestrator's document names them. `HUGR_POD_*` and `HUGR_TEMP_*` work without an orchestrator too.
+
+- **The document** (version 2) comes from `GET <HUGR_ORCHESTRATOR>/v1/bootstrap` with the first token as the bearer. It
+  names the group, the node's label, tresor and the node's identity in the IdP, the repository, the catalog's secret
+  and the heartbeat's interval. The catalog's type is the secret's own type, read from tresor before anything is
+  attached.
+- **The node's name.** The node sets `acl_node_group` and `acl_node_label` from the document. Its sessions carry the
+  label, so a front routes by it.
+- **The engine follows the pod.**
+  - The defaults: `memory_limit` at 80% of the pod's memory, `threads` at its CPU, `max_temp_directory_size` at 90%
+    of the spill volume.
+  - A profile item for one of them wins, but is cut to a ceiling: 90% of the memory, the CPU, 90% of the volume. A
+    value that is no amount (`-1`, `none`, `95%`) is cut to the ceiling too.
+  - This keeps a node from being OOM-killed, or evicted because its spill filled the node's disk.
+- **The tick.** Every heartbeat interval, and every 15 s without an orchestrator, the node:
+  - applies the profile's hot items it does not have yet: a new source, a new extension;
+  - detaches a source it took from the profile that the profile no longer has;
+  - reports what needs a restart or a drain: a setting that differs or was reset, an extension at another version or
+    removed, a re-pointed source (to the same type too);
+  - drains itself when its resource group is gone from the policy, and resumes when it is back;
+  - sends the heartbeat: its versions, the profile version it has applied, what is pending, its drift and its load.
+
+  A source attached by hand (`ACL NATIVE`) is never detached: it shows as drift.
+
 ## Stopping
 
 On SIGTERM the node stops seating new sessions and waits until the sessions end or `HUGR_DRAIN_DEADLINE` passes. Then
@@ -128,5 +166,5 @@ second SIGTERM skips the wait.
 ## What a profile may not change
 
 The bootstrap sets the node's trust settings, and no cluster-profile item may change them. These are
-`ca_cert_file`, `tresor_http_client`, the autoinstall settings and the extension repository settings, together with
-the hardening list in [Node groups and the cluster profile](cluster.md).
+`ca_cert_file`, `tresor_http_client`, `temp_directory`, the autoinstall settings and the extension repository settings,
+together with the hardening list in [Node groups and the cluster profile](cluster.md).

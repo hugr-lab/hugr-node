@@ -5,11 +5,16 @@
 // and the control plane's bootstrap document, serves, and stops on SIGTERM; hugr_node_bootstrap_plan(document) answers
 // the statements the bootstrap would run; hugr_node_profile_statements() the ones that apply this node's profile.
 // The plan is pure (the environment and the document in, statements out) - the tests and an operator read it.
+// Spec 010: in an orchestrated cluster (HUGR_ORCHESTRATOR) the entry asks the orchestrator first, with the pod's own
+// ServiceAccount token, for a document v2 that names tresor and the node's identity; the engine is sized from the
+// pod; and the runner's loop ticks - the profile's hot items applied on every node, the rest reported pending, a
+// self-drain when the node's resource group is gone, and the heartbeat.
 //===----------------------------------------------------------------------===//
 
 #pragma once
 
 #include "acl_policy.hpp"
+#include "hugr_node_engine.hpp"
 
 namespace duckdb {
 class ExtensionLoader;
@@ -34,6 +39,14 @@ struct AgentEnvironment {
 	//! test environment that cannot give the service and the IdP a trusted certificate (a Go service on macOS ignores
 	//! SSL_CERT_FILE); never needed by the node itself, which trusts HUGR_CA_FILE through tresor_http_client = duckdb
 	bool tresor_insecure_http = false;
+	//! spec 010: HUGR_ORCHESTRATOR (the operator's https base URL) makes the entry orchestrated: the document v2 is
+	//! fetched first with HUGR_ORCHESTRATOR_TOKEN_FILE (the projected token, audience hugr-platform), and tresor's host
+	//! and the node's identity come from it - set in the environment as well, they are refused (one source per value)
+	string orchestrator;
+	string orchestrator_token_file;
+	//! spec 010: the container, through the Downward API (HUGR_POD_MEMORY, HUGR_POD_CPU) and the spill volume
+	//! (HUGR_TEMP_DIRECTORY, HUGR_TEMP_SIZE)
+	PodResources pod;
 
 	static AgentEnvironment FromProcess();
 	//! the same variables as a JSON object (hugr_node_bootstrap_plan's `environment :=`)
@@ -43,15 +56,25 @@ struct AgentEnvironment {
 	bool DevIdentity() const {
 		return assertion_file.empty() && !private_key_file.empty();
 	}
+	bool Orchestrated() const {
+		return !orchestrator.empty();
+	}
 };
 
-//! What the control plane answers at GET <HUGR_CONTROL_PLANE>/v1/bootstrap (version 1): pointers, never a secret
+//! What the control plane answers at GET <HUGR_CONTROL_PLANE>/v1/bootstrap (version 1), or the orchestrator at
+//! GET <HUGR_ORCHESTRATOR>/v1/bootstrap (version 2, spec 010): pointers and names, never a secret
 struct BootstrapDocument {
 	int64_t version = 0;
 	string node_group;
 	string repository_name = "hugr";
 	string repository_prefix;
+	//! version 2 names the catalog's secret only: its type (and so the extension) is the secret's, read at the run
 	string catalog_type, catalog_extension, catalog_path, catalog_secret, catalog_schema = "acl";
+	//! version 2: the node's label (its pod's name - duckdb-acl spec 134 acl_node_label), tresor and the node's
+	//! identity in the IdP, the heartbeat's interval
+	string node_label;
+	string tresor_host, tresor_issuer, tresor_client_id, tresor_scope;
+	int64_t heartbeat_interval = 15;
 
 	//! refuses an unknown version, a missing field (named) and a prefix that is not https
 	static BootstrapDocument Parse(const string &json);

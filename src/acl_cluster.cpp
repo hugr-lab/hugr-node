@@ -20,6 +20,8 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
+#include "duckdb/storage/object_cache.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "yyjson.hpp"
 
@@ -73,7 +75,13 @@ const case_insensitive_set_t HARDENING_SETTINGS = {
     // spec 006: which certificates the node trusts and where code may come from - the bootstrap sets them from
     // the environment, never a profile item (found 2026-10-15: ca_cert_file could hand every node a new CA)
     "ca_cert_file", "autoinstall_known_extensions", "autoload_known_extensions", "custom_extension_repository",
-    "autoinstall_extension_repository", "tresor_http_client"};
+    "autoinstall_extension_repository", "tresor_http_client",
+    // spec 010: where a node spills is its pod's (the spill volume, set by the bootstrap from HUGR_TEMP_DIRECTORY) - a
+    // profile item could otherwise point every node's temp files somewhere else
+    "temp_directory",
+    // spec 010 review: the bearer path - which HTTP client carries the node's tokens (httplib verifies by its own
+    // setting) and whether its log shows an Authorization header as written
+    "httpfs_client_implementation", "redact_http_logs"};
 
 //! Where the cluster's telemetry goes (spec 005): one destination for the whole cluster (the owner, 2026-10-14) - a
 //! profile item of the cluster's scope, never of a group's
@@ -366,6 +374,44 @@ string JsonField(const string &json, const char *field) {
 
 } // namespace
 
+string ClusterExtensionOfType(const string &type) {
+	return ExtensionOfType(type);
+}
+
+namespace {
+
+//! spec 010: what this node's own profile writes applied here before their commit - per instance, in its object cache
+class AppliedHere : public ObjectCacheEntry {
+public:
+	static string ObjectType() {
+		return "hugr_node_applied_here";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx(); // never evicted: a note between a write and the next tick
+	}
+	mutex lock;
+	vector<std::pair<string, string>> items;
+};
+
+} // namespace
+
+void NoteAppliedHere(DatabaseInstance &db, const string &kind, const string &name) {
+	auto here = db.GetObjectCache().GetOrCreate<AppliedHere>(AppliedHere::ObjectType());
+	lock_guard<mutex> guard(here->lock);
+	here->items.emplace_back(kind, name);
+}
+
+vector<std::pair<string, string>> TakeAppliedHere(DatabaseInstance &db) {
+	auto here = db.GetObjectCache().GetOrCreate<AppliedHere>(AppliedHere::ObjectType());
+	lock_guard<mutex> guard(here->lock);
+	auto out = std::move(here->items);
+	here->items.clear();
+	return out;
+}
+
 vector<string> ClusterItemApplyStatements(const PolicyStore::ClusterItem &item) {
 	using namespace duckdb_yyjson; // NOLINT
 	if (item.kind == "setting") {
@@ -423,9 +469,11 @@ bool ClusterBundleMaySet(const string &name) {
 	return TUNING_SETTINGS.count(name) > 0;
 }
 
-PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, const string &scope, const string &name,
+PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, const string &scope, const string &name_p,
                                                          const string &version, const string &repository,
                                                          const string &comment) {
+	// spec 010 review: one extension, one item - `postgres` is the item `postgres_scanner`, as duckdb loads it
+	auto name = ExtensionHelper::ApplyExtensionAlias(name_p);
 	RequireClusterCatalog(catalog, "acl_cluster_extension");
 	auto db = instance.lock();
 	if (!db) {
@@ -518,13 +566,14 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, con
 			    return;
 		    }
 		    if (v != "install") {
-			    answer.note = "restart class - a running process cannot unload or reload an extension; the node agent "
-			                  "rolls it out through drain";
+			    answer.note = "restart class - a running process cannot unload or reload an extension; each node "
+			                  "reports it pending until it restarts (the orchestrator rolls it)";
 			    return;
 		    }
 		    NodeQuery(*db, "INSTALL " + Ident(name) + " FROM " + Ident(repo) + " VERSION " + Quoted(version));
 		    NodeQuery(*db, "LOAD " + Ident(name) + " FROM " + Ident(repo));
 		    answer.applied_here = true;
+		    NoteAppliedHere(*db, "extension", name);
 	    });
 	return answer;
 }
@@ -634,12 +683,13 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 			    answer.note = string(overrides && !repoint ? "drain class - it overrides the cluster's source of that "
 			                                                 "name on this group's nodes; "
 			                                               : "drain class - ") +
-			                  "re-pointing an attached source is DETACH + ATTACH under the same name; the node agent "
-			                  "applies it through drain";
+			                  "re-pointing an attached source is DETACH + ATTACH under the same name; each node "
+			                  "reports it pending for a drain";
 			    return;
 		    }
 		    if (NodeHasDatabase(*db, alias)) {
 			    answer.note = "\"" + alias + "\" is already attached on this node - the profile now describes it";
+			    NoteAppliedHere(*db, "source", alias);
 			    if (!lineage.empty()) {
 				    NodeQuery(*db, "SELECT acl_lineage_source(" + Quoted(alias) + ", " + Quoted(lineage) + ")");
 				    answer.note += "; its lineage identity is declared";
@@ -648,6 +698,7 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 		    }
 		    NodeQuery(*db, AttachStatement(alias, path, type, secret, options, lineage));
 		    answer.applied_here = true;
+		    NoteAppliedHere(*db, "source", alias);
 	    });
 	return answer;
 }
@@ -846,13 +897,13 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const
 			    answer.note += string(answer.note.empty() ? "" : "; ") +
 			                   "the cluster's source of that name is in "
 			                   "effect again on this node: " +
-			                   StringUtil::Join(repointed, ", ") + " - the node agent re-points it through drain";
+			                   StringUtil::Join(repointed, ", ") + " - the node reports it pending for a drain";
 		    }
 		    if (!busy.empty()) {
 			    answer.item_class = "drain";
 			    answer.note += string(answer.note.empty() ? "" : "; ") +
 			                   "in use on this node: " + StringUtil::Join(busy, ", ") +
-			                   " - the node agent detaches it through drain";
+			                   " - the node reports it pending for a drain";
 		    }
 	    });
 	return answer;
@@ -918,10 +969,32 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterSetting(const string &verb, const
 		        })) {
 			    return;
 		    }
-		    answer.note = "restart class - the node's configuration is locked after its bootstrap; the node agent "
-		                  "rolls the change out through drain";
+		    answer.note = "restart class - the node's configuration is locked after its bootstrap; each node reports "
+		                  "the change pending until it restarts (the orchestrator rolls it)";
 	    });
 	return answer;
+}
+
+//! spec 010 review: an extension's setting the scratch cannot render (it lacks the extension) is the same value when
+//! it reads as the same boolean (`yes` as written, `true` on the node) or the same number (`2`, `2.0`)
+static bool SameValue(const string &node_value, const string &wanted) {
+	bool a = false;
+	bool b = false;
+	if (TryCastStringBool(node_value.c_str(), node_value.size(), a, false) &&
+	    TryCastStringBool(wanted.c_str(), wanted.size(), b, false)) {
+		return a == b;
+	}
+	double x = 0;
+	double y = 0;
+	return TryCast::Operation<string_t, double>(string_t(node_value), x) &&
+	       TryCast::Operation<string_t, double>(string_t(wanted), y) && x == y;
+}
+
+//! a setting that starts threads when it is set: never set on the scratch (a profile's `1e6` would start a million
+//! there on every tick) - its value is a number, compared as one
+static bool StartsThreads(const string &name) {
+	auto lower = StringUtil::Lower(name);
+	return lower == "threads" || lower == "worker_threads" || lower == "external_threads";
 }
 
 vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
@@ -937,7 +1010,9 @@ vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 		return kind == "setting" ? 0 : kind == "extension" ? 1 : 2;
 	};
 	for (auto &item : effective) {
-		profile[slot(item.kind)][item.name] = &item;
+		// spec 010 review: an extension by its canonical name - `postgres` is loaded as `postgres_scanner`
+		auto name = item.kind == "extension" ? ExtensionHelper::ApplyExtensionAlias(item.name) : item.name;
+		profile[slot(item.kind)][name] = &item;
 	}
 	// databases: bootstrap (the default, the policy's, a secrets service) or compared with the sources
 	string default_db;
@@ -957,11 +1032,17 @@ vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 		return StringUtil::CIEquals(type, "duckdb") || StringUtil::CIEquals(type, "sqlite") ? path : "(" + type + ")";
 	};
 	case_insensitive_set_t on_node;
+	// spec 010 review: the policy catalog's extension is loaded at the bootstrap's step 5, before the profile can be
+	// read - its version is the repository's then, whatever an item says, and a restart repeats that order
+	string catalog_extension;
 	for (idx_t i = 0; i < database_rows.Count(); i++) {
 		auto name = database_rows.GetValue(0, i).ToString();
 		auto path = database_rows.GetValue(1, i).ToString();
 		auto type = database_rows.GetValue(2, i).ToString();
 		on_node.insert(name);
+		if (catalog && StringUtil::CIEquals(name, catalog->db_name)) {
+			catalog_extension = ExtensionOfType(type);
+		}
 		auto source = profile[2].find(name);
 		if (source != profile[2].end()) {
 			auto wanted = JsonField(source->second->spec, "type");
@@ -992,6 +1073,12 @@ vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 		auto mode = extension_rows.GetValue(2, i).ToString();
 		loaded.insert(name);
 		auto item = profile[1].find(name);
+		if (!catalog_extension.empty() && StringUtil::CIEquals(name, catalog_extension)) {
+			out.push_back({"extension", name, "bootstrap", version,
+			               item == profile[1].end() ? string() : JsonField(item->second->spec, "version"),
+			               item == profile[1].end() ? string() : item->second->scope});
+			continue;
+		}
 		if (item != profile[1].end()) {
 			auto wanted = JsonField(item->second->spec, "version");
 			bool same = wanted.empty() || StringUtil::CIEquals(wanted, version);
@@ -1021,6 +1108,7 @@ vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 		}
 		DBConfig scratch_config; // no extension - acl itself never (a second store and override)
 		scratch_config.options.load_extensions = false;
+		scratch_config.SetOptionByName("threads", Value::BIGINT(1));
 		scratch_config.SetOptionByName("enable_external_access", Value::BOOLEAN(false));
 		scratch_config.SetOptionByName("autoload_known_extensions", Value::BOOLEAN(false));
 		scratch_config.SetOptionByName("autoinstall_known_extensions", Value::BOOLEAN(false));
@@ -1030,15 +1118,18 @@ vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 			auto value = node_values[item.first];
 			auto wanted = JsonField(item.second->spec, "value");
 			auto shown_wanted = wanted;
-			auto set = scratch_con.Query("SET GLOBAL " + Ident(item.first) + " = " + Quoted(wanted));
-			if (!set->HasError()) {
+			auto set = StartsThreads(item.first)
+			               ? unique_ptr<QueryResult>()
+			               : scratch_con.Query("SET GLOBAL " + Ident(item.first) + " = " + Quoted(wanted));
+			if (set && !set->HasError()) {
 				// duckdb_settings(), not current_setting(): the scratch loads no core_functions
 				auto read = scratch_con.Query("SELECT value FROM duckdb_settings() WHERE name = " + Quoted(item.first));
 				if (!read->HasError() && read->RowCount() > 0) {
 					shown_wanted = read->Collection().GetValue(0, 0).ToString();
 				}
 			}
-			bool same = StringUtil::CIEquals(value, shown_wanted) || StringUtil::CIEquals(value, wanted);
+			bool same = StringUtil::CIEquals(value, shown_wanted) || StringUtil::CIEquals(value, wanted) ||
+			            SameValue(value, wanted);
 			out.push_back({"setting", item.first, same ? "same" : "differs", value, wanted, item.second->scope});
 		}
 	}

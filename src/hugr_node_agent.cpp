@@ -14,22 +14,34 @@
 #include "hugr_node_agent.hpp"
 
 #include "acl_cluster.hpp"
+#include "acl_door_common.hpp"
+#include "acl_node_label.hpp"
 #include "acl_result_rows.hpp"
+#include "hugr_node_extension.hpp"
+#include "hugr_node_tick.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/extension_helper.hpp"
+#include "duckdb/main/http/http_util.hpp"
 #include "yyjson.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
+#include <limits>
+#include <map>
+#include <set>
 #include <thread>
 
 namespace duckdb {
@@ -84,6 +96,65 @@ int64_t ParseSeconds(const string &value, const char *name) {
 	return parsed;
 }
 
+bool AllDigits(const string &value) {
+	return !value.empty() && value.size() < 20 &&
+	       std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+//! a finite size: a byte count (the Downward API's), a duckdb size ('600GiB') or a Kubernetes quantity's binary form
+//! ('600Gi' - a volume's sizeLimit as written); invalid for anything else - unlimited, a percentage, a typo
+optional_idx FiniteBytes(const string &value) {
+	if (AllDigits(value)) {
+		return std::strtoull(value.c_str(), nullptr, 10);
+	}
+	auto text = value;
+	if (text.size() > 2 && text.back() == 'i' && string("KMGT").find(text[text.size() - 2]) != string::npos) {
+		text += "B";
+	}
+	try {
+		return DBConfig::ParseMemoryLimit(text);
+	} catch (std::exception &) {
+		return optional_idx();
+	}
+}
+
+//! spec 010: a byte count from the pod; '' = 0. Below 1 MiB is no pod's size - a Downward API divisor other than 1
+uint64_t ParseBytes(const string &value, const char *name) {
+	if (value.empty()) {
+		return 0;
+	}
+	auto parsed = FiniteBytes(value);
+	if (!parsed.IsValid() || parsed.GetIndex() < MEBIBYTE) {
+		throw InvalidInputException("hugr_node: %s is a size of at least 1 MiB - a byte count (the Downward API's, "
+		                            "divisor 1) or a size like '600GiB' / '600Gi'",
+		                            name);
+	}
+	return parsed.GetIndex();
+}
+
+//! spec 010: whole cores from the pod (the Downward API's requests.cpu with divisor 1 rounds up); '' = 0
+uint64_t ParseCores(const string &value, const char *name) {
+	if (value.empty()) {
+		return 0;
+	}
+	auto parsed = AllDigits(value) && value.size() < 10 ? std::strtoull(value.c_str(), nullptr, 10) : 0;
+	if (parsed == 0) {
+		throw InvalidInputException("hugr_node: %s is a whole number of cores (the Downward API's, divisor 1)", name);
+	}
+	return parsed;
+}
+
+//! spec 010: what a profile item asks of an engine quantity - anything that is not a finite amount (unlimited, a
+//! percentage, '1e3' threads, a typo) asks for everything, so the pod's ceiling cuts it: the ceiling fails closed
+uint64_t RequestedAmount(EngineQuantity quantity, const string &value) {
+	if (quantity == EngineQuantity::THREADS) {
+		return AllDigits(value) && value.size() < 10 ? std::strtoull(value.c_str(), nullptr, 10)
+		                                             : std::numeric_limits<uint64_t>::max();
+	}
+	auto parsed = FiniteBytes(value);
+	return parsed.IsValid() ? parsed.GetIndex() : std::numeric_limits<uint64_t>::max();
+}
+
 string CutTresorScheme(const string &host) {
 	return StringUtil::StartsWith(host, "tresor:") ? host.substr(7) : host;
 }
@@ -93,6 +164,18 @@ string TrimSlash(string url) {
 		url.pop_back();
 	}
 	return url;
+}
+
+//! spec 006: plain http to tresor is for a tresor-server on loopback only - a host and a port, nothing that could
+//! send the request elsewhere (userinfo, a path); the value never reaches the error
+void RequireLoopbackTresor(const string &tresor) {
+	bool plain = tresor.find_first_of("@/?#\\ ") == string::npos;
+	auto colon = tresor.rfind(':');
+	auto host = colon == string::npos ? tresor : tresor.substr(0, colon);
+	if (!plain || (host != "127.0.0.1" && host != "localhost" && host != "[::1]")) {
+		throw InvalidInputException("hugr_node: HUGR_TRESOR_INSECURE_HTTP is for a tresor-server on loopback only - "
+		                            "a host:port of 127.0.0.1, localhost or [::1]");
+	}
 }
 
 //! JSON helpers over duckdb's bundled yyjson
@@ -146,6 +229,12 @@ AgentEnvironment AgentEnvironment::FromProcess() {
 	env.quack_key = EnvOr("HUGR_QUACK_KEY");
 	env.drain_deadline = ParseSeconds(EnvOr("HUGR_DRAIN_DEADLINE"), "HUGR_DRAIN_DEADLINE");
 	env.tresor_insecure_http = EnvOr("HUGR_TRESOR_INSECURE_HTTP") == "1";
+	env.orchestrator = TrimSlash(EnvOr("HUGR_ORCHESTRATOR"));
+	env.orchestrator_token_file = EnvOr("HUGR_ORCHESTRATOR_TOKEN_FILE");
+	env.pod.memory = ParseBytes(EnvOr("HUGR_POD_MEMORY"), "HUGR_POD_MEMORY");
+	env.pod.cpu = ParseCores(EnvOr("HUGR_POD_CPU"), "HUGR_POD_CPU");
+	env.pod.temp_size = ParseBytes(EnvOr("HUGR_TEMP_SIZE"), "HUGR_TEMP_SIZE");
+	env.pod.temp_directory = EnvOr("HUGR_TEMP_DIRECTORY");
 	return env;
 }
 
@@ -170,6 +259,12 @@ AgentEnvironment AgentEnvironment::FromJson(const string &json) {
 	env.quack_key = StrField(root, "HUGR_QUACK_KEY");
 	env.drain_deadline = ParseSeconds(StrField(root, "HUGR_DRAIN_DEADLINE"), "HUGR_DRAIN_DEADLINE");
 	env.tresor_insecure_http = StrField(root, "HUGR_TRESOR_INSECURE_HTTP") == "1";
+	env.orchestrator = TrimSlash(StrField(root, "HUGR_ORCHESTRATOR"));
+	env.orchestrator_token_file = StrField(root, "HUGR_ORCHESTRATOR_TOKEN_FILE");
+	env.pod.memory = ParseBytes(StrField(root, "HUGR_POD_MEMORY"), "HUGR_POD_MEMORY");
+	env.pod.cpu = ParseCores(StrField(root, "HUGR_POD_CPU"), "HUGR_POD_CPU");
+	env.pod.temp_size = ParseBytes(StrField(root, "HUGR_TEMP_SIZE"), "HUGR_TEMP_SIZE");
+	env.pod.temp_directory = StrField(root, "HUGR_TEMP_DIRECTORY");
 	return env;
 }
 
@@ -179,6 +274,43 @@ void AgentEnvironment::Validate() const {
 			throw InvalidInputException("hugr_node: %s is not set", name);
 		}
 	};
+	if (pod.temp_directory.empty() != (pod.temp_size == 0)) {
+		throw InvalidInputException("hugr_node: HUGR_TEMP_DIRECTORY and HUGR_TEMP_SIZE go together - the spill "
+		                            "volume's mount and its size");
+	}
+	if (Orchestrated()) {
+		// spec 010: the orchestrator's document names tresor and the node's identity - one source per value
+		auto refuse = [](const string &value, const char *name) {
+			if (!value.empty()) {
+				throw InvalidInputException("hugr_node: %s comes in the orchestrator's document when HUGR_ORCHESTRATOR "
+				                            "is set - remove it from the environment",
+				                            name);
+			}
+		};
+		refuse(tresor, "HUGR_TRESOR");
+		refuse(issuer, "HUGR_IDENTITY_ISSUER");
+		refuse(client_id, "HUGR_IDENTITY_CLIENT_ID");
+		refuse(scope, "HUGR_IDENTITY_SCOPE");
+		refuse(control_plane, "HUGR_CONTROL_PLANE");
+		// the bearer goes there: https, and no userinfo (a URL's value never reaches an error or a log)
+		if (!StringUtil::StartsWith(orchestrator, "https://") || StringUtil::Contains(orchestrator, "@")) {
+			throw InvalidInputException("hugr_node: HUGR_ORCHESTRATOR is an https URL without userinfo");
+		}
+		require(orchestrator_token_file, "HUGR_ORCHESTRATOR_TOKEN_FILE");
+		if (assertion_file.empty() == private_key_file.empty()) {
+			throw InvalidInputException("hugr_node: the node's identity is HUGR_IDENTITY_ASSERTION_FILE (the projected "
+			                            "service-account token) or, for development only, "
+			                            "HUGR_IDENTITY_PRIVATE_KEY_FILE - exactly one of them");
+		}
+		require(flight, "HUGR_FLIGHT");
+		if (flight_cert.empty() != flight_key.empty()) {
+			throw InvalidInputException("hugr_node: HUGR_FLIGHT_CERT and HUGR_FLIGHT_KEY go together");
+		}
+		if (quack_cert.empty() != quack_key.empty()) {
+			throw InvalidInputException("hugr_node: HUGR_QUACK_CERT and HUGR_QUACK_KEY go together");
+		}
+		return;
+	}
 	require(tresor, "HUGR_TRESOR");
 	require(issuer, "HUGR_IDENTITY_ISSUER");
 	require(client_id, "HUGR_IDENTITY_CLIENT_ID");
@@ -188,17 +320,11 @@ void AgentEnvironment::Validate() const {
 		                            "exactly one of them");
 	}
 	if (tresor_insecure_http) {
-		auto colon = tresor.rfind(':');
-		auto host = colon == string::npos ? tresor : tresor.substr(0, colon);
-		if (host != "127.0.0.1" && host != "localhost" && host != "[::1]") {
-			throw InvalidInputException("hugr_node: HUGR_TRESOR_INSECURE_HTTP is for a tresor-server on loopback only, "
-			                            "not \"%s\"",
-			                            tresor);
-		}
+		RequireLoopbackTresor(tresor);
 	}
 	require(control_plane, "HUGR_CONTROL_PLANE");
-	if (!StringUtil::StartsWith(control_plane, "https://")) {
-		throw InvalidInputException("hugr_node: HUGR_CONTROL_PLANE is an https URL, not \"%s\"", control_plane);
+	if (!StringUtil::StartsWith(control_plane, "https://") || StringUtil::Contains(control_plane, "@")) {
+		throw InvalidInputException("hugr_node: HUGR_CONTROL_PLANE is an https URL without userinfo");
 	}
 	require(flight, "HUGR_FLIGHT");
 	if (flight_cert.empty() != flight_key.empty()) {
@@ -223,11 +349,51 @@ BootstrapDocument BootstrapDocument::Parse(const string &json) {
 		throw InvalidInputException("hugr_node: the bootstrap document has no version");
 	}
 	out.version = yyjson_get_sint(version);
-	if (out.version != 1) {
-		throw InvalidInputException("hugr_node: the bootstrap document's version %lld is not one this node reads (1)",
-		                            static_cast<long long>(out.version));
+	if (out.version != 1 && out.version != 2) {
+		throw InvalidInputException(
+		    "hugr_node: the bootstrap document's version %lld is not one this node reads (1, 2)",
+		    static_cast<long long>(out.version));
 	}
 	out.node_group = StrField(root, "node_group");
+	if (out.version == 2) {
+		// spec 010: the orchestrator's - the node's label (its pod), tresor and the node's identity in the IdP
+		out.node_label = StrField(root, "node_label");
+		if (!acl::ValidNodeLabel(out.node_label)) {
+			throw InvalidInputException(
+			    "hugr_node: the bootstrap document (version 2) names no node_label that is a DNS "
+			    "label ([a-z0-9-], at most 63) - the node's sessions carry it (duckdb-acl spec "
+			    "134)");
+		}
+		if (out.node_group.empty()) {
+			throw InvalidInputException("hugr_node: the bootstrap document (version 2) names no node_group - an "
+			                            "orchestrated node always belongs to its group");
+		}
+		auto tresor = yyjson_obj_get(root, "tresor");
+		auto identity = tresor && yyjson_is_obj(tresor) ? yyjson_obj_get(tresor, "identity") : nullptr;
+		out.tresor_host = CutTresorScheme(StrField(tresor, "host"));
+		out.tresor_issuer = StrField(identity, "issuer");
+		out.tresor_client_id = StrField(identity, "client_id");
+		out.tresor_scope = StrField(identity, "scope");
+		if (out.tresor_host.empty() || out.tresor_issuer.empty() || out.tresor_client_id.empty()) {
+			throw InvalidInputException("hugr_node: the bootstrap document (version 2) names no tresor host, issuer "
+			                            "and client_id - the node logs in to tresor with them");
+		}
+		auto heartbeat = yyjson_obj_get(root, "heartbeat");
+		auto interval = heartbeat && yyjson_is_obj(heartbeat) ? yyjson_obj_get(heartbeat, "interval_seconds") : nullptr;
+		if (interval && !yyjson_is_int(interval)) {
+			throw InvalidInputException("hugr_node: the bootstrap document's heartbeat interval_seconds is a whole "
+			                            "number of seconds");
+		}
+		if (interval) {
+			out.heartbeat_interval = yyjson_get_sint(interval);
+		}
+		if (out.heartbeat_interval < 1 || out.heartbeat_interval > 3600) {
+			throw InvalidInputException(
+			    "hugr_node: the bootstrap document's heartbeat interval_seconds is 1..3600, not "
+			    "%lld",
+			    static_cast<long long>(out.heartbeat_interval));
+		}
+	}
 	auto repository = yyjson_obj_get(root, "repository");
 	if (!repository || !yyjson_is_obj(repository)) {
 		throw InvalidInputException("hugr_node: the bootstrap document has no repository");
@@ -240,24 +406,27 @@ BootstrapDocument BootstrapDocument::Parse(const string &json) {
 	if (out.repository_prefix.empty()) {
 		throw InvalidInputException("hugr_node: the bootstrap document's repository has no prefix");
 	}
-	if (!StringUtil::StartsWith(out.repository_prefix, "https://")) {
-		throw InvalidInputException("hugr_node: the repository's prefix is an https URL, not \"%s\" - its signing keys "
-		                            "are read from it",
-		                            out.repository_prefix);
+	if (!StringUtil::StartsWith(out.repository_prefix, "https://") ||
+	    StringUtil::Contains(out.repository_prefix, "@")) {
+		throw InvalidInputException("hugr_node: the repository's prefix is an https URL without userinfo - its "
+		                            "signing keys are read from it");
 	}
 	auto catalog = yyjson_obj_get(root, "catalog");
 	if (!catalog || !yyjson_is_obj(catalog)) {
 		throw InvalidInputException("hugr_node: the bootstrap document has no catalog");
 	}
-	out.catalog_type = StrField(catalog, "type");
-	out.catalog_extension = StrField(catalog, "extension");
-	out.catalog_path = StrField(catalog, "path");
+	if (out.version == 1) {
+		out.catalog_type = StrField(catalog, "type");
+		out.catalog_extension = StrField(catalog, "extension");
+		out.catalog_path = StrField(catalog, "path");
+	}
+	// version 2: the reserved secret's own type is the catalog's (the owner, 2026-10-17), read at the run
 	out.catalog_secret = StrField(catalog, "secret");
 	auto schema = StrField(catalog, "schema");
 	if (!schema.empty()) {
 		out.catalog_schema = schema;
 	}
-	if (out.catalog_type.empty()) {
+	if (out.version == 1 && out.catalog_type.empty()) {
 		throw InvalidInputException("hugr_node: the bootstrap document's catalog has no type");
 	}
 	if (out.catalog_secret.empty()) {
@@ -291,8 +460,14 @@ vector<PlanStep> HardeningSteps(const AgentEnvironment &env) {
 	// every request of tresor's - discovery, the IdP, the service - through duckdb's HTTP client, which verifies
 	// against ca_cert_file; tresor's builtin client trusts only the system roots (reported to tresor 2026-10-15)
 	add("SET GLOBAL tresor_http_client = 'duckdb'");
+	// spec 010: whichever HTTP client serves a request, it verifies the server (httplib's own default does not)
+	add("SET GLOBAL enable_server_cert_verification = true");
 	if (!env.ca_file.empty()) {
 		add("SET GLOBAL ca_cert_file = " + Quoted(env.ca_file));
+	}
+	// spec 010: where the node spills is the pod's spill volume (temp_directory is a hardening setting)
+	if (!env.pod.temp_directory.empty()) {
+		add("SET GLOBAL temp_directory = " + Quoted(env.pod.temp_directory));
 	}
 	return steps;
 }
@@ -327,25 +502,55 @@ string DocumentFetchSql(const AgentEnvironment &env) {
 	return "SELECT content FROM read_text(" + Quoted(env.control_plane + "/v1/bootstrap") + ")";
 }
 
+//! spec 010: the orchestrated entry's document is fetched with the pod's own token, not by a statement - the plan
+//! shows what is asked
+string DocumentFetchNote(const AgentEnvironment &env) {
+	return "-- GET " + env.orchestrator + "/v1/bootstrap with Authorization: Bearer <the content of " +
+	       env.orchestrator_token_file + ">";
+}
+
+//! spec 010: what to set where an extension a secret type needs is the catalog's
+const char *CATALOG_TYPE_NOTE = "<the secret's type>";
+
 vector<PlanStep> RepositoryAndCatalogSteps(const BootstrapDocument &doc) {
 	vector<PlanStep> steps;
 	// OR REPLACE: a restarted container keeps its emptyDir, and every start reads the keys again (rotation is the
 	// discovery document's, design/017 item 15)
 	steps.push_back({"4 repository", "CREATE OR REPLACE EXTENSION REPOSITORY " + Ident(doc.repository_name) +
 	                                     " WITH PREFIX " + Quoted(doc.repository_prefix)});
-	if (!doc.catalog_extension.empty()) {
+	if (doc.catalog_type.empty()) {
+		// spec 010 (version 2): the reserved secret's own type is the catalog's - read from tresor's descriptor at the
+		// run, and its extension installed from the repository when the build does not link it
+		steps.push_back({"5 policy catalog", "-- the catalog's type: the type of secret " + Quoted(doc.catalog_secret) +
+		                                         " in duckdb_secrets(), its extension from " +
+		                                         Ident(doc.repository_name)});
+	} else if (!doc.catalog_extension.empty()) {
 		steps.push_back(
 		    {"5 policy catalog", "INSTALL " + Ident(doc.catalog_extension) + " FROM " + Ident(doc.repository_name)});
 		steps.push_back(
 		    {"5 policy catalog", "LOAD " + Ident(doc.catalog_extension) + " FROM " + Ident(doc.repository_name)});
 	}
 	steps.push_back({"5 policy catalog", "ATTACH " + Quoted(doc.catalog_path) + " AS " + POLICY_ALIAS + " (TYPE " +
-	                                         doc.catalog_type + ", SECRET " + Ident(doc.catalog_secret) + ")"});
+	                                         (doc.catalog_type.empty() ? string(CATALOG_TYPE_NOTE) : doc.catalog_type) +
+	                                         ", SECRET " + Ident(doc.catalog_secret) + ")"});
 	if (!doc.node_group.empty()) {
 		steps.push_back({"5 policy catalog", "SET GLOBAL acl_node_group = " + Quoted(doc.node_group)});
 	}
+	if (!doc.node_label.empty()) {
+		// duckdb-acl spec 134: the name the node's sessions carry, for the front
+		steps.push_back({"5 policy catalog", "SET GLOBAL acl_node_label = " + Quoted(doc.node_label)});
+	}
 	steps.push_back(
 	    {"5 policy catalog", "SELECT acl_use_db(" + Quoted(POLICY_ALIAS) + ", " + Quoted(doc.catalog_schema) + ")"});
+	return steps;
+}
+
+//! spec 010: the engine's defaults from the pod, before the profile
+vector<PlanStep> EngineSteps(const AgentEnvironment &env) {
+	vector<PlanStep> steps;
+	for (auto &setting : EngineDefaults(env.pod)) {
+		steps.push_back({"6 engine", "SET GLOBAL " + setting.name + " = " + Quoted(setting.value)});
+	}
 	return steps;
 }
 
@@ -383,14 +588,55 @@ string RandomToken() {
 
 } // namespace
 
-vector<PlanStep> BootstrapPlan(const AgentEnvironment &env, const BootstrapDocument &document,
+namespace {
+
+AgentEnvironment WithDocument(const AgentEnvironment &env, const BootstrapDocument &document) {
+	if (!env.Orchestrated()) {
+		if (document.version == 2) {
+			throw InvalidInputException("hugr_node: a bootstrap document of version 2 is the orchestrator's - set "
+			                            "HUGR_ORCHESTRATOR, or answer version 1 from the control plane");
+		}
+		return env;
+	}
+	if (document.version != 2) {
+		throw InvalidInputException("hugr_node: the orchestrator answered a bootstrap document of version %lld - an "
+		                            "orchestrated node reads version 2",
+		                            static_cast<long long>(document.version));
+	}
+	auto merged = env;
+	merged.tresor = document.tresor_host;
+	merged.issuer = document.tresor_issuer;
+	merged.client_id = document.tresor_client_id;
+	merged.scope = document.tresor_scope;
+	if (merged.tresor_insecure_http) {
+		RequireLoopbackTresor(merged.tresor);
+	}
+	return merged;
+}
+
+} // namespace
+
+vector<PlanStep> BootstrapPlan(const AgentEnvironment &env_p, const BootstrapDocument &document,
                                const string &quack_token) {
+	auto env = WithDocument(env_p, document);
 	auto plan = HardeningSteps(env);
-	for (auto &step : TresorSteps(env)) {
+	if (env.Orchestrated()) {
+		// spec 010: the orchestrator first, with the pod's own token; tresor from the document
+		plan.push_back({"2 bootstrap document", DocumentFetchNote(env)});
+		for (auto &step : TresorSteps(env)) {
+			step.step = "3 tresor";
+			plan.push_back(step);
+		}
+	} else {
+		for (auto &step : TresorSteps(env)) {
+			plan.push_back(step);
+		}
+		plan.push_back({"3 bootstrap document", DocumentFetchSql(env)});
+	}
+	for (auto &step : RepositoryAndCatalogSteps(document)) {
 		plan.push_back(step);
 	}
-	plan.push_back({"3 bootstrap document", DocumentFetchSql(env)});
-	for (auto &step : RepositoryAndCatalogSteps(document)) {
+	for (auto &step : EngineSteps(env)) {
 		plan.push_back(step);
 	}
 	plan.push_back(
@@ -467,15 +713,50 @@ unique_ptr<FunctionData> PlanBind(ClientContext &, TableFunctionBindInput &input
 	return std::move(bind);
 }
 
-//! hugr_node_profile_statements(): what applies this node's effective profile, in its order
+//! a setting item's value as written in its spec
+string SettingValueOf(const acl::PolicyStore::ClusterItem &item) {
+	JsonDoc doc(item.spec, "a profile item's spec");
+	return StrField(doc.Root(), "value");
+}
+
+//! spec 010: one effective item's statements, an engine setting cut to the pod's ceiling (`cut` says whether it was)
+vector<string> ProfileItemStatements(const acl::PolicyStore::ClusterItem &item, const PodResources &pod, bool &cut) {
+	cut = false;
+	auto statements = acl::ClusterItemApplyStatements(item);
+	if (item.kind != "setting") {
+		return statements;
+	}
+	auto quantity = EngineSettingOf(item.name);
+	auto ceiling = EngineCeiling(quantity, pod);
+	if (quantity == EngineQuantity::NONE || ceiling == 0) {
+		return statements;
+	}
+	auto kept = ClampToCeiling(RequestedAmount(quantity, SettingValueOf(item)), ceiling, cut);
+	if (!cut) {
+		return statements;
+	}
+	return {"SET GLOBAL " + Ident(item.name) + " = " + Quoted(EngineValueOf(quantity, kept))};
+}
+
+//! hugr_node_profile_statements([environment := json]): what applies this node's effective profile, in its order -
+//! an engine setting cut to the pod the environment describes (spec 010)
 unique_ptr<FunctionData> ProfileBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
                                      vector<Identifier> &names) {
 	StepsColumns(types, names);
 	auto &store = input.info->Cast<AgentInfo>().store;
+	AgentEnvironment env;
+	auto named = input.named_parameters.find("environment");
+	if (named != input.named_parameters.end() && !named->second.IsNull()) {
+		env = AgentEnvironment::FromJson(named->second.ToString());
+	} else {
+		env = AgentEnvironment::FromProcess();
+	}
 	auto bind = make_uniq<StepsBind>();
 	for (auto &item : store->ClusterEffective()) {
-		for (auto &sql : acl::ClusterItemApplyStatements(item)) {
-			bind->steps.push_back({"6 profile: " + item.kind + " " + item.name, sql});
+		bool cut = false;
+		for (auto &sql : ProfileItemStatements(item, env.pod, cut)) {
+			bind->steps.push_back(
+			    {"6 profile: " + item.kind + " " + item.name + (cut ? " (cut to the pod)" : ""), sql});
 		}
 	}
 	return std::move(bind);
@@ -549,6 +830,351 @@ int64_t Stop(DatabaseInstance &db, const AgentEnvironment &env) {
 	return live;
 }
 
+//===--------------------------------------------------------------------===//
+// spec 010: the orchestrator, the catalog's type, the tick, the heartbeat
+//===--------------------------------------------------------------------===//
+
+//! the projected token, read at each call (kubelet renews it); never kept, never logged. A token is one line of
+//! printable ASCII (a JWT) of at most 64 KiB - anything else is refused before it reaches a header
+string ReadTokenFile(const string &path) {
+	static constexpr idx_t MAX_TOKEN = 64 * 1024;
+	std::ifstream in(path, std::ios::binary);
+	if (!in) {
+		throw IOException("hugr_node: the orchestrator's token file cannot be read (HUGR_ORCHESTRATOR_TOKEN_FILE)");
+	}
+	string token;
+	char buffer[4096];
+	while (in.read(buffer, sizeof(buffer)) || in.gcount() > 0) {
+		token.append(buffer, static_cast<size_t>(in.gcount()));
+		if (token.size() > MAX_TOKEN) {
+			throw IOException("hugr_node: the orchestrator's token file is larger than a token "
+			                  "(HUGR_ORCHESTRATOR_TOKEN_FILE)");
+		}
+	}
+	StringUtil::Trim(token);
+	if (token.empty() || std::any_of(token.begin(), token.end(), [](char c) { return c <= ' ' || c > '~'; })) {
+		throw IOException("hugr_node: the orchestrator's token file holds no token (HUGR_ORCHESTRATOR_TOKEN_FILE)");
+	}
+	return token;
+}
+
+//! an orchestrator's answer: its status (0 = none) and its body
+struct OrchestratorAnswer {
+	int status = 0;
+	string body;
+};
+
+//! one request to the orchestrator through duckdb's HTTP client (so ca_cert_file applies), with the pod's token as the
+//! bearer, never redirected; the server is verified by the hardening (enable_server_cert_verification, and neither
+//! the client nor its verification is a profile item). `quick` (the heartbeat): one attempt, 5 s - a stalled
+//! orchestrator never holds the tick, nor the SIGTERM behind it
+OrchestratorAnswer OrchestratorRequest(DatabaseInstance &db, const AgentEnvironment &env, const string &path,
+                                       const string *body, bool quick) {
+	auto url = env.orchestrator + path;
+	auto &http = HTTPUtil::Get(db);
+	auto params = http.InitializeParameters(db, url);
+	// the bearer is the pod's own token: a redirect would carry it to wherever the answer points
+	params->follow_location = false;
+	if (quick) {
+		params->timeout = 5;
+		params->timeout_usec = 0;
+		params->retries = 0;
+	}
+	HTTPHeaders headers;
+	headers.Insert("Authorization", "Bearer " + ReadTokenFile(env.orchestrator_token_file));
+	unique_ptr<HTTPResponse> response;
+	OrchestratorAnswer answer;
+	if (body) {
+		headers.Insert("Content-Type", "application/json");
+		PostRequestInfo request(url, headers, *params, const_data_ptr_cast(body->data()), body->size());
+		response = http.Request(request);
+		answer.body = request.buffer_out;
+	} else {
+		GetRequestInfo request(
+		    url, headers, *params, [](const HTTPResponse &) { return true; },
+		    [&](const_data_ptr_t data, idx_t length) {
+			    answer.body.append(const_char_ptr_cast(data), length);
+			    return true;
+		    });
+		response = http.Request(request);
+	}
+	if (!response) {
+		return OrchestratorAnswer();
+	}
+	answer.status = static_cast<int>(response->status);
+	if (answer.body.empty()) {
+		answer.body = response->body;
+	}
+	return answer;
+}
+
+//! the body of a 2xx; throws the status otherwise (never the token, never the body)
+string OrchestratorCall(DatabaseInstance &db, const AgentEnvironment &env, const string &path, const string *body) {
+	auto answer = OrchestratorRequest(db, env, path, body, false);
+	if (answer.status == 0) {
+		throw IOException("hugr_node: the orchestrator did not answer %s", path);
+	}
+	if (answer.status < 200 || answer.status > 299) {
+		throw IOException("hugr_node: the orchestrator answered %s with %d", path, answer.status);
+	}
+	return answer.body;
+}
+
+//! spec 010 (version 2): the catalog's type is its reserved secret's - tresor lists a descriptor with its type before
+//! anything is attached (tresor spec 004: duckdb_secrets() shows descriptors only)
+void ResolveCatalogType(DatabaseInstance &db, BootstrapDocument &document) {
+	static const case_insensitive_set_t CATALOG_TYPES = {"postgres", "mysql", "mssql"};
+	auto result = RunStep(db, "5 policy catalog",
+	                      "SELECT type FROM duckdb_secrets() WHERE name = " + Quoted(document.catalog_secret));
+	acl::ResultRows rows(*result);
+	if (rows.Count() == 0) {
+		throw InvalidInputException("hugr_node: bootstrap step \"5 policy catalog\" failed: the secret \"%s\" is not "
+		                            "one the node may use",
+		                            document.catalog_secret);
+	}
+	auto type = rows.GetValue(0, 0).ToString();
+	if (!CATALOG_TYPES.count(type)) {
+		throw InvalidInputException("hugr_node: bootstrap step \"5 policy catalog\" failed: the secret \"%s\" is of "
+		                            "type \"%s\", which is not a policy catalog's (postgres, mysql, mssql)",
+		                            document.catalog_secret, type);
+	}
+	document.catalog_type = StringUtil::Lower(type);
+	auto extension = acl::ClusterExtensionOfType(document.catalog_type);
+	// a build that links the type's extension has it loaded already: INSTALL from the repository only otherwise
+	if (!extension.empty()) {
+		auto loaded =
+		    RunStep(db, "5 policy catalog",
+		            "SELECT count(*) FROM duckdb_extensions() WHERE loaded AND extension_name = " + Quoted(extension));
+		acl::ResultRows loaded_rows(*loaded);
+		if (loaded_rows.Count() == 0 || loaded_rows.GetValue(0, 0).GetValue<int64_t>() == 0) {
+			document.catalog_extension = extension;
+		}
+	}
+}
+
+//! the tick's own memory between ticks
+struct TickState {
+	int64_t applied = -1;
+	TickTaken taken; // what this node took from the profile, with the spec it applied
+	bool self_drained = false;
+	std::vector<TickPending> pending;
+	bool needs_restart = false;
+	std::map<string, int64_t> drift_counts;
+};
+
+//! an item as the tick reads it: an extension by its canonical name (`postgres` is loaded as `postgres_scanner`)
+TickItem TickItemOf(const acl::PolicyStore::ClusterItem &item) {
+	auto name = item.kind == "extension" ? ExtensionHelper::ApplyExtensionAlias(item.name) : item.name;
+	return {item.kind, name, item.spec};
+}
+
+TickKey TickKeyOf(const TickItem &item) {
+	return {item.kind, TickLower(item.name)};
+}
+
+//! spec 010: the drift as the tick reads it - an engine setting the node holds at the pod's ceiling is "cut", not
+//! pending: the profile asked for more than the pod has, and the node runs what the pod allows
+vector<TickDrift> TickDriftOf(const vector<acl::PolicyStore::DriftRow> &rows, const PodResources &pod) {
+	vector<TickDrift> out;
+	for (auto &row : rows) {
+		auto state = row.state;
+		auto quantity = row.kind == "setting" ? EngineSettingOf(row.name) : EngineQuantity::NONE;
+		auto ceiling = EngineCeiling(quantity, pod);
+		if (state == "differs" && quantity != EngineQuantity::NONE && ceiling > 0) {
+			bool cut = false;
+			auto kept = ClampToCeiling(RequestedAmount(quantity, row.profile_value), ceiling, cut);
+			bool holds;
+			if (quantity == EngineQuantity::THREADS) {
+				holds = row.node_value == std::to_string(kept);
+			} else {
+				// the node holds what the bootstrap set - the ceiling in whole MiB - and duckdb shows it rounded
+				// (3.5 GiB): the same rendering of the same amount is the same amount
+				auto set = kept / MEBIBYTE * MEBIBYTE;
+				holds = row.node_value == StringUtil::BytesToHumanReadableString(set);
+			}
+			if (cut && holds) {
+				state = "cut";
+			}
+		}
+		out.push_back({row.kind, row.name, state});
+	}
+	return out;
+}
+
+//! the class of a failed statement's error - never its text, which may carry a path or a DSN
+string ErrorClassOf(QueryResult &result) {
+	return Exception::ExceptionTypeToString(result.GetErrorType());
+}
+
+string ErrorClassOf(std::exception &ex) {
+	return Exception::ExceptionTypeToString(ErrorData(ex).Type());
+}
+
+//! one of the tick's own statements: no "step ok" line every interval, the error's class only when it fails
+unique_ptr<QueryResult> TickQuery(DatabaseInstance &db, const string &sql) {
+	Connection con(db);
+	auto result = con.Query(sql);
+	if (result->HasError()) {
+		throw InvalidInputException("hugr_node: a tick statement failed (%s)", ErrorClassOf(*result));
+	}
+	return result;
+}
+
+//! one hot item's statements; '' when they hold, else the error's class
+string ApplyHot(DatabaseInstance &db, const acl::PolicyStore::ClusterItem &item, const PodResources &pod) {
+	try {
+		bool cut = false;
+		for (auto &sql : ProfileItemStatements(item, pod, cut)) {
+			Connection con(db);
+			auto result = con.Query(sql);
+			if (result->HasError()) {
+				return ErrorClassOf(*result);
+			}
+		}
+	} catch (std::exception &ex) {
+		return ErrorClassOf(ex);
+	}
+	return string();
+}
+
+//! one convergence tick: the hot items applied, the rest pending, the version recorded when every hot item holds
+void Converge(DatabaseInstance &db, acl::PolicyStore &store, const AgentEnvironment &env, TickState &state) {
+	auto version = store.ClusterVersion();
+	auto items = store.ClusterEffective();
+	auto drift = TickDriftOf(store.ClusterDrift(), env.pod);
+	vector<TickItem> tick_items;
+	for (auto &item : items) {
+		tick_items.push_back(TickItemOf(item));
+	}
+	std::set<TickKey> applied_here;
+	for (auto &note : acl::TakeAppliedHere(db)) {
+		auto name = note.first == "extension" ? ExtensionHelper::ApplyExtensionAlias(note.second) : note.second;
+		applied_here.insert({note.first, TickLower(name)});
+	}
+	auto decision = DecideTick(tick_items, drift, state.taken, applied_here);
+	for (auto index : decision.adopt) {
+		state.taken[TickKeyOf(tick_items[index])] = tick_items[index].spec;
+	}
+	for (auto &key : decision.forget) {
+		state.taken.erase(key);
+	}
+	bool hot_failed = false;
+	for (auto index : decision.apply) {
+		auto &item = items[index];
+		auto error = ApplyHot(db, item, env.pod);
+		if (!error.empty()) {
+			// listed, and the rest still apply
+			decision.pending.push_back({item.kind, item.name, "hot", error});
+			hot_failed = true;
+			Log("tick: " + item.kind + " " + item.name + " could not be applied (" + error + ")");
+			continue;
+		}
+		state.taken[TickKeyOf(tick_items[index])] = tick_items[index].spec;
+		Log("tick: " + item.kind + " " + item.name + " applied (profile version " + std::to_string(version) + ")");
+	}
+	for (auto &alias : decision.detach) {
+		Connection con(db);
+		auto result = con.Query("DETACH " + Ident(alias));
+		if (result->HasError()) {
+			// in use: it goes with a drain, like a re-pointed source
+			decision.pending.push_back({"source", alias, "drain", ErrorClassOf(*result)});
+		} else {
+			state.taken.erase({"source", TickLower(alias)});
+			Log("tick: source " + alias + " detached (profile version " + std::to_string(version) + ")");
+		}
+	}
+	if (!hot_failed && version != state.applied) {
+		TickQuery(db, "SELECT acl_cluster_applied(" + std::to_string(version) + ")");
+		state.applied = version;
+	}
+	state.drift_counts.clear();
+	for (auto &row : drift) {
+		state.drift_counts[row.state]++;
+	}
+	state.pending = decision.pending;
+	state.needs_restart = false;
+	for (auto &pending : state.pending) {
+		state.needs_restart = state.needs_restart || pending.item_class != "hot";
+	}
+}
+
+//! spec 010: a node whose resource group the policy lacks refuses new sessions already (duckdb-acl spec 096); the tick
+//! says so by draining it - and resumes only a drain it made itself, never one an operator ordered (DecideGroup)
+void WatchGroup(DatabaseInstance &db, acl::PolicyStore &store, TickState &state) {
+	auto has_group = !store.NodeGroup().empty();
+	auto decision = DecideGroup(has_group, has_group && store.NodeGroupKnown(), store.Draining(), state.self_drained);
+	if (decision.drain) {
+		TickQuery(db, "SELECT acl_drain()");
+		Log("tick: the node's resource group is not in the policy - draining");
+	}
+	if (decision.resume) {
+		TickQuery(db, "SELECT acl_resume()");
+		Log("tick: the node's resource group is back - resumed");
+	}
+	state.self_drained = decision.self_drained;
+}
+
+//! the heartbeat's body: hugr-platform spec 001's contract
+string HeartbeatBody(DatabaseInstance &db, acl::PolicyStore &store, const BootstrapDocument &document,
+                     const TickState &state) {
+	string pending = "[";
+	for (idx_t i = 0; i < state.pending.size(); i++) {
+		auto &p = state.pending[i];
+		pending += (i ? "," : "") + string("{\"kind\":") + acl::JsonQuote(p.kind) +
+		           ",\"name\":" + acl::JsonQuote(p.name) + ",\"class\":" + acl::JsonQuote(p.item_class) +
+		           ",\"error\":" + acl::JsonQuote(p.error) + "}";
+	}
+	pending += "]";
+	string drift = "{";
+	idx_t n = 0;
+	for (auto &count : state.drift_counts) {
+		drift += (n++ ? "," : "") + acl::JsonQuote(count.first) + ":" + std::to_string(count.second);
+	}
+	drift += "}";
+	auto load = TickQuery(db, "SELECT acl_node_load()");
+	acl::ResultRows load_rows(*load);
+	auto load_json = load_rows.Count() == 0 ? string("null") : load_rows.GetValue(0, 0).ToString();
+	int64_t target = -1;
+	try {
+		target = store.ClusterVersion();
+	} catch (std::exception &) { // NOLINT: the report says what it can
+	}
+	return "{\"node_id\":" + acl::JsonQuote(document.node_label) +
+	       ",\"image\":" + acl::JsonQuote(HugrNodeExtension().Version()) +
+	       ",\"duckdb\":" + acl::JsonQuote(DuckDB::SourceID()) + ",\"config\":{\"target\":" + std::to_string(target) +
+	       ",\"applied\":" + std::to_string(state.applied) +
+	       ",\"needs_restart\":" + (state.needs_restart ? "true" : "false") + ",\"pending\":" + pending +
+	       "},\"drift\":" + drift + ",\"load\":" + load_json + "}";
+}
+
+//! one tick: converge, watch the group, beat - each part on its own, so that one failing does not stop the others
+void Tick(DatabaseInstance &db, acl::PolicyStore &store, const AgentEnvironment &env, const BootstrapDocument &document,
+          TickState &state) {
+	try {
+		Converge(db, store, env, state);
+	} catch (std::exception &ex) {
+		Log("tick: convergence failed (" + ErrorClassOf(ex) + ") - the next tick tries again");
+	}
+	try {
+		WatchGroup(db, store, state);
+	} catch (std::exception &ex) {
+		Log("tick: the resource group could not be checked (" + ErrorClassOf(ex) + ")");
+	}
+	if (!env.Orchestrated()) {
+		return;
+	}
+	try {
+		auto body = HeartbeatBody(db, store, document, state);
+		auto answer = OrchestratorRequest(db, env, "/v1/heartbeat", &body, true);
+		if (answer.status < 200 || answer.status > 299) {
+			// the status is the orchestrator's own (a 409: another pod beats as this node), never a value of ours
+			Log("tick: the heartbeat was answered " + std::to_string(answer.status) + " - the next tick sends again");
+		}
+	} catch (std::exception &ex) {
+		Log("tick: the heartbeat failed (" + ErrorClassOf(ex) + ") - the next tick sends again");
+	}
+}
+
 struct AgentPragmaInfo : public PragmaFunctionInfo {
 	explicit AgentPragmaInfo(shared_ptr<acl::PolicyStore> store_p) : store(std::move(store_p)) {
 	}
@@ -571,6 +1197,14 @@ string RunPragma(ClientContext &context, const FunctionParameters &parameters) {
 	auto &db = *context.db;
 	auto env = AgentEnvironment::FromProcess();
 	env.Validate();
+	// spec 010: a pod has no more cores than its machine - more is a Downward API divisor other than 1 (millicores)
+	auto cores = std::thread::hardware_concurrency();
+	if (env.pod.cpu > 0 && cores > 0 && env.pod.cpu > cores) {
+		throw InvalidInputException(
+		    "hugr_node: HUGR_POD_CPU says more cores than this machine has (%llu) - the Downward "
+		    "API's requests.cpu is read with divisor 1",
+		    static_cast<unsigned long long>(cores));
+	}
 	if (env.DevIdentity()) {
 		Log("WARNING: the node runs on a DEVELOPMENT identity (HUGR_IDENTITY_PRIVATE_KEY_FILE), never in production");
 	}
@@ -583,27 +1217,67 @@ string RunPragma(ClientContext &context, const FunctionParameters &parameters) {
 	for (auto &step : HardeningSteps(env)) {
 		RunStep(db, step.step, step.sql);
 	}
-	for (auto &step : TresorSteps(env)) {
+	BootstrapDocument document;
+	if (env.Orchestrated()) {
+		// spec 010: the orchestrator first, with the pod's own token; tresor and the node's identity from its answer
+		string text;
+		try {
+			text = OrchestratorCall(db, env, "/v1/bootstrap", nullptr);
+		} catch (std::exception &ex) {
+			throw InvalidInputException("hugr_node: bootstrap step \"2 bootstrap document\" failed: %s",
+			                            ErrorData(ex).RawMessage());
+		}
+		Log("step 2 bootstrap document: ok");
+		document = BootstrapDocument::Parse(text);
+		env = WithDocument(env, document);
+		for (auto &step : TresorSteps(env)) {
+			RunStep(db, "3 tresor", step.sql);
+		}
+	} else {
+		for (auto &step : TresorSteps(env)) {
+			RunStep(db, step.step, step.sql);
+		}
+		auto fetched = RunStep(db, "3 bootstrap document", DocumentFetchSql(env));
+		acl::ResultRows fetched_rows(*fetched);
+		if (fetched_rows.Count() == 0) {
+			throw InvalidInputException("hugr_node: bootstrap step \"3 bootstrap document\" failed: the control plane "
+			                            "answered nothing");
+		}
+		document = BootstrapDocument::Parse(fetched_rows.GetValue(0, 0).ToString());
+	}
+	if (document.catalog_type.empty()) {
+		// the repository first: the type's extension may come from it
+		auto steps = RepositoryAndCatalogSteps(document);
+		RunStep(db, steps[0].step, steps[0].sql);
+		ResolveCatalogType(db, document);
+		steps = RepositoryAndCatalogSteps(document);
+		for (idx_t i = 1; i < steps.size(); i++) {
+			RunStep(db, steps[i].step, steps[i].sql);
+		}
+	} else {
+		for (auto &step : RepositoryAndCatalogSteps(document)) {
+			RunStep(db, step.step, step.sql);
+		}
+	}
+	for (auto &step : EngineSteps(env)) {
 		RunStep(db, step.step, step.sql);
 	}
-	auto fetched = RunStep(db, "3 bootstrap document", DocumentFetchSql(env));
-	acl::ResultRows fetched_rows(*fetched);
-	if (fetched_rows.Count() == 0) {
-		throw InvalidInputException("hugr_node: bootstrap step \"3 bootstrap document\" failed: the control plane "
-		                            "answered nothing");
-	}
-	auto document = BootstrapDocument::Parse(fetched_rows.GetValue(0, 0).ToString());
-	for (auto &step : RepositoryAndCatalogSteps(document)) {
-		RunStep(db, step.step, step.sql);
-	}
+	TickState tick;
 	auto version = store->ClusterVersion();
 	for (auto &item : store->ClusterEffective()) {
-		for (auto &sql : acl::ClusterItemApplyStatements(item)) {
+		bool cut = false;
+		for (auto &sql : ProfileItemStatements(item, env.pod, cut)) {
 			RunStep(db, "6 profile: " + item.kind + " " + item.name, sql);
 		}
+		if (cut) {
+			Log("step 6 profile: " + item.name + " cut to the pod's ceiling");
+		}
+		auto tick_item = TickItemOf(item);
+		tick.taken[TickKeyOf(tick_item)] = tick_item.spec;
 	}
 	RunStep(db, "7 lock", "SET GLOBAL lock_configuration = true");
 	RunStep(db, "8 serve", "SELECT acl_cluster_applied(" + std::to_string(version) + ")");
+	tick.applied = version;
 
 	// the doors open last: a TCP probe on the Flight port is the readiness probe
 	g_stop_signal.store(0);
@@ -613,7 +1287,19 @@ string RunPragma(ClientContext &context, const FunctionParameters &parameters) {
 		RunStep(db, step.step, step.sql);
 	}
 	Log("ready - profile version " + std::to_string(version) + ", serving " + env.flight);
+	// spec 010: the tick, on this thread (never a worker); the first one right away, so the orchestrator hears of the
+	// node as soon as it serves
+	auto interval = std::chrono::seconds(document.heartbeat_interval);
+	auto next_tick = std::chrono::steady_clock::now();
 	while (g_stop_signal.load() == 0) {
+		if (std::chrono::steady_clock::now() >= next_tick) {
+			Tick(db, *store, env, document, tick);
+			// on the interval's own clock: a slow tick does not push every later beat back
+			next_tick += interval;
+			if (next_tick < std::chrono::steady_clock::now()) {
+				next_tick = std::chrono::steady_clock::now();
+			}
+		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(250));
 	}
 	auto signal_number = g_stop_signal.load();
@@ -640,6 +1326,9 @@ void RegisterHugrNodeAgent(ExtensionLoader &loader, const shared_ptr<acl::Policy
 	loader.RegisterFunction(plan);
 
 	TableFunction profile(Identifier("hugr_node_profile_statements"), {}, StepsScan, ProfileBind, StepsInit);
+	// spec 010: the pod the statements are cut to, like the plan's
+	profile.GetSignature().WithTypedKwargs(
+	    "options", [](TypedKwargs &options) { options.Add("environment", LogicalType::VARCHAR); });
 	profile.function_info = info;
 	loader.RegisterFunction(profile);
 }
