@@ -13,6 +13,19 @@
 #   5. it serves Flight;
 #   6. on SIGTERM it drains, stops and exits 0;
 #   7. a broken step (a secret the service does not have) stops the bootstrap with the step named, and no port opens.
+# Then the orchestrated entry (spec 010): a fake orchestrator over https answers a document v2 to each node's token
+# and records their heartbeats, and two nodes run on the one catalog:
+#   8. both enter through the orchestrator, log in to tresor with the document's identity, take the catalog's type from
+#      its secret, and serve;
+#   9. the engine's defaults follow HUGR_POD_*, and a profile memory_limit above the pod is cut - drift, not pending;
+#  10. a hot ATTACH written on the catalog is in effect on both within a tick, reported applied at the new version;
+#      re-pointed to the same type it is pending a drain on both, and dropped it is detached by both;
+#  11. a hot item failing on one node (a file the other holds) is listed there with its error's class, the rest of
+#      the write applied;
+#  12. a restart-class item (SET ... IN GROUP) is reported by both as needs_restart, with the item pending; withdrawn
+#      before it ran it waits no more, while a setting the nodes took at their bootstrap and the profile dropped does;
+#  13. a dropped resource group drains both by themselves, and recreating it resumes them;
+#  14. the heartbeat's node_id is the document's label, and the load report carries it as acl_node_label.
 # Needs docker, go, python3, curl, openssl and the hugr_node build with the e2e's postgres_scanner
 # (HUGR_NODE_E2E=1 GEN=ninja make). A missing tool or build is a SKIP (exit 0) on a developer's machine; CI asserts the
 # run happened.
@@ -40,6 +53,9 @@ KC_PORT="${KEYCLOAK_PORT:-18680}"
 TS_PORT="${TRESOR_SERVER_PORT:-18643}"
 REPO_PORT="${REPOSITORY_PORT:-18744}"
 CP_PORT="${CONTROL_PLANE_PORT:-18745}"
+ORCH_PORT="${ORCHESTRATOR_PORT:-18746}"
+FLIGHT_A_PORT="${FLIGHT_A_PORT:-18311}"
+FLIGHT_B_PORT="${FLIGHT_B_PORT:-18312}"
 PG_PORT="${POSTGRES_PORT:-18546}"
 FLIGHT_PORT="${FLIGHT_PORT:-18310}"
 ISSUER="http://127.0.0.1:$KC_PORT/realms/tresor"
@@ -63,7 +79,7 @@ if [ -n "$NODE_IMAGE" ]; then
 	docker image inspect "$NODE_IMAGE" >/dev/null 2>&1 || fail "no image $NODE_IMAGE"
 fi
 [ -f "$ROOT/tresor/server/docker-compose.yml" ] || skip "no tresor submodule (git submodule update --init tresor)"
-for port in "$TS_PORT" "$REPO_PORT" "$CP_PORT" "$PG_PORT" "$FLIGHT_PORT"; do
+for port in "$TS_PORT" "$REPO_PORT" "$CP_PORT" "$PG_PORT" "$FLIGHT_PORT" "$ORCH_PORT" "$FLIGHT_A_PORT" "$FLIGHT_B_PORT"; do
 	if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then fail "127.0.0.1:$port is taken"; fi
 done
 
@@ -71,11 +87,14 @@ TMP="$(mktemp -d)"
 COMPOSE=(docker compose -p hugr-node-bootstrap-kc -f "$ROOT/tresor/server/docker-compose.yml")
 PG_CONTAINER="hugr-node-bootstrap-pg"
 cleanup() {
-	for pid in "${NODE_PID:-}" "${SERVER_PID:-}" "${KISTA_PID:-}" "${CP_PID:-}"; do
+	for pid in "${NODE_PID:-}" "${NODE_A_PID:-}" "${NODE_B_PID:-}" "${SERVER_PID:-}" "${KISTA_PID:-}" "${CP_PID:-}" \
+		"${ORCH_PID:-}"; do
 		[ -n "$pid" ] && kill "$pid" 2>/dev/null || true
 	done
 	docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
-	[ -z "${NODE_CONTAINER:-}" ] || docker rm -f "$NODE_CONTAINER" >/dev/null 2>&1 || true
+	for container in "${NODE_CONTAINER:-}" "${NODE_A_CONTAINER:-}" "${NODE_B_CONTAINER:-}"; do
+		[ -z "$container" ] || docker rm -f "$container" >/dev/null 2>&1 || true
+	done
 	[ "${KEEP_KEYCLOAK:-0}" = 1 ] || "${COMPOSE[@]}" down >/dev/null 2>&1 || true
 	rm -rf "$TMP"
 }
@@ -213,6 +232,9 @@ ATTACH 'tresor:$TS_HOST' AS owner (INSECURE_HTTP true, SECRET etl);
 CREATE PERSISTENT SECRET policy_catalog IN owner (TYPE postgres, HOST '127.0.0.1', PORT '$PG_PORT', DATABASE 'postgres', USER 'postgres', PASSWORD 'pg-e2e');
 CREATE PERSISTENT SECRET control_plane IN owner (TYPE http, SCOPE 'https://127.0.0.1:$CP_PORT/', BEARER_TOKEN 'cp-e2e-token');
 CALL owner.grant_secret('policy_catalog', 'role:default-roles-tresor', ['use']);
+-- spec 010: the reserved name an orchestrated node finds its catalog by - the secret's own type is the catalog's
+CREATE PERSISTENT SECRET hugr_policy_catalog IN owner (TYPE postgres, HOST '127.0.0.1', PORT '$PG_PORT', DATABASE 'postgres', USER 'postgres', PASSWORD 'pg-e2e');
+CALL owner.grant_secret('hugr_policy_catalog', 'role:default-roles-tresor', ['use']);
 CALL owner.grant_secret('control_plane', 'role:default-roles-tresor', ['use']);
 ATTACH 'host=127.0.0.1 port=$PG_PORT dbname=postgres user=postgres password=pg-e2e' AS pg (TYPE postgres);
 SELECT acl_use_db('pg', 'acl', true);
@@ -331,4 +353,234 @@ NODE_PID=""
 	fail "a broken step did not stop the bootstrap with the step named (exit $status)"
 }
 echo "ok: a broken step stopped the bootstrap with the step named, and no port opened"
+
+# --- spec 010: the orchestrated entry - two nodes, one catalog, a fake orchestrator ---------------------------------------
+# the operator's SQL on the catalog, from outside any node (what an administrator's statement does through a node)
+operator_sql() { # <sql>...
+	{
+		echo "LOAD '$PGEXT';"
+		echo "ATTACH 'host=127.0.0.1 port=$PG_PORT dbname=postgres user=postgres password=pg-e2e' AS pg (TYPE postgres);"
+		echo "SELECT acl_use_db('pg', 'acl');"
+		echo "SET GLOBAL acl_allow_anonymous_admin = true;"
+		printf '%s\n' "$@"
+		echo "SELECT 'version:' || acl_cluster_version();"
+	} >"$TMP/operator.sql"
+	"$DUCKDB" -no-agent -unsigned -bail -csv -noheader <"$TMP/operator.sql" >"$TMP/operator.log" 2>&1 || {
+		redact <"$TMP/operator.log" >&2
+		fail "the operator's statements failed"
+	}
+	sed -n 's/^version://p' "$TMP/operator.log"
+}
+operator_sql "ACL ADMIN CREATE RESOURCE GROUP e2e;" "ACL ADMIN CLUSTER SET memory_limit = '500GB';" >/dev/null
+
+# the projected tokens' stand-ins: a token per node, and the label the orchestrator answers it with
+printf 'orch-token-a' >"$TMP/orch-token-a"
+printf 'orch-token-b' >"$TMP/orch-token-b"
+cat >"$TMP/orch.py" <<'PY'
+import http.server, json, ssl, sys
+prefix, ts_host, issuer, cert, key, port, beats = sys.argv[1:8]
+labels = {"Bearer orch-token-a": "hugr-node-e2e-a", "Bearer orch-token-b": "hugr-node-e2e-b"}
+class Handler(http.server.BaseHTTPRequestHandler):
+    def answer(self, status, body=b""):
+        self.send_response(status); self.send_header("Content-Length", str(len(body)))
+        if body: self.send_header("Content-Type", "application/json")
+        self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        label = labels.get(self.headers.get("Authorization"))
+        if self.path != "/v1/bootstrap" or not label: return self.answer(401)
+        doc = {"version": 2, "node_group": "e2e", "node_label": label,
+               "tresor": {"host": ts_host, "identity": {"issuer": issuer, "client_id": "keynode", "scope": ""}},
+               "repository": {"name": "hugr", "prefix": prefix},
+               "catalog": {"secret": "hugr_policy_catalog", "schema": "acl"}, "heartbeat": {"interval_seconds": 2}}
+        self.answer(200, json.dumps(doc).encode())
+    def do_POST(self):
+        label = labels.get(self.headers.get("Authorization"))
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        if self.path != "/v1/heartbeat" or not label: return self.answer(401)
+        beat = json.loads(body)
+        if beat.get("node_id") != label: return self.answer(409)   # a node speaks only for itself
+        with open(beats, "a") as f: f.write(json.dumps(beat) + "\n")
+        self.answer(204)
+    def log_message(self, *args): pass
+server = http.server.ThreadingHTTPServer(("127.0.0.1", int(port)), Handler)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
+server.socket = ctx.wrap_socket(server.socket, server_side=True)
+server.serve_forever()
+PY
+python3 "$TMP/orch.py" "$PREFIX" "$TS_HOST" "$ISSUER" "$TMP/tls.crt" "$TMP/tls.key" "$ORCH_PORT" "$TMP/beats.jsonl" &
+ORCH_PID=$!
+for _ in $(seq 50); do curl -s -o /dev/null --cacert "$TMP/ca.pem" "https://127.0.0.1:$ORCH_PORT/" && break; sleep 0.1; done
+
+start_orchestrated_node() { # <a|b> <flight port> <log>
+	mkdir -p "$TMP/node-home-$1" "$TMP/spill-$1"
+	local env_vars=(HUGR_ORCHESTRATOR="https://127.0.0.1:$ORCH_PORT" HUGR_ORCHESTRATOR_TOKEN_FILE="$TMP/orch-token-$1"
+		HUGR_TRESOR_INSECURE_HTTP=1 HUGR_IDENTITY_PRIVATE_KEY_FILE="$TMP/node-key.pem" HUGR_CA_FILE="$TMP/ca.pem"
+		HUGR_FLIGHT="grpc://localhost:$2" HUGR_DRAIN_DEADLINE=5 HUGR_POD_MEMORY=4294967296 HUGR_POD_CPU=8
+		HUGR_TEMP_DIRECTORY="$TMP/spill-$1" HUGR_TEMP_SIZE=1GiB)
+	if [ -z "$NODE_IMAGE" ]; then
+		env -i PATH="$PATH" HOME="$TMP/node-home-$1" "${env_vars[@]}" "$DUCKDB" -no-agent -c "PRAGMA hugr_node_run" \
+			>"$3" 2>&1 &
+		eval "NODE_$(echo "$1" | tr a-z A-Z)_PID=$!"
+		return
+	fi
+	local docker_env=() kv
+	for kv in "${env_vars[@]}"; do docker_env+=(-e "$kv"); done
+	chmod 640 "$TMP/orch-token-$1" && chmod 770 "$TMP/spill-$1"
+	local name="hugr-node-e2e-$1-$$-$RANDOM"
+	eval "NODE_$(echo "$1" | tr a-z A-Z)_CONTAINER=$name"
+	docker run --rm --name "$name" --network host --group-add "$(id -g)" -v "$TMP:$TMP" "${docker_env[@]}" \
+		"$NODE_IMAGE" >"$3" 2>&1 &
+	eval "NODE_$(echo "$1" | tr a-z A-Z)_PID=$!"
+}
+wait_for() { # <seconds> <command...>: 0 when the command succeeds within the time
+	local deadline=$((SECONDS + $1))
+	shift
+	while [ "$SECONDS" -lt "$deadline" ]; do
+		"$@" && return 0
+		sleep 0.5
+	done
+	return 1
+}
+# the latest heartbeat of a node, as one field: <label> <python expression over the beat `b`>
+beat() {
+	python3 - "$TMP/beats.jsonl" "$1" "$2" <<'PY'
+import json, sys
+beats, label, expr = sys.argv[1], sys.argv[2], sys.argv[3]
+last = None
+try:
+    for line in open(beats):
+        b = json.loads(line)
+        if b.get("node_id") == label: last = b
+except FileNotFoundError:
+    pass
+print("" if last is None else eval(expr, {"b": last}))
+PY
+}
+
+start_orchestrated_node a "$FLIGHT_A_PORT" "$TMP/node-a.log"
+start_orchestrated_node b "$FLIGHT_B_PORT" "$TMP/node-b.log"
+for node in a b; do
+	grep_ready() { grep -q 'hugr_node: ready' "$TMP/node-$node.log"; }
+	wait_for 90 grep_ready || {
+		redact <"$TMP/node-$node.log" >&2
+		fail "orchestrated node $node did not become ready"
+	}
+	grep -q 'step 2 bootstrap document: ok' "$TMP/node-$node.log" && grep -q 'step 3 tresor: ok' "$TMP/node-$node.log" ||
+		fail "node $node did not enter through the orchestrator"
+	[ "$(grep -c 'step 6 engine: ok' "$TMP/node-$node.log")" = 3 ] || fail "node $node did not size its engine from the pod"
+	grep -q "step 6 profile: memory_limit cut to the pod's ceiling" "$TMP/node-$node.log" ||
+		fail "node $node did not cut the profile's memory_limit to the pod"
+done
+echo "ok: both nodes entered through the orchestrator, took tresor's identity and the catalog's type from it, and serve"
+echo "ok: the engine follows the pod - three defaults set, a memory_limit above the pod cut"
+
+has_beat() { [ -n "$(beat "$1" 'b["config"]["applied"]')" ]; }
+for label in hugr-node-e2e-a hugr-node-e2e-b; do
+	wait_for 20 has_beat "$label" || fail "no heartbeat from $label"
+	[ "$(beat "$label" 'b["load"]["label"]')" = "$label" ] || fail "$label's load report does not carry its label"
+	[ "$(beat "$label" '[p["name"] for p in b["config"]["pending"]]')" = "[]" ] ||
+		fail "$label reports pending items at start: $(beat "$label" 'b["config"]["pending"]')"
+	[ "$(beat "$label" 'b["drift"].get("cut", 0)')" = 1 ] ||
+		fail "$label does not report its memory_limit cut to the pod: $(beat "$label" 'b["drift"]')"
+done
+echo "ok: each heartbeat names its node by the document's label, the load report carries it, nothing is pending, the cut is drift"
+
+HOT="$(operator_sql "ACL ADMIN CLUSTER ATTACH ':memory:' AS e2e_hot (TYPE duckdb);")"
+for node in a b; do
+	label="hugr-node-e2e-$node"
+	took() { grep -q "tick: source e2e_hot applied (profile version $HOT)" "$TMP/node-$node.log"; }
+	wait_for 20 took || fail "node $node did not take the hot ATTACH on its tick"
+	applied_at() { [ "$(beat "$label" 'b["config"]["applied"]')" = "$HOT" ]; }
+	wait_for 10 applied_at || fail "$label does not report version $HOT applied"
+done
+echo "ok: a hot ATTACH reached both nodes within a tick, reported applied at version $HOT"
+
+# re-pointed to the same type: the drift cannot tell (one type), the node can - it is not what the node attached
+operator_sql "ACL ADMIN CLUSTER ATTACH '$TMP/e2e_hot2.duckdb' AS e2e_hot (TYPE duckdb);" >/dev/null
+for label in hugr-node-e2e-a hugr-node-e2e-b; do
+	repointed() { [ "$(beat "$label" 'any(p["name"] == "e2e_hot" and p["class"] == "drain" for p in b["config"]["pending"])')" = True ]; }
+	wait_for 20 repointed || fail "$label does not report the re-pointed source pending a drain: $(beat "$label" 'b["config"]')"
+done
+operator_sql "ACL ADMIN CLUSTER DETACH e2e_hot;" >/dev/null
+for node in a b; do
+	label="hugr-node-e2e-$node"
+	detached() { grep -q "tick: source e2e_hot detached" "$TMP/node-$node.log" &&
+		[ "$(beat "$label" '[p["name"] for p in b["config"]["pending"]]')" = "[]" ]; }
+	wait_for 20 detached || fail "node $node did not detach the source the profile dropped: $(beat "$label" 'b["config"]')"
+done
+echo "ok: a source re-pointed to the same type is pending a drain on both; dropped, it is detached by both"
+
+# a hot item that fails on one node (both attach one file: the second finds it locked) is listed there, and the rest
+# of the write still applies
+operator_sql "ACL ADMIN CLUSTER ATTACH '$TMP/e2e_lock.duckdb' AS e2e_lock (TYPE duckdb);" \
+	"ACL ADMIN CLUSTER ATTACH ':memory:' AS e2e_mem (TYPE duckdb);" >/dev/null
+both_seen() {
+	for label in hugr-node-e2e-a hugr-node-e2e-b; do
+		grep -q "tick: source e2e_mem applied" "$TMP/node-${label##*-}.log" || return 1
+	done
+	[ "$(python3 - "$TMP/beats.jsonl" <<'PY'
+import json, sys
+last = {}
+for line in open(sys.argv[1]):
+    b = json.loads(line); last[b["node_id"]] = b
+hot = [l for l, b in last.items() if any(p["name"] == "e2e_lock" and p["class"] == "hot" and p["error"] for p in b["config"]["pending"])]
+print(len(hot))
+PY
+)" = 1 ]
+}
+wait_for 20 both_seen || fail "the locked file is not listed on exactly one node, or e2e_mem did not apply on both: $(beat hugr-node-e2e-a 'b["config"]') $(beat hugr-node-e2e-b 'b["config"]')"
+operator_sql "ACL ADMIN CLUSTER DETACH e2e_lock;" "ACL ADMIN CLUSTER DETACH e2e_mem;" >/dev/null
+for label in hugr-node-e2e-a hugr-node-e2e-b; do
+	settled() { [ "$(beat "$label" '[p["name"] for p in b["config"]["pending"]]')" = "[]" ]; }
+	wait_for 20 settled || fail "$label still reports pending items: $(beat "$label" 'b["config"]')"
+done
+echo "ok: a hot item failing on one node is listed there with its error's class, the rest applied; dropped, nothing waits"
+
+operator_sql "ACL ADMIN CLUSTER SET acl_max_sessions = 77 IN GROUP e2e;" >/dev/null
+for label in hugr-node-e2e-a hugr-node-e2e-b; do
+	waits() { [ "$(beat "$label" 'b["config"]["needs_restart"] and any(p["name"] == "acl_max_sessions" and p["class"] == "restart" for p in b["config"]["pending"])')" = True ]; }
+	wait_for 20 waits || fail "$label does not report the restart item: $(beat "$label" 'b["config"]')"
+done
+echo "ok: a restart-class item is reported by both as needs_restart, the item pending"
+operator_sql "ACL ADMIN CLUSTER RESET acl_max_sessions IN GROUP e2e;" >/dev/null
+for label in hugr-node-e2e-a hugr-node-e2e-b; do
+	withdrawn() { [ "$(beat "$label" 'b["config"]["needs_restart"]')" = False ]; }
+	wait_for 20 withdrawn || fail "$label still waits for a restart item withdrawn before it ran: $(beat "$label" 'b["config"]')"
+done
+# a setting the node took at its bootstrap and the profile dropped (RESET) needs the restart to go
+operator_sql "ACL ADMIN CLUSTER RESET memory_limit;" >/dev/null
+for label in hugr-node-e2e-a hugr-node-e2e-b; do
+	reset_waits() { [ "$(beat "$label" 'b["config"]["needs_restart"] and any(p["name"] == "memory_limit" and p["class"] == "restart" for p in b["config"]["pending"])')" = True ]; }
+	wait_for 20 reset_waits || fail "$label does not report the RESET memory_limit pending a restart: $(beat "$label" 'b["config"]')"
+done
+echo "ok: a restart item withdrawn before it ran waits no more; a setting the node took and the profile dropped waits for the restart"
+
+operator_sql "ACL ADMIN DROP RESOURCE GROUP e2e;" >/dev/null
+for node in a b; do
+	label="hugr-node-e2e-$node"
+	drained() { grep -q 'tick: the node.s resource group is not in the policy - draining' "$TMP/node-$node.log" &&
+		[ "$(beat "$label" 'b["load"]["draining"]')" = True ]; }
+	wait_for 20 drained || fail "node $node did not drain when its resource group went"
+done
+operator_sql "ACL ADMIN CREATE RESOURCE GROUP e2e;" >/dev/null
+for node in a b; do
+	label="hugr-node-e2e-$node"
+	resumed() { grep -q 'tick: the node.s resource group is back - resumed' "$TMP/node-$node.log" &&
+		[ "$(beat "$label" 'b["load"]["draining"]')" = False ]; }
+	wait_for 20 resumed || fail "node $node did not resume when its resource group came back"
+done
+echo "ok: a dropped resource group drained both nodes by themselves, and recreating it resumed them"
+
+for node in a b; do
+	pid_var="NODE_$(echo "$node" | tr a-z A-Z)_PID"
+	kill -TERM "${!pid_var}"
+	status=0
+	wait "${!pid_var}" || status=$?
+	eval "$pid_var="
+	[ "$status" = 0 ] && grep -q 'hugr_node: stopped' "$TMP/node-$node.log" || {
+		redact <"$TMP/node-$node.log" >&2
+		fail "orchestrated node $node did not stop cleanly (exit $status)"
+	}
+done
+echo "ok: both orchestrated nodes stopped cleanly on SIGTERM"
 echo "PASS: a node bootstraps itself"

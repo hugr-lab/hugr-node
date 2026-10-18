@@ -330,14 +330,14 @@ SELECT acl_cluster_attach('etl', 'src3', ':memory:', 'duckdb', '', '{}', 'src1',
 query III
 SELECT r.applied_here, r."class", r.note FROM (SELECT acl_cluster_attach('interactive', 'src1', ':memory:', 'duckdb', '', '{}', '', '') AS r);
 ----
-false	drain	drain class - it overrides the cluster's source of that name on this group's nodes; re-pointing an attached source is DETACH + ATTACH under the same name; the node agent applies it through drain
+false	drain	drain class - it overrides the cluster's source of that name on this group's nodes; re-pointing an attached source is DETACH + ATTACH under the same name; each node reports it pending for a drain
 
 # removing the override: nothing depends on IT (the cluster's src2 depends on the cluster's src1), and
 # the cluster's src1 is in effect again - re-pointed, never detached
 query III
 SELECT r.applied_here, r."class", r.note FROM (SELECT acl_cluster_detach('interactive', 'src1', 'false', 'false') AS r);
 ----
-false	drain	the cluster's source of that name is in effect again on this node: src1 - the node agent re-points it through drain
+false	drain	the cluster's source of that name is in effect again on this node: src1 - the node reports it pending for a drain
 
 query I
 SELECT count(*) FROM duckdb_databases() WHERE database_name IN ('src1', 'src2');

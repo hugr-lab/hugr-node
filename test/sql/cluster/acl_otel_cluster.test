@@ -40,7 +40,7 @@ SELECT acl_cluster_setting('set', 'etl', 'ACL_OTEL_ENDPOINT', 'http://collector:
 ----
 <REGEX>:.*one destination for the whole cluster.*
 
-# for the whole cluster: written, the restart class (the node agent rolls it out), nothing applied here
+# for the whole cluster: written, the restart class (each node reports it pending until it restarts), nothing applied here
 query TT
 SELECT r.class, r.applied_here FROM (SELECT acl_cluster_setting('set', '', 'acl_otel_endpoint', 'http://collector.example:4318') AS r);
 ----

@@ -159,7 +159,7 @@ SELECT spec FROM acl_cluster_items() WHERE kind = 'setting' AND name = 'memory_l
 {"value": "2GB"}
 
 # spec 099: how types are exposed is one value for the cluster (a group's own on its nodes) - a
-# GLOBAL setting like any other, rolled out by the node agent
+# GLOBAL setting like any other, taken at each node's restart
 statement ok
 ACL ADMIN CLUSTER SET acl_enum_types = 'varchar';
 
@@ -179,7 +179,7 @@ statement ok
 ACL ADMIN CLUSTER RESET acl_alias_types;
 
 # spec 112: the lineage namespace is the cluster's - every node names a virtual dataset alike - a
-# setting like any other, rolled out by the node agent
+# setting like any other, taken at each node's restart
 statement ok
 ACL ADMIN CLUSTER SET acl_lineage_namespace = 'acl://cluster';
 
@@ -204,6 +204,22 @@ ACL ADMIN CLUSTER SET lock_configuration = true;
 # spec 006: which certificates the node trusts and where code may come from are its bootstrap's (found 2026-10-15:
 # ca_cert_file was missing, so a profile item could hand every node a new CA)
 foreach name ca_cert_file autoinstall_known_extensions autoload_known_extensions custom_extension_repository autoinstall_extension_repository tresor_http_client CA_CERT_FILE
+
+statement error
+SELECT acl_cluster_setting('set', '', '${name}', 'x');
+----
+<REGEX>:.*is the node's hardening, fixed by its bootstrap.*
+
+endloop
+
+# spec 010: where a node spills is its pod's - the bootstrap sets temp_directory from HUGR_TEMP_DIRECTORY
+statement error
+SELECT acl_cluster_setting('set', '', 'temp_directory', '/elsewhere');
+----
+<REGEX>:.*"temp_directory" is the node's hardening, fixed by its bootstrap.*
+
+# spec 010 review: the bearer path - which HTTP client carries the node's tokens, and whether its log shows them
+foreach name httpfs_client_implementation redact_http_logs
 
 statement error
 SELECT acl_cluster_setting('set', '', '${name}', 'x');
@@ -275,6 +291,12 @@ statement error
 ACL ADMIN CLUSTER REMOVE EXTENSION spatial;
 ----
 <REGEX>:.*extension "spatial" is not in the profile.*
+
+# hugr-node spec 010 review: one extension, one item - an alias names the extension duckdb loads
+statement error
+ACL ADMIN CLUSTER REMOVE EXTENSION postgres;
+----
+<REGEX>:.*extension "postgres_scanner" is not in the profile.*
 
 # --- DETACH: dependents need CASCADE, a policy reading through it needs FORCE --------------------
 
