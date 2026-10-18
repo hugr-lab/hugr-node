@@ -258,8 +258,8 @@ nothing changes here).
   3. a hot `ACL CLUSTER ATTACH` written on the catalog (by an operator's process, which applies it itself) is in effect
      on both within a tick, `applied` at the new version; re-pointed to the same type it is pending a drain on both,
      and dropped it is detached by both;
-  4. a hot item failing on one node (a file the other node holds) is listed there with its error's class, and the rest
-     of the write applies;
+  4. a hot item failing on a node (a file the other node holds) is listed there with its error's class and its version
+     not recorded, and the rest of the write applies;
   5. a `SET … IN GROUP g` is reported by both as `needs_restart` with the item in `pending`; withdrawn before a
      restart it waits no more, while a `RESET` of a setting both took at their bootstrap waits for the restart;
   6. a `DROP RESOURCE GROUP g` drains both by themselves (the heartbeat says `draining`), and recreating it resumes

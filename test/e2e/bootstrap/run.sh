@@ -21,8 +21,8 @@
 #      not pending;
 #  10. a hot ATTACH written on the catalog is in effect on both within a tick, reported applied at the new version;
 #      re-pointed to the same type it is pending a drain on both, and dropped it is detached by both;
-#  11. a hot item failing on one node (a file the other holds) is listed there with its error's class, the rest of
-#      the write applied;
+#  11. a hot item failing on a node (a file the other holds) is listed there with its error's class, its version not
+#      recorded, the rest of the write applied;
 #  12. a restart-class item (SET ... IN GROUP) is reported by both as needs_restart, with the item pending; withdrawn
 #      before it ran it waits no more, while a setting the nodes took at their bootstrap and the profile dropped does;
 #  13. a dropped resource group drains both by themselves, and recreating it resumes them;
@@ -513,8 +513,8 @@ for node in a b; do
 done
 echo "ok: a source re-pointed to the same type is pending a drain on both; dropped, it is detached by both"
 
-# a hot item that fails on one node (both attach one file: the second finds it locked) is listed there, and the rest
-# of the write still applies
+# a hot item that fails on a node (both attach one file: the second finds it locked - in the image, where the file is
+# the host's, neither may write it) is listed there with its error's class, and the rest of the write still applies
 operator_sql "ACL ADMIN CLUSTER ATTACH '$TMP/e2e_lock.duckdb' AS e2e_lock (TYPE duckdb);" \
 	"ACL ADMIN CLUSTER ATTACH ':memory:' AS e2e_mem (TYPE duckdb);" >/dev/null
 both_seen() {
@@ -527,17 +527,17 @@ last = {}
 for line in open(sys.argv[1]):
     b = json.loads(line); last[b["node_id"]] = b
 hot = [l for l, b in last.items() if any(p["name"] == "e2e_lock" and p["class"] == "hot" and p["error"] for p in b["config"]["pending"])]
-print(len(hot))
+print(len(hot) >= 1 and all(b["config"]["applied"] < b["config"]["target"] for l, b in last.items() if l in hot))
 PY
-)" = 1 ]
+)" = True ]
 }
-wait_for 20 both_seen || fail "the locked file is not listed on exactly one node, or e2e_mem did not apply on both: $(beat hugr-node-e2e-a 'b["config"]') $(beat hugr-node-e2e-b 'b["config"]')"
+wait_for 20 both_seen || fail "the failing item is listed on no node (or its version recorded), or e2e_mem did not apply on both: $(beat hugr-node-e2e-a 'b["config"]') $(beat hugr-node-e2e-b 'b["config"]')"
 operator_sql "ACL ADMIN CLUSTER DETACH e2e_lock;" "ACL ADMIN CLUSTER DETACH e2e_mem;" >/dev/null
 for label in hugr-node-e2e-a hugr-node-e2e-b; do
 	settled() { [ "$(beat "$label" '[p["name"] for p in b["config"]["pending"]]')" = "[]" ]; }
 	wait_for 20 settled || fail "$label still reports pending items: $(beat "$label" 'b["config"]')"
 done
-echo "ok: a hot item failing on one node is listed there with its error's class, the rest applied; dropped, nothing waits"
+echo "ok: a hot item failing on a node is listed there with its error's class, the rest applied; dropped, nothing waits"
 
 operator_sql "ACL ADMIN CLUSTER SET acl_max_sessions = 77 IN GROUP e2e;" >/dev/null
 for label in hugr-node-e2e-a hugr-node-e2e-b; do
