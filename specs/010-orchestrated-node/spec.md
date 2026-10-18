@@ -253,8 +253,8 @@ nothing changes here).
   nodes run on one catalog, and the checks are:
   1. both enter through the orchestrator, log in to tresor with the document's identity, take the catalog's type
      from its secret, and serve;
-  2. the engine's defaults follow `HUGR_POD_*`, and a profile `memory_limit` above the pod is cut - `cut` in the
-     heartbeat's drift, nothing pending;
+  2. the engine's defaults follow `HUGR_POD_*`, and a profile `memory_limit` and `threads` above the pod are cut -
+     `cut` in the heartbeat's drift, nothing pending;
   3. a hot `ACL CLUSTER ATTACH` written on the catalog (by an operator's process, which applies it itself) is in effect
      on both within a tick, `applied` at the new version; re-pointed to the same type it is pending a drain on both,
      and dropped it is detached by both;

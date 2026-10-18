@@ -17,7 +17,8 @@
 # and records their heartbeats, and two nodes run on the one catalog:
 #   8. both enter through the orchestrator, log in to tresor with the document's identity, take the catalog's type from
 #      its secret, and serve;
-#   9. the engine's defaults follow HUGR_POD_*, and a profile memory_limit above the pod is cut - drift, not pending;
+#   9. the engine's defaults follow HUGR_POD_*, and a profile memory_limit and threads above the pod are cut - drift,
+#      not pending;
 #  10. a hot ATTACH written on the catalog is in effect on both within a tick, reported applied at the new version;
 #      re-pointed to the same type it is pending a drain on both, and dropped it is detached by both;
 #  11. a hot item failing on one node (a file the other holds) is listed there with its error's class, the rest of
@@ -415,7 +416,7 @@ start_orchestrated_node() { # <a|b> <flight port> <log>
 	mkdir -p "$TMP/node-home-$1" "$TMP/spill-$1"
 	local env_vars=(HUGR_ORCHESTRATOR="https://127.0.0.1:$ORCH_PORT" HUGR_ORCHESTRATOR_TOKEN_FILE="$TMP/orch-token-$1"
 		HUGR_TRESOR_INSECURE_HTTP=1 HUGR_IDENTITY_PRIVATE_KEY_FILE="$TMP/node-key.pem" HUGR_CA_FILE="$TMP/ca.pem"
-		HUGR_FLIGHT="grpc://localhost:$2" HUGR_DRAIN_DEADLINE=5 HUGR_POD_MEMORY=4294967296 HUGR_POD_CPU=8
+		HUGR_FLIGHT="grpc://localhost:$2" HUGR_DRAIN_DEADLINE=5 HUGR_POD_MEMORY=4294967296 HUGR_POD_CPU=2
 		HUGR_TEMP_DIRECTORY="$TMP/spill-$1" HUGR_TEMP_SIZE=1GiB)
 	if [ -z "$NODE_IMAGE" ]; then
 		env -i PATH="$PATH" HOME="$TMP/node-home-$1" "${env_vars[@]}" "$DUCKDB" -no-agent -c "PRAGMA hugr_node_run" \
@@ -468,11 +469,12 @@ for node in a b; do
 	grep -q 'step 2 bootstrap document: ok' "$TMP/node-$node.log" && grep -q 'step 3 tresor: ok' "$TMP/node-$node.log" ||
 		fail "node $node did not enter through the orchestrator"
 	[ "$(grep -c 'step 6 engine: ok' "$TMP/node-$node.log")" = 3 ] || fail "node $node did not size its engine from the pod"
-	grep -q "step 6 profile: memory_limit cut to the pod's ceiling" "$TMP/node-$node.log" ||
-		fail "node $node did not cut the profile's memory_limit to the pod"
+	grep -q "step 6 profile: memory_limit cut to the pod's ceiling" "$TMP/node-$node.log" &&
+		grep -q "step 6 profile: threads cut to the pod's ceiling" "$TMP/node-$node.log" ||
+		fail "node $node did not cut the profile's memory_limit and threads to the pod"
 done
 echo "ok: both nodes entered through the orchestrator, took tresor's identity and the catalog's type from it, and serve"
-echo "ok: the engine follows the pod - three defaults set, a memory_limit above the pod cut"
+echo "ok: the engine follows the pod - three defaults set, a memory_limit and threads above the pod cut"
 
 has_beat() { [ -n "$(beat "$1" 'b["config"]["applied"]')" ]; }
 for label in hugr-node-e2e-a hugr-node-e2e-b; do
@@ -480,8 +482,9 @@ for label in hugr-node-e2e-a hugr-node-e2e-b; do
 	[ "$(beat "$label" 'b["load"]["label"]')" = "$label" ] || fail "$label's load report does not carry its label"
 	[ "$(beat "$label" '[p["name"] for p in b["config"]["pending"]]')" = "[]" ] ||
 		fail "$label reports pending items at start: $(beat "$label" 'b["config"]["pending"]')"
-	[ "$(beat "$label" 'b["drift"].get("cut", 0)')" = 1 ] ||
-		fail "$label does not report its memory_limit cut to the pod: $(beat "$label" 'b["drift"]')"
+	# the profile's memory_limit (500GB) and threads (3) are both above this pod (4 GiB, 2 cores)
+	[ "$(beat "$label" 'b["drift"].get("cut", 0)')" = 2 ] ||
+		fail "$label does not report its memory_limit and threads cut to the pod: $(beat "$label" 'b["drift"]')"
 done
 echo "ok: each heartbeat names its node by the document's label, the load report carries it, nothing is pending, the cut is drift"
 
