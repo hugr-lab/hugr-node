@@ -1,6 +1,6 @@
 # Spec 011: the `hugr` type - a platform as a source of another
 
-- **Status**: draft
+- **Status**: accepted in general (the owner, 2026-10-19: «в целом да»), Q8 changed - see "Decisions" at the end
 - **Date**: 2026-10-19
 - **Author**: Claude, at the owner's ask. The decisions are the owner's: design/019 (duckdb-acl's local `design/`,
   2026-10-01 and 2026-10-09), design/017 §3.3 and §7 items 13-14, and design/082's F1 (duckdb-acl spec 135). The open
@@ -237,7 +237,11 @@ The retry rules:
    - Read-only scans that push the projection only, as quack's scan does (`filter_pushdown` is off). Filters are
      pending Q6.
    - `hugr` in the profile, the metrics and the tests.
-2. **Pushdown** (design/019 §6), in its own spec.
+2. **Pushdown** (design/019 §6), in its own spec. The owner, 2026-10-19: the query pushdown duckdb 2.0 brings (a
+   query node executed by the remote catalog) is the best form; and B - the platform that serves - must be able to
+   LIMIT it per consumer: projection only, projection and filters, or the whole query. A pushed query can cost B far
+   more than a scan, so the level is a limit like the others of a resource group (duckdb-acl spec 085), on the group
+   of the role B grants to A; B's door judges each statement's shape against it and refuses what is above it.
    - The type claims `IS_REMOTE | EXECUTE_QUERY_NODE`.
    - `SupportsPushdown` is a dry run against what B lets A's role call. That list is `duckdb_functions()` under a
      principal (duckdb-acl spec 098, done), read with the catalog.
@@ -340,7 +344,18 @@ Writes through `hugr` are pending Q4.
 - **Not done** (design/019 §10): delegating A's users to B, routing per statement, moving quack sessions between nodes,
   serialized plans, and two-phase commit.
 
-## Open questions for the owner
+## Decisions (the owner, 2026-10-19)
+
+- **Q1-Q7, Q9: as recommended below.**
+- **Q8: not as recommended.** The issuer and the scope - what A needs to get a token for B - come as a **service**
+  that B issues for A, the way an Azure SQL server is a resource its clients get Entra tokens for; and they go
+  **through tresor** (A's), not as options of the ATTACH. The shape of that service and how B hands it out are to be
+  settled with the owner before the ATTACH's identity part is written (pending Q8').
+- **Pushdown: levels limited by B per consumer**, in the resource group - see Stages, 2.
+- (Not this spec: duckdb-acl's release item 2.5 - the right secret under a session - later, with the owner's own
+  view of it.)
+
+## Open questions for the owner (as asked; the decisions above stand)
 
 **Q1. One snapshot of B per A query?** Two scans of B in one A query run on two connections and see B at two moments
 (design/019 §5.2). *Recommendation:* accept it and document it. B's own sources are live, and B gives no snapshot
