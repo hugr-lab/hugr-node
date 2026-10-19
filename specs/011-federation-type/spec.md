@@ -105,7 +105,7 @@ The owner decided (design/017 §7 item 14; 019 §1) that the client and its type
 ### The client: quack's transport, the rest our own
 
 - **The source** is `duckdb-acl/third_party/quack`, the commit acl's embedded server is built from (`e7a9be3` at the
-  duckdb-acl pin `3ed5ed1`). Client and server speak one protocol version; quack's CONNECT refuses any other.
+  duckdb-acl pin `0ea1ef6`). Client and server speak one protocol version; quack's CONNECT refuses any other.
 - **What is copied: the transport.** `src/hugr_type/sync.py` makes the copies the way duckdb-acl's
   `src/quack_embed/sync.py` does - duckdb's quack patches first, then ours; unique basenames; every name holding
   `Quack` renamed `Hugr` outside string literals; inside one only the settings the copies read (`quack_*` → `hugr_*`,
