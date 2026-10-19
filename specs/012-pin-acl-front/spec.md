@@ -1,6 +1,6 @@
 # Spec 012: re-pin duckdb-acl for the platform's front
 
-- **Status**: in progress
+- **Status**: implemented
 - **Date**: 2026-10-19
 
 hugr-platform spec 002 (the front, accepted 2026-10-19) reads two things from a node that duckdb-acl added for it.
@@ -9,7 +9,7 @@ hugr_node builds duckdb-acl in, so the node carries them from this pin on:
 | submodule | from | to | why |
 | --- | --- | --- | --- |
 | duckdb-acl | 0ea1ef6 | b100dad | spec 096's addendum (#243): `x-acl-resource-groups` on a `wrong_resource_group` refusal (a Flight trailer, a header of quack's CONNECT answer) and `group_default` in the load report |
-| duckdb-acl | b100dad | (#245) | spec 134's addendum: a Flight ticket and a prepared statement's handle start with the node's label |
+| duckdb-acl | b100dad | ad784b9 | spec 134's addendum (#245): a Flight ticket and a prepared statement's handle start with the node's label, and a draining node redeems what a cookie-less client holds |
 
 duckdb (f8f3f4d), tresor and acl-otel stay: neither change touches duckdb-ext-common's contracts, and duckdb-acl's
 pin of duckdb is the same.
