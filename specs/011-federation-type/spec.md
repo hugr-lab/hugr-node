@@ -347,10 +347,13 @@ Writes through `hugr` are pending Q4.
 ## Decisions (the owner, 2026-10-19)
 
 - **Q1-Q7, Q9: as recommended below.**
-- **Q8: not as recommended.** The issuer and the scope - what A needs to get a token for B - come as a **service**
-  that B issues for A, the way an Azure SQL server is a resource its clients get Entra tokens for; and they go
-  **through tresor** (A's), not as options of the ATTACH. The shape of that service and how B hands it out are to be
-  settled with the owner before the ATTACH's identity part is written (pending Q8').
+- **Q8: not as recommended - a service through tresor** (confirmed by the owner, 2026-10-19: «q8 да»). B issues A a
+  **service**: the connection's description, with no secret in it - the door's address, the issuer, the
+  audience / scope, the client id - the way an Azure SQL server is an Entra resource its clients get tokens for.
+  A's operator puts it into A's tresor; A's tresor mints the token for B by the node's workload identity (no client
+  secret where the IdP federates it, as a managed identity reaches Azure SQL); the ATTACH names only that secret
+  (`SECRET s`). Still open (Q8'): how B hands the service out - B's operator exports it (a command or a view) for
+  A's operator to import, or A reads it from B's door discovery and A's operator confirms it.
 - **Pushdown: levels limited by B per consumer**, in the resource group - see Stages, 2.
 - (Not this spec: duckdb-acl's release item 2.5 - the right secret under a session - later, with the owner's own
   view of it.)
