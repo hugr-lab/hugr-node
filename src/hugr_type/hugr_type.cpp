@@ -66,11 +66,14 @@ unique_ptr<Catalog> HugrAttach(optional_ptr<StorageExtensionInfo>, ClientContext
 			options.read_ahead = PositiveOption(key, value);
 		} else if (key == "catalog_ttl") {
 			options.catalog_ttl_s = PositiveOption(key, value);
+		} else if (key == "heartbeat_timeout") {
+			options.heartbeat_timeout_s = PositiveOption(key, value);
 		} else if (key == "disable_ssl") {
 			disable_ssl = BooleanValue::Get(value.DefaultCastAs(LogicalType::BOOLEAN));
 		} else {
 			throw InvalidInputException("hugr: unknown ATTACH option \"%s\" (the options: secret, pool_size, pool_wait, "
-			                            "idle_timeout, max_lifetime, read_ahead, catalog_ttl, disable_ssl)",
+			                            "idle_timeout, max_lifetime, read_ahead, catalog_ttl, heartbeat_timeout, "
+			                            "disable_ssl)",
 			                            entry.first);
 		}
 	}

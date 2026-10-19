@@ -20,8 +20,6 @@ namespace hugr {
 
 namespace {
 
-//! quack's own default lease: a heartbeat about every 20 s keeps it
-constexpr idx_t HEARTBEAT_TIMEOUT_S = 60;
 //! how often idle connections are looked at, so a link nobody reads gives B its seats back
 constexpr int64_t SWEEP_INTERVAL_MS = 30000;
 //! how often a waiting loan looks at its statement's interrupt
@@ -168,7 +166,7 @@ string Pool::ReadToken() {
 shared_ptr<HugrClientConnection> Pool::Connect(ClientContext &context) {
 	auto token = ReadToken();
 	// no client id: every connection of A is A's one role, and the door's seat accounting is per connection
-	return HugrClient::ConnectToServer(context, uri, std::move(token), string(), HEARTBEAT_TIMEOUT_S,
+	return HugrClient::ConnectToServer(context, uri, std::move(token), string(), options.heartbeat_timeout_s,
 	                                   options.read_ahead);
 }
 

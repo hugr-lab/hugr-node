@@ -49,11 +49,13 @@ test-cpp:
 # spec 005: acl_otel's export from a node to a fake OTLP receiver (python) - inert with no endpoint, records after one.
 # spec 006: a node bootstraps itself (Keycloak, tresor-server, Postgres, kista, a fake control plane; needs the
 # HUGR_NODE_E2E=1 build for its postgres_scanner)
+# spec 011: the hugr type across processes - two B nodes behind a stand-in front, A attached through it (python only)
 .PHONY: test-e2e
 test-e2e:
 	test/e2e/tresor/run.sh
 	test/e2e/otel/run.sh
 	test/e2e/bootstrap/run.sh
+	test/e2e/federation/run.sh
 
 # a local vcpkg checkout, as duckdb-acl's `make vcpkg-setup`
 .PHONY: vcpkg-setup

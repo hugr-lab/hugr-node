@@ -91,6 +91,8 @@ The owner decided (design/017 §7 item 14; 019 §1) that the client and its type
 | `max_lifetime` | 1800 s (019 §5.3) | a connection retires at its next return after this |
 | `read_ahead` | 8 (019 §5.1) | FETCHes in flight per scan - pending Q2 |
 | `catalog_ttl` | 300 s | when the catalog is read again |
+| `heartbeat_timeout` | 60 s | the lease a connection asks B for (quack's default); its heartbeat renews it about every third |
+| `disable_ssl` | false | cleartext, to a loopback B only (the tests) |
 
 **On B**, the setup is configuration only:
 
@@ -99,35 +101,42 @@ The owner decided (design/017 §7 item 14; 019 §1) that the client and its type
 - a resource group for the role (spec 085), on nodes of its own if wanted (spec 096);
 - a served quack door.
 
-### The client, from quack's client sources
+### The client: quack's transport, the rest our own
 
 - **The source** is `duckdb-acl/third_party/quack`, the commit acl's embedded server is built from (`e7a9be3` at the
-  duckdb-acl pin `0c3415c`). Client and server speak one protocol version; quack's CONNECT refuses any other.
-- **The copies.** `src/hugr_type/sync.py` makes them the way duckdb-acl's `src/quack_embed/sync.py` does:
-  - duckdb's quack patches first;
-  - unique basenames, `hugr_client_*.cpp`;
-  - exact literals renamed: the catalog type, setting names and function names;
-  - duckdb/duckdb-quack#297 carried as a patch (the owner, 2026-10-18) until quack's pin has it. It sends a cookie and
-    `X-Quack-Connection-Id` on every request, so the front routes by header.
+  duckdb-acl pin `3ed5ed1`). Client and server speak one protocol version; quack's CONNECT refuses any other.
+- **What is copied: the transport.** `src/hugr_type/sync.py` makes the copies the way duckdb-acl's
+  `src/quack_embed/sync.py` does - duckdb's quack patches first, then ours; unique basenames; every name holding
+  `Quack` renamed `Hugr`, `"quack…"` literals `"hugr…"`; each cut and patch anchored, a gone anchor fails the sync.
 
-| quack `src/` | taken |
+| quack `src/` | the copy |
 | --- | --- |
-| `quack_client.cpp` / `.hpp` | `HttpsQuackClient` (POST `/quack` through duckdb's `HTTPUtil`); `QuackClientConnection` (the id, the heartbeat lease, cached HTTP clients, `CancelQuery`); `QuackClientWrapper` |
-| `quack_scan.cpp`, `quack_fetch_ahead.cpp` | the table scan: `QuackScanInitGlobal` (PREPARE `SELECT #i, … FROM <path>`, first rows inline); `QuackFetcher` (read-ahead on the ASYNC pool, `StopAndDrain`). It takes its connection from the pool. |
-| `storage/quack_catalog.cpp`, `quack_schema.cpp`, `quack_table.cpp`, `quack_catalog_set.cpp` | `QuackCatalog` (loaded whole at ATTACH; `Refresh`), `QuackSchemaSet`, `QuackTableSet` (each table's `CREATE TABLE` text, bound on A) |
-| `storage/quack_transaction*.cpp` | the transaction and its manager; stage 1 begins none on B |
-| `quack_storage.cpp` | the attach and its options, kept by hand as `HugrStorageExtension` |
+| `quack_client.cpp` / `.hpp` | `hugr_client`: the HTTPS client (POST `/quack` through duckdb's `HTTPUtil`), the connection (the id, the heartbeat lease, cached HTTP clients, `CancelQuery`, DISCONNECT at its end) |
+| `quack_affinity.cpp` / `.hpp` | `hugr_client_affinity`: duckdb/duckdb-quack#297, carried as `patches/0001` (the owner, 2026-10-18) until quack's pin has it - a cookie and `X-Quack-Connection-Id` on every request, so the front routes by header |
+| `quack_fetch_ahead.cpp` / `.hpp` | `hugr_client_fetch_ahead`: the FETCH read-ahead on the ASYNC pool, `StopAndDrain` |
 
-- **Not taken:**
-  - `PinnedHttpsQuackClient`: the trust anchor is B's URL and TLS, as for all of the node's https (the owner,
-    2026-10-14);
-  - the secret type, `SEND_DATA` and inserts, `quack_query`, the cancel function, the entry point and the server;
-  - `storage/quack_optimizer.cpp`: its "second scan" refusal goes away (pending Q1).
-- **The protocol TUs are acl's.** acl's embed already compiles `quack_message.cpp`, `serialize_quack_message.cpp`,
-  `quack_uri.cpp`, `quack_log.cpp` and `quack_random.cpp` into hugr_node, and a second copy would duplicate their
-  definitions. So the type needs the embed, which is on by default.
-- **The embed's compile options**: the httplib shim and `-fvisibility=hidden -fvisibility-inlines-hidden`. Without them,
-  a stock quack loaded beside hugr_node on Linux binds its calls to our copies (duckdb-acl spec 063).
+- **What the copy loses** (cuts and patches in `sync.py`):
+  - `PinnedHttpsQuackClient` and its key generator: B is trusted by its URL and TLS, as all of the node's https (the
+    owner, 2026-10-14); a pinned fingerprint is refused;
+  - every `quack` secret lookup: the token is the type's, read from the `hugr` secret;
+  - a statement's HTTP parameters: a connection's are the node's (`InitializeParameters(db)`), so a statement's context
+    never looks up an `http` secret for B's URL as that statement's user;
+  - the HTTP clients a connection caches are the link's `read_ahead`, not the node's async threads;
+  - the heartbeat's last result is kept (`HeartbeatFailed()`), the pool's check before a loan.
+- **Shared, never copied:** the protocol (`quack_message`, `quack_uri`, `quack_log` - compiled once, by acl's embed,
+  so the type needs the embed, which is on by default), the server's session state the client consults, and quack's
+  header-only buffers. Their names stay quack's.
+- **The type's own** (hand-written, `src/hugr_type/hugr_*.cpp`): quack's catalog, scan and attach do more than the
+  type may (writes, `quack_query`, a view bound through a function that takes SQL, a catalog swapped in place under
+  the statements that read it), so they are not patched but written for the type:
+  - `hugr_catalog` - read-only, a snapshot per transaction (below);
+  - `hugr_scan` - quack's scan with a loan: `SELECT #i, … FROM <path>`, first rows inline, the rest FETCHed ahead;
+  - `hugr_pool`, `hugr_pool_core.hpp` - the pool, its decisions header-only and clock-free;
+  - `hugr_type` - the attach and its options, the `hugr` secret type, `hugr_pools()`, the gauges.
+- **Not taken:** `SEND_DATA` and inserts, `quack_query`, the cancel function, the entry point, the server,
+  `storage/quack_optimizer.cpp` (its "second scan" refusal goes away - Q1).
+- **Hidden symbols** (`-fvisibility=hidden -fvisibility-inlines-hidden`), as the embed's: a stock quack loaded beside
+  hugr_node on Linux must not bind its calls to our copies (duckdb-acl spec 063).
 - **HTTP goes through duckdb's client.** httpfs is linked in (spec 006), so `ca_cert_file` and spec 010's server
   verification apply.
 
@@ -138,7 +147,8 @@ A pooled connection carries only what the type composes: the catalog's listing q
 
 - **`Supports()` claims nothing.** duckdb then never forwards a statement verbatim (`CONNECT`), and in stage 1 never
   pushes one (`EXECUTE_*`).
-- **The catalog refuses writes**: schema DDL, CTAS, INSERT, UPDATE, DELETE and indexes fail with
+- **The catalog refuses writes.** The attachment is read-only, so duckdb refuses every write to it before the catalog
+  is reached; what reaches the catalog anyway (schema DDL, CTAS, INSERT, UPDATE, DELETE, indexes) fails with
   `hugr: the catalog b is read-only`. Writes are pending Q4.
 - **No function takes SQL text.** quack binds a remote view as `FROM quack_query_by_name(<catalog>, 'FROM <view>')`.
   The type instead describes a view from B's `duckdb_columns()` at load, and scans it like a table.
@@ -199,15 +209,16 @@ none, so a reconnect has nothing to replay.
 | `acl: this connection is not known on this node - connect again` (spec 135; also the answer behind a front that re-routed because the label's node is gone) | reconnect and retry once. Also drop every connection whose id starts with the same `<label>.` (spec 134; 019 §5.4): idle ones at once, busy ones when they return. Anything more about B's nodes: pending Q3. |
 | `acl: this connection's lease ran out on this node - connect again` | reconnect and retry once |
 | no answer: refused, reset, timed out | reconnect and retry once |
-| `Authorization failed` (the session has ended on B) | pending Q9 |
-| at connect: `acl: node at capacity …`, `max_sessions`, `draining`, `wrong_resource_group` | no new connection: wait (Capacity) |
-| B's database invalidated (`must_invalidate`) | drop the connection |
+| `Authorization failed` (the session has ended on B: idle, killed, past its `exp` under `every_use`) | reconnect and retry once (Q9) |
+| at connect: `acl: node at capacity …`, `Authentication failed` (B does not tell a drain, `max_sessions` or a token it refuses apart), a placement refusal (`wrong_resource_group`) | no new connection: wait (Capacity) - growth suspended for a backoff (0.5 s doubling to 8 s); a loan that waits out `pool_wait` fails naming B's last answer. The ATTACH does not wait: B's first refusal is its answer |
+| B's database invalidated (`must_invalidate`) | drop the connection; the statement fails |
 | the statement's own error (binder, access, function) | the statement fails and the connection returns. A binder error naming an object or column also refreshes the catalog. |
 
 The retry rules:
 
 - **Transparent only before any row, and only unpinned.** No row may have reached A's pipeline (it is the PREPARE), and
-  the connection may hold no open transaction on B. The retry runs once, on a new connection.
+  the connection may hold no open transaction on B. The retry runs once, on a new connection - never an idle one,
+  which may have ended the same way; at the pool's size the least recently used idle one makes room.
 - **Once rows have flowed, the statement fails** (design/019 §5.4).
 - **A connection holding a transaction fails its statement**: `hugr: the connection to b lost its open transaction on
   B - ROLLBACK to go on`, and A's transaction is aborted.
@@ -226,24 +237,33 @@ The retry rules:
 
 **Visibility.**
 
-- Metrics go to the registry acl-otel reads: `hugr.pool.connections{catalog, state}`, `hugr.pool.waiting`,
+- Metrics go to the registry acl-otel reads, every one with the link's `catalog`: the gauges
+  `hugr.pool.connections{state = busy | idle | connecting}` and `hugr.pool.waiting`, the counters
   `hugr.pool.reconnects{reason}`, `hugr.pool.retries`, `hugr.pool.refused{reason}` and `hugr.pool.wait_timeouts`.
-- `hugr_pools()` is the operator's view:
-  - per pool: its B, size, in use, idle and waiting;
-  - per connection: its label, age and last error class.
+- `hugr_pools()` is the operator's view, one row per pool: its B, size, busy, idle, connecting, waiting, B's last
+  refusal, and per connection its label, age, idle time and whether it is lent.
 - It never shows a connection id: the id's random part is its secret (spec 134).
 
 ### The catalog
 
-- **The snapshot.** At ATTACH and at each refresh, the type reads B's listings as A's role: `duckdb_schemas()`,
-  `duckdb_tables()` (each `CREATE TABLE` bound on A) and `duckdb_columns()` for views. B answers them as the
-  principal's own, with masked and exposed types (duckdb-acl specs 025, 026, 046, 099). So `b` is what B shows A's
-  role, never B's physical objects (design/019 §3).
+- **The snapshot.** At ATTACH and at each refresh, the type reads B's listings as A's role: `duckdb_schemas()` (the
+  schema tree, quack's walk) and `duckdb_columns()` (every column of every table and view, by its schema's oid). B
+  answers them as the principal's own, with masked and exposed types (duckdb-acl specs 025, 026, 046, 099). So `b` is
+  what B shows A's role, never B's physical objects (design/019 §3).
+  - A table and a view are both an entry read as `SELECT <columns> FROM <path>`: B's acl resolves the name.
+  - A type is spelled by the node's type manager, built-in types only - what B exposes under a principal (duckdb-acl
+    spec 099). An object with a type the node cannot spell is left out, named in a warning in the log; the rest of B
+    stays readable.
+- **A transaction reads one snapshot**: the one current at its first lookup in `b`. A refresh makes a new one for the
+  transactions that start after; the old one lives while a transaction holds it. A prepared statement over `b` is
+  re-bound at every execution (the catalog has no version), so no plan outlives its snapshot.
 - **The layout** is quack's. B's MAIN catalog's schemas sit at the top (`b.main.orders`). Each other catalog of the
   role becomes a schema holding its schemas (`b.hr.main.staff`).
-- **The refresh** runs after `catalog_ttl`, or after an error from B that names an object or column (design/019 §3).
+- **The refresh** runs after `catalog_ttl`, or after a binder or catalog error from B (an object or column gone,
+  design/019 §3), when the next transaction first looks at `b`.
   - The snapshot is swapped whole; a statement bound to the old one finishes on it.
   - The failed statement is not retried, because its plan was bound to the old shape.
+  - A refresh that fails (B away) keeps the snapshot and is tried again 30 s later, not by every statement.
 - **B's table functions and scalars are not in the catalog.** quack loads tables and views only; functions come with
   stage 2.
 
@@ -310,42 +330,42 @@ Writes through `hugr` are pending Q4.
 
 ## Testing
 
-- **sqllogictest** (`test/sql/federation/hugr_type.test`, no B needed):
-  - ATTACH is refused without `SECRET`, with an unknown option, and with `disable_ssl` to a host that is not loopback;
-  - `ACL CLUSTER ATTACH … (TYPE hugr)` is refused without `SECRET`, and with one it plans no extension install;
-  - `hugr_pools()` is refused under a principal.
-- **C++** (`make test-cpp`):
-  - `test_hugr_pool.cpp` tests the pool's decisions, kept in a pure `hugr_pool.hpp` (as `hugr_node_tick.hpp` is):
-    - the FIFO queue and its timeout;
-    - retirement when idle and after the lifetime;
-    - each answer in the table;
-    - one retry, only before a row and only unpinned;
-    - the label sweep;
-    - no growth after `at_capacity`;
-    - the token's reuse.
-  - `test_hugr_type_coload.cpp` loads hugr_node and a stock quack in one process. Both attach, and our copies'
-    symbols are local (`nm`).
-- **e2e** (`test/e2e/federation/run.sh`, in `make test-e2e`).
-  - The setup:
-    - Keycloak and tresor-server, as in `test/e2e/bootstrap`;
-    - two B nodes, `b1` and `b2`, on one policy catalog, with labels and quack doors;
-    - a Python stand-in for the front, which routes by the label in `X-Quack-Connection-Id` and places new connections
-      where it is told;
-    - A, with its client secret in tresor-server.
+- **sqllogictest** (`test/sql/hugr_type/hugr_type.test`): B is the node's own quack door, A attaches it in the same
+  process with a fixture token in a local `hugr` secret.
+  - What the ATTACH refuses: no `SECRET` (and `TOKEN` as an option), an unknown option, `disable_ssl` to a host that is
+    not loopback, a secret the node does not have, `pool_size 0`; a door that is not there fails the ATTACH at once.
+  - A reads exactly B's slice for A's role: a column B hides is not in `b`, a view is read as a table, B's listing in
+    `duckdb_tables()`; a result past the PREPARE's inline rows is FETCHed whole; an early stop (`LIMIT 1`) gives the
+    connection back with B's query over.
+  - Two scans of B in one statement run on two loans; with `pool_size 1` that statement waits `pool_wait`, then fails
+    with the pool's state, and the pool is not stuck after it.
+  - Nothing is written through `b` (INSERT, CREATE TABLE, DELETE); the token is redacted in `duckdb_secrets()`.
+  - A's principal reads through A's virtual table with A's RLS on top, cannot name `b.…`, and cannot call
+    `hugr_pools()`.
+  - B ended the sessions (`acl_session_kill`): the next read retries once on a new connection
+    (`hugr.pool.retries`); B's door restarted: the next read reconnects the same way.
+  - `catalog_ttl`: an object B publishes later is in `b` after it.
+  - `ACL CLUSTER ATTACH … (TYPE hugr, SECRET s)` attaches B on the node, no extension to install;
+    `test/sql/cluster/acl_cluster_profile.test` refuses one without `SECRET`.
+  - DETACH ends the pool.
+- **C++** (`make test-cpp`): `test_hugr_pool.cpp` tests `hugr_pool_core.hpp`, header-only and clock-free (as
+  `hugr_node_tick.hpp` is): each answer in the table and what it does, the one retry (before a row, on a new
+  connection - never an idle one), the label, loans in arrival order, no growth while B refuses (the backoff and its
+  ceiling, an empty pool retrying), retirement idle / past the lifetime / unusable / its node gone, the pool's end.
+- **e2e** (`test/e2e/federation/run.sh`, in `make test-e2e`) - what one process cannot show:
+  - The setup: two B nodes, `b1` and `b2`, with labels and quack doors, the same policy; a Python stand-in for the
+    front, which routes by the label in `X-Quack-Connection-Id` and places new connections where it is told; A.
   - The checks:
-    1. A reads exactly B's slice for A's role, and a column B hides is not in `b`.
-    2. A's principal reads through A's virtual table with A's RLS on top, and cannot name `b.…`.
-    3. A join of two B tables runs on two loans.
-    4. B's door restarts between two statements: the second reconnects, succeeds, and is counted.
-    5. The stand-in forgets `b1`: `b2` answers "not known", and A continues on `b2`.
-    6. A is stopped (SIGSTOP) for longer than its lease: its next statement succeeds through a reconnect.
-    7. B is killed during a long scan: that statement fails, and the next works.
-    8. With a short token lifetime, live connections keep working, and new ones mint new tokens.
-    9. `acl_drain()` on `b1` with a short `max_lifetime`: A's reads continue on `b2`, and `b1` holds none of A's
+    1. The stand-in forgets `b1`: `b2` answers "not known", A continues on `b2`, and `b1`'s other connections go.
+    2. A is stopped (SIGSTOP) for longer than its lease: its next statement succeeds through a reconnect.
+    3. B is killed during a long scan: that statement fails, and the next works.
+    4. `acl_drain()` on `b1` with a short `max_lifetime`: A's reads continue on `b2`, and `b1` holds none of A's
        sessions after one lifetime.
-    10. One statement more than `pool_size`: it waits, then fails with the message, and `hugr_pools()` shows the queue.
-        With B's door capacity lowered, B's refusal counter stays bounded.
-    11. SET, CREATE TABLE and INSERT through `b` are refused.
+    5. With B's door capacity lowered, B's refusal counter stays bounded (the backoff).
+    6. Our copies' symbols are local in the loadable (`nm`), so a stock quack loaded beside binds its own.
+  - With tresor (Keycloak and tresor-server, as in `test/e2e/tresor`): A's `hugr` secret in tresor-server with
+    `mint+exchange://`, the node reading it as itself; with a short token lifetime, live connections keep working and
+    new ones mint new tokens.
 - **CI**: the linux job, like the other e2e.
 
 ## Alternatives

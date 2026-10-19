@@ -29,6 +29,8 @@ struct LinkOptions {
 	idx_t read_ahead = 8;
 	//! when the catalog is read again, in seconds
 	idx_t catalog_ttl_s = 300;
+	//! the lease a connection asks B for; its heartbeat renews it about every third of it (quack's default)
+	idx_t heartbeat_timeout_s = 60;
 };
 
 //! What one of B's answers means to the pool (spec 011, "Failures and the reconnect").
