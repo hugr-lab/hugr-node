@@ -54,14 +54,31 @@ The owner decided (design/017 §7 item 14; 019 §1) that the client and its type
 - **The path** is B's quack door, `host[:port]` in quack's URI form. On a platform that is B's front.
   - Any node serving duckdb-acl's quack door can be B; it need not be a hugr_node.
   - TLS is always on. `disable_ssl` is accepted only for a loopback host (the tests).
-- **`SECRET`** names an `oidc_client` secret in A's tresor (duckdb-acl spec 095: `CLIENT_ID`, `CLIENT_SECRET`;
-  design/019 §2). The grant's IdP and scope are pending Q8.
-- **The token.**
-  - It is minted by client credentials at every connect, through duckdb-ext-common's OIDC core, compiled under
-    hugr_node's namespace (R13).
-  - It is reused until shortly before its `exp`.
-  - B's default `acl_session_token_binding = 'connect'` (spec 059) judges `exp` only when a session opens. A live
-    connection therefore outlives its token, and reconnecting is the refresh (design/019 §2).
+- **`SECRET`** names a `hugr` secret that A's tresor serves (Q8 / Q8', the owner): B's operator exports the
+  **service**, A's operator stores it in A's tresor service as that secret. The service is a description with no
+  secret in it:
+  - the door's address;
+  - the audience and scope B's door accepts for A's node.
+
+  ```json
+  {"name": "b", "type": "hugr", "scope": "hugr://b.example:443",
+   "params": {"token": "mint+exchange://api://hugr-b?scope=api://hugr-b/.default"}}
+  ```
+- **The token** is tresor's own generated parameter (tresor's `mint+exchange://<audience>[?scope=…]`).
+  - tresor mints it for the caller - here the node itself, which attached tresor by its workload identity (spec
+    006, FLOW `federated`) - at the identity provider, by RFC 8693 exchange.
+  - tresor caches it until shortly before its `exp`. The type reads the secret at every connect, so a reconnect is
+    the refresh.
+  - B's default `acl_session_token_binding = 'connect'` (spec 059) judges `exp` only when a session opens, so a live
+    connection outlives its token (design/019 §2).
+  - No client secret lives anywhere where the IdP federates the node's identity. The node never holds the token's
+    making, and the type compiles no OIDC client of its own.
+- **The export.** In stage 1, B's operator writes the service from B's client, as the docs show: the door, the
+  audience, the scope. A command that prints it on B (`platform` view or function) is a follow-up of its own.
+- **On B**, the identity side is configuration (spec 095):
+  - an `ISSUER` that trusts the identity provider minting A's token;
+  - a `CLIENT` with that audience, whose own mapping reaches A's role.
+
 - **Who attaches**: the operator only - the bootstrap, a hot profile item (`ACL CLUSTER ATTACH … (TYPE hugr,
   SECRET s)`), or `ACL NATIVE`. A principal never does.
 - **Options**, per link. The defaults are proposed, except those marked 019.
