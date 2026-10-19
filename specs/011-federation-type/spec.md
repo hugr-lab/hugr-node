@@ -363,9 +363,17 @@ Writes through `hugr` are pending Q4.
        sessions after one lifetime.
     5. With B's door capacity lowered, B's refusal counter stays bounded (the backoff).
     6. Our copies' symbols are local in the loadable (`nm`), so a stock quack loaded beside binds its own.
-  - With tresor (Keycloak and tresor-server, as in `test/e2e/tresor`): A's `hugr` secret in tresor-server with
-    `mint+exchange://`, the node reading it as itself; with a short token lifetime, live connections keep working and
-    new ones mint new tokens.
+- **e2e, the identity** (`test/e2e/federation/tresor.sh`, in `make test-e2e`): Keycloak and tresor-server, as in
+  `test/e2e/tresor`; A's link a `hugr` secret in tresor-server with `TOKEN 'mint+exchange://echo-api'`, usable by the
+  role `nodes` only; B trusting Keycloak for that audience, the token's realm role (`nodes`) A's role there.
+  1. A attaches B by the secret's name: tresor mints the token for the node, B seats it as `nodes`.
+  2. A user of A (alice, through an acl session) reads B through A's virtual table.
+  3. B ends A's sessions: the reconnect inside alice's statement reads the secret as the node, and her statement
+     succeeds through the one retry. Negative control (run by hand, 2026-10-19): reading the secret with the
+     statement's context made tresor mint alice's token, which B refused - the check fails.
+  4. No token is in A's or B's output.
+  A live connection outliving its token is B's `connect` binding (duckdb-acl spec 059), and the minted token's cache
+  tresor's (spec 029) - each tested where it is built.
 - **CI**: the linux job, like the other e2e.
 
 ## Alternatives

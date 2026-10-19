@@ -113,3 +113,4 @@ jobs:
           grep -q '^PASS: acl_otel in hugr_node' e2e.log
           grep -q '^PASS: a node bootstraps itself' e2e.log
           grep -q '^PASS: the hugr type across processes' e2e.log
+          grep -q "^PASS: the hugr type's identity through tresor" e2e.log
