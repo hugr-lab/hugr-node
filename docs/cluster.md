@@ -85,8 +85,8 @@ in its heartbeat; the orchestrator rolls the nodes (hugr-node spec 010, hugr-pla
 
 - **No credentials, anywhere.** A path with a credential key is refused. That covers a conninfo
   `password=`, a URI's `user:password@`, a SAS `sig=` and the like, and so does an option with such a
-  key. A postgres, mysql or mssql source must name a `SECRET`, and the node resolves it from its
-  secrets service. The refusal names the key, never its value.
+  key. A postgres, mysql, mssql or hugr ([another platform](federation.md)) source must name a `SECRET`, and the
+  node resolves it from its secrets service. The refusal names the key, never its value.
 - **The node's hardening is not a profile item.** `allow_unsigned_extensions`, `lock_configuration`,
   `allow_persistent_secrets`, `allow_extension_repositories`, the extension and secret directories
   and the like are refused - and (spec 118) the node's trust: `acl_allow_anonymous_admin`, the quack door's

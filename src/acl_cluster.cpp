@@ -90,7 +90,8 @@ const case_insensitive_set_t CLUSTER_WIDE_SETTINGS = {
     "acl_otel_lineage",  "acl_otel_lineage_endpoint", "acl_otel_lineage_secret"};
 
 //! Source types whose connection needs a credential: written without SECRET, refused
-const case_insensitive_set_t TYPES_NEEDING_SECRET = {"postgres", "postgres_scanner", "mysql", "mysql_scanner", "mssql"};
+const case_insensitive_set_t TYPES_NEEDING_SECRET = {"postgres", "postgres_scanner", "mysql", "mysql_scanner", "mssql",
+                                                     "hugr"};
 
 //! The extension a source type needs loaded ('' = a core type)
 string ExtensionOfType(const string &type) {
@@ -104,7 +105,8 @@ string ExtensionOfType(const string &type) {
 	if (t == "sqlite" || t == "sqlite_scanner") {
 		return "sqlite_scanner";
 	}
-	if (t == "duckdb" || t.empty()) {
+	// spec 011: another platform - the type is built into hugr_node
+	if (t == "duckdb" || t == "hugr" || t.empty()) {
 		return "";
 	}
 	return t; // ducklake, mssql, iceberg, delta, ... are named like their extension

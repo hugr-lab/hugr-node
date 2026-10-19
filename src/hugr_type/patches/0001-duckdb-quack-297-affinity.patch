@@ -1,0 +1,451 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 666de59a..8299a1c7 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -3,6 +3,7 @@ add_subdirectory(storage)
+ add_library(
+   quack_library OBJECT
+   quack_active_connections.cpp
++  quack_affinity.cpp
+   quack_rebalancer_core.cpp
+   quack_rebalancer_sink.cpp
+   quack_fetch_collector.cpp
+diff --git a/src/include/quack_affinity.hpp b/src/include/quack_affinity.hpp
+new file mode 100644
+index 00000000..1ba85f3a
+--- /dev/null
++++ b/src/include/quack_affinity.hpp
+@@ -0,0 +1,45 @@
++//===----------------------------------------------------------------------===//
++//                         DuckDB
++//
++// quack_affinity.hpp
++//
++//
++//===----------------------------------------------------------------------===//
++
++#pragma once
++
++#include "duckdb/common/mutex.hpp"
++#include "duckdb/common/string.hpp"
++#include "duckdb/common/types/timestamp.hpp"
++#include "duckdb/common/vector.hpp"
++
++namespace duckdb {
++
++struct HTTPHeaders;
++
++//! One stored cookie; expires is timestamp_t::infinity() for a session cookie
++struct QuackCookie {
++	string name;
++	string value;
++	timestamp_t expires = timestamp_t::infinity();
++};
++
++//! Manages connection affinity, including cookies and connection ID
++class QuackConnectionAffinity {
++public:
++	//! headers for the next request: Cookie (merged with a Cookie from EXTRA_HTTP_HEADERS, if any) and
++	//! X-Quack-Connection-Id once the id is known
++	void AddRequestHeaders(HTTPHeaders &headers, timestamp_t now);
++	//! every Set-Cookie value of a response that arrived - also a non-200 one
++	void Absorb(const vector<string> &set_cookie_values, timestamp_t now);
++	//! Called once, right after CONNECTION_RESPONSE
++	void SetConnectionId(const string &connection_id_p);
++
++private:
++	mutex lock;
++	//! In first-stored order; name is unique
++	vector<QuackCookie> cookies;
++	string connection_id;
++};
++
++} // namespace duckdb
+diff --git a/src/include/quack_client.hpp b/src/include/quack_client.hpp
+index 254cd2b6..84de2e50 100644
+--- a/src/include/quack_client.hpp
++++ b/src/include/quack_client.hpp
+@@ -15,6 +15,7 @@
+ 
+ namespace duckdb {
+ class QuackClientConnection;
++class QuackConnectionAffinity;
+ struct QuackClientWrapper;
+ 
+ //! The active query's id, for log correlation. Invalid when no query runs (e.g. transaction start).
+@@ -49,6 +50,12 @@ class QuackClient {
+ 		owner_connection = owner_connection_p;
+ 	}
+ 
++	//! The affinity (cookie jar, connection id) of the logical connection this client belongs to, shared by all
++	//! its clients. Set when the client is created - by ConnectToServer and TakeClient - before any request.
++	void SetAffinity(shared_ptr<QuackConnectionAffinity> affinity_p) {
++		affinity = std::move(affinity_p);
++	}
++
+ 	//! POST already-serialized request bytes and return the raw response body, throwing on transport failure.
+ 	//! Lets an async sender serialize on a producer thread and perform the blocking POST from the ASYNC pool;
+ 	//! pass context=nullptr when called off the execution thread (parameters fall back to the database).
+@@ -106,6 +113,8 @@ class QuackClient {
+ 	shared_ptr<Logger> request_logger;
+ 	//! See SetOwnerConnection
+ 	optional_ptr<const QuackClientConnection> owner_connection;
++	//! See SetAffinity. Null for a client nobody attached one to - requests then carry no affinity headers.
++	shared_ptr<QuackConnectionAffinity> affinity;
+ 
+ private:
+ 	virtual unique_ptr<QuackMessage> RequestInternal(optional_ptr<ClientContext> context,
+@@ -114,7 +123,8 @@ class QuackClient {
+ 
+ class QuackClientConnection : public enable_shared_from_this<QuackClientConnection> {
+ public:
+-	explicit QuackClientConnection(DatabaseInstance &db_p, unique_ptr<QuackClient> client_p, QuackUri uri_p,
++	explicit QuackClientConnection(DatabaseInstance &db_p, unique_ptr<QuackClient> client_p,
++	                               shared_ptr<QuackConnectionAffinity> affinity_p, QuackUri uri_p,
+ 	                               string connection_id_p, idx_t heartbeat_timeout_seconds_p,
+ 	                               idx_t max_connections_cached = 1);
+ 	~QuackClientConnection();
+@@ -155,6 +165,8 @@ class QuackClientConnection : public enable_shared_from_this<QuackClientConnecti
+ 	DatabaseInstance &db;
+ 	QuackUri uri;
+ 	string connection_id;
++	//! Shared with every client of this connection; TakeClient hands it to each new one.
++	shared_ptr<QuackConnectionAffinity> affinity;
+ 	//! Lease timeout accepted by the server during the connection handshake.
+ 	idx_t heartbeat_timeout_seconds;
+ 	mutable mutex lock;
+diff --git a/src/quack_affinity.cpp b/src/quack_affinity.cpp
+new file mode 100644
+index 00000000..b3cb09de
+--- /dev/null
++++ b/src/quack_affinity.cpp
+@@ -0,0 +1,213 @@
++#include "quack_affinity.hpp"
++
++#include "duckdb/common/algorithm.hpp"
++#include "duckdb/common/http_util.hpp"
++#include "duckdb/common/string_util.hpp"
++#include "duckdb/common/types/date.hpp"
++#include "duckdb/common/types/interval.hpp"
++#include "duckdb/common/types/time.hpp"
++
++#include <ctime>
++#include <iomanip>
++#include <locale>
++#include <sstream>
++
++namespace duckdb {
++
++namespace {
++
++//! Name of the header that carries the connection ID.
++constexpr const char *CONNECTION_ID_HEADER = "X-Quack-Connection-Id";
++
++//! Maximum size of a cookie in bytes, including name and value.
++constexpr idx_t MAX_COOKIE_BYTES = 4096;
++//! Cap the Max-Age to this many seconds (roughly 300 years) to avoid overflow.
++constexpr int64_t MAX_AGE_CAP_SECONDS = Interval::DAYS_PER_YEAR * Interval::SECS_PER_DAY * 300;
++//! Cookies kept per connection; a new name beyond it is skipped (never evict: the affinity cookie came first)
++constexpr idx_t MAX_COOKIES = 20;
++
++//! A character that must never get into a request header: < 0x20 except tab, and DEL
++bool IsControl(char c) {
++	auto byte = static_cast<unsigned char>(c);
++	return (byte < 0x20 && c != '\t') || byte == 0x7F;
++}
++
++//! Strips spaces and tabs only - StringUtil::Trim would also eat \r and \n
++string TrimSpaces(const string &text) {
++	idx_t start = 0;
++	idx_t end = text.size();
++
++	while (start < end && (text[start] == ' ' || text[start] == '\t')) {
++		start++;
++	}
++	while (end > start && (text[end - 1] == ' ' || text[end - 1] == '\t')) {
++		end--;
++	}
++	return text.substr(start, end - start);
++}
++
++//! RFC 6265 5.2.2: an optional '-' followed by digits. False for anything else (the attribute is ignored).
++bool ParseMaxAge(const string &value, int64_t &max_age) {
++	idx_t pos = 0;
++	bool negative = false;
++	if (pos < value.size() && value[pos] == '-') {
++		negative = true;
++		pos++;
++	}
++	if (pos == value.size()) {
++		return false;
++	}
++	int64_t result = 0;
++	for (; pos < value.size(); pos++) {
++		auto c = value[pos];
++		if (c < '0' || c > '9') {
++			return false;
++		}
++		if (result < MAX_AGE_CAP_SECONDS) {
++			result = result * 10 + (c - '0');
++		}
++	}
++	max_age = negative ? -result : MinValue(result, MAX_AGE_CAP_SECONDS);
++	return true;
++}
++
++//! RFC 1123 HTTP-date ("Sun, 06 Nov 1994 08:49:37 GMT") - the form every current ingress sends.
++//! False for anything else: the attribute is ignored and the cookie is a session cookie.
++bool ParseHttpDate(const string &text, timestamp_t &result) {
++	std::tm parts {};
++	std::istringstream stream(text);
++	stream.imbue(std::locale::classic());
++	stream >> std::get_time(&parts, "%a, %d %b %Y %H:%M:%S");
++	if (stream.fail()) {
++		return false;
++	}
++	date_t date;
++	if (!Date::TryFromDate(parts.tm_year + 1900, parts.tm_mon + 1, parts.tm_mday, date)) {
++		return false;
++	}
++	return Timestamp::TryFromDatetime(date, Time::FromTime(parts.tm_hour, parts.tm_min, parts.tm_sec), result);
++}
++
++//! Parses one Set-Cookie value. False: skip it as a whole (garbage, control characters, too long).
++//! An expires <= now means the cookie is deleted.
++bool ParseSetCookie(const string &set_cookie, timestamp_t now, QuackCookie &parsed) {
++	for (auto c : set_cookie) {
++		if (IsControl(c)) {
++			return false;
++		}
++	}
++	auto pair_end = set_cookie.find(';');
++	auto cookie_pair = set_cookie.substr(0, pair_end);
++	auto equals = cookie_pair.find('=');
++	if (equals == string::npos) {
++		return false;
++	}
++
++	parsed.name = TrimSpaces(cookie_pair.substr(0, equals));
++	parsed.value = TrimSpaces(cookie_pair.substr(equals + 1));
++	if (parsed.name.empty() || parsed.name.size() + parsed.value.size() > MAX_COOKIE_BYTES) {
++		return false;
++	}
++	parsed.expires = timestamp_t::infinity();
++	if (pair_end == string::npos) {
++		return true;
++	}
++
++	bool has_max_age = false;
++	for (auto &attribute : StringUtil::Split(set_cookie.substr(pair_end + 1), ';')) {
++		auto attribute_equals = attribute.find('=');
++		auto attribute_name = TrimSpaces(attribute.substr(0, attribute_equals));
++		auto attribute_value =
++		    attribute_equals == string::npos ? string() : TrimSpaces(attribute.substr(attribute_equals + 1));
++		if (StringUtil::CIEquals(attribute_name, "max-age")) {
++			int64_t max_age = 0;
++			if (!ParseMaxAge(attribute_value, max_age)) {
++				continue;
++			}
++			parsed.expires = max_age <= 0 ? now : timestamp_t(now.value + max_age * Interval::MICROS_PER_SEC);
++			has_max_age = true;
++		} else if (StringUtil::CIEquals(attribute_name, "expires") && !has_max_age) {
++			timestamp_t expires;
++			if (ParseHttpDate(attribute_value, expires)) {
++				parsed.expires = expires;
++			}
++		}
++		// Domain, Path, Secure, HttpOnly, SameSite, unknown: ignored - one origin, one path, never persisted.
++	}
++	return true;
++}
++
++//! Cookie header value: the static pairs whose name is not stored, then every stored cookie.
++//! A stored value wins over a static one of the same name: the ingress's value is fresh.
++string MergeCookieHeader(const string &static_cookie, const vector<QuackCookie> &cookies) {
++	string result;
++	auto add_pair = [&](const string &pair) {
++		if (!result.empty()) {
++			result += "; ";
++		}
++		result += pair;
++	};
++	for (auto &static_pair : StringUtil::Split(static_cookie, ';')) {
++		auto pair = TrimSpaces(static_pair);
++		if (pair.empty()) {
++			continue;
++		}
++		auto name = TrimSpaces(pair.substr(0, pair.find('=')));
++		auto stored =
++		    std::any_of(cookies.begin(), cookies.end(), [&](const QuackCookie &cookie) { return cookie.name == name; });
++		if (!stored) {
++			add_pair(pair);
++		}
++	}
++	for (auto &cookie : cookies) {
++		add_pair(cookie.name + "=" + cookie.value);
++	}
++	return result;
++}
++
++} // namespace
++
++void QuackConnectionAffinity::AddRequestHeaders(HTTPHeaders &headers, timestamp_t now) {
++	lock_guard<mutex> guard(lock);
++
++	cookies.erase(std::remove_if(cookies.begin(), cookies.end(),
++	                             [&](const QuackCookie &cookie) { return cookie.expires <= now; }),
++	              cookies.end());
++	if (!cookies.empty()) {
++		auto static_cookie = headers.HasHeader("Cookie") ? headers.GetHeaderValue("Cookie") : string();
++		headers["Cookie"] = MergeCookieHeader(static_cookie, cookies);
++	}
++	if (!connection_id.empty()) {
++		headers[CONNECTION_ID_HEADER] = connection_id;
++	}
++}
++
++void QuackConnectionAffinity::Absorb(const vector<string> &set_cookie_values, timestamp_t now) {
++	lock_guard<mutex> guard(lock);
++	for (auto &set_cookie : set_cookie_values) {
++		QuackCookie parsed;
++		if (!ParseSetCookie(set_cookie, now, parsed)) {
++			continue;
++		}
++		auto it =
++		    std::find_if(cookies.begin(), cookies.end(), [&](const QuackCookie &c) { return c.name == parsed.name; });
++		if (parsed.expires <= now) {
++			// Max-Age <= 0 or a past Expires: delete, and don't store this one.
++			if (it != cookies.end()) {
++				cookies.erase(it);
++			}
++		} else if (it != cookies.end()) {
++			it->value = std::move(parsed.value);
++			it->expires = parsed.expires;
++		} else if (cookies.size() < MAX_COOKIES) {
++			cookies.push_back(std::move(parsed));
++		}
++	}
++}
++
++void QuackConnectionAffinity::SetConnectionId(const string &connection_id_p) {
++	lock_guard<mutex> guard(lock);
++	connection_id = connection_id_p;
++}
++
++} // namespace duckdb
+diff --git a/src/quack_client.cpp b/src/quack_client.cpp
+index 611cf73a..e5ecb12f 100644
+--- a/src/quack_client.cpp
++++ b/src/quack_client.cpp
+@@ -12,6 +12,7 @@
+ 
+ #include "quack_ssl_key_generator.hpp"
+ 
++#include "quack_affinity.hpp"
+ #include "quack_client.hpp"
+ #include "quack_secret.hpp"
+ #include "quack_session_state.hpp"
+@@ -127,6 +128,9 @@ string HttpsQuackClient::PostRawLocked(const_data_ptr_t data, idx_t size) {
+ 	auto &http_util = HTTPUtil::Get(db);
+ 	auto request_url = uri.Http() + "/quack";
+ 	HTTPHeaders headers = extra_headers;
++	if (affinity) {
++		affinity->AddRequestHeaders(headers, Timestamp::GetCurrentTimestamp());
++	}
+ 	PostRequestInfo post_request(request_url, headers, *http_params, data, size);
+ 	unique_ptr<HTTPResponse> response;
+ 	try {
+@@ -135,6 +139,10 @@ string HttpsQuackClient::PostRawLocked(const_data_ptr_t data, idx_t size) {
+ 		ErrorData error(ex);
+ 		throw IOException("Failed to send message: %s", error.Message());
+ 	}
++	// any response that arrived, also non-200 one: an ingress may set cookies on a 503
++	if (response && affinity && response->headers.HasHeader("Set-Cookie")) {
++		affinity->Absorb(response->headers.GetHeaderValues("Set-Cookie"), Timestamp::GetCurrentTimestamp());
++	}
+ 	if (!response || !response->Success()) {
+ 		string error = response ? response->GetError() : "no response";
+ 		throw IOException("Failed to send message: %s", error);
+@@ -253,7 +261,15 @@ void PinnedHttpsQuackClient::PrepareTeardownRequest() {
+ }
+ 
+ string PinnedHttpsQuackClient::PostRawLocked(const_data_ptr_t data, idx_t size) {
+-	auto result = https_client->Post("/quack", const_char_ptr_cast(data), size, "application/vnd.duckdb");
++	duckdb_httplib_openssl::Headers headers;
++	if (affinity) {
++		HTTPHeaders affinity_headers;
++		affinity->AddRequestHeaders(affinity_headers, Timestamp::GetCurrentTimestamp());
++		for (auto &header : affinity_headers) {
++			headers.emplace(header.first, header.second);
++		}
++	}
++	auto result = https_client->Post("/quack", headers, const_char_ptr_cast(data), size, "application/vnd.duckdb");
+ 	if (!result) {
+ 		auto error = result.error();
+ 		if (error == duckdb_httplib_openssl::Error::SSLServerVerification) {
+@@ -264,6 +280,15 @@ string PinnedHttpsQuackClient::PostRawLocked(const_data_ptr_t data, idx_t size)
+ 		throw IOException("Failed to send message: %s error for HTTP POST to '%s/quack'",
+ 		                  duckdb_httplib_openssl::to_string(error), uri.Http());
+ 	}
++	// any response that arrived, also non-200 one
++	if (affinity) {
++		vector<string> set_cookie_values;
++		auto set_cookie_count = result->get_header_value_count("Set-Cookie");
++		for (idx_t i = 0; i < set_cookie_count; i++) {
++			set_cookie_values.push_back(result->get_header_value("Set-Cookie", "", i));
++		}
++		affinity->Absorb(set_cookie_values, Timestamp::GetCurrentTimestamp());
++	}
+ 	if (result->status != 200) {
+ 		throw IOException("Failed to send message: HTTP %d for HTTP POST to '%s/quack'", result->status, uri.Http());
+ 	}
+@@ -315,10 +340,11 @@ unique_ptr<QuackClient> QuackClient::GetClient(ClientContext &context, const Qua
+ 	return GetClient(*context.db, uri);
+ }
+ 
+-QuackClientConnection::QuackClientConnection(DatabaseInstance &db_p, unique_ptr<QuackClient> client_p, QuackUri uri_p,
++QuackClientConnection::QuackClientConnection(DatabaseInstance &db_p, unique_ptr<QuackClient> client_p,
++                                             shared_ptr<QuackConnectionAffinity> affinity_p, QuackUri uri_p,
+                                              string connection_id_p, idx_t heartbeat_timeout_seconds_p,
+                                              idx_t max_connections_cached_p)
+-    : db(db_p), uri(std::move(uri_p)), connection_id(std::move(connection_id_p)),
++    : db(db_p), uri(std::move(uri_p)), connection_id(std::move(connection_id_p)), affinity(std::move(affinity_p)),
+       heartbeat_timeout_seconds(heartbeat_timeout_seconds_p), max_connections_cached(max_connections_cached_p) {
+ 	if (client_p) {
+ 		StoreClient(std::move(client_p));
+@@ -433,6 +459,11 @@ shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(ClientContext &co
+ 	// open a HTTP client to the server
+ 	auto client = QuackClient::GetClient(context, server_uri);
+ 
++	// The connection's affinity starts with the handshake: the ingress sets its cookie on this response.
++	// The request itself goes out bare (empty jar, no id), so a new connection is placed freely.
++	auto affinity = make_shared_ptr<QuackConnectionAffinity>();
++	client->SetAffinity(affinity);
++
+ 	// submit the connection request
+ 	auto connection_request_response = client->Request<ConnectionResponseMessage>(
+ 	    context, make_uniq<ConnectionRequestMessage>(token, std::move(client_id), heartbeat_timeout_seconds));
+@@ -445,12 +476,13 @@ shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(ClientContext &co
+ 	ValidateHeartbeatTimeout(accepted_heartbeat_timeout_seconds);
+ 	// success! we got a connection id
+ 	auto connection_id = connection_request_response->ConnectionId();
++	affinity->SetConnectionId(connection_id);
+ 	// Cache at most one client per async send slot: pending SEND_DATA tasks can check out far more
+ 	// clients than ever POST concurrently, and each cached client pins a server connection slot.
+ 	idx_t pool_size = MaxValue<idx_t>(1, (idx_t)TaskScheduler::GetScheduler(context).NumberOfAsyncThreads());
+ 	auto connection =
+-	    make_shared_ptr<QuackClientConnection>(*context.db, std::move(client), server_uri, std::move(connection_id),
+-	                                           accepted_heartbeat_timeout_seconds, pool_size);
++	    make_shared_ptr<QuackClientConnection>(*context.db, std::move(client), std::move(affinity), server_uri,
++	                                           std::move(connection_id), accepted_heartbeat_timeout_seconds, pool_size);
+ 	connection->StartHeartbeat();
+ 	return connection;
+ }
+@@ -466,6 +498,7 @@ unique_ptr<QuackClient> QuackClientConnection::TakeClient(optional_ptr<ClientCon
+ 	}
+ 	if (!result) {
+ 		result = QuackClient::GetClient(db, uri);
++		result->SetAffinity(affinity);
+ 	}
+ 	result->SetRequestLogger(context ? context->logger : nullptr);
+ 	return result;

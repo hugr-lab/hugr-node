@@ -32,7 +32,31 @@ include(${CMAKE_CURRENT_LIST_DIR}/tresor/tresor_sources.cmake)
 # configured it exports nothing. Its contracts and hooks must be acl's and tresor's files (checked at configure)
 set(ACL_OTEL_EMBEDDED ON)
 include(${CMAKE_CURRENT_LIST_DIR}/acl-otel/acl_otel_sources.cmake)
+# spec 011: the `hugr` catalog type - quack's client transport (the copies src/hugr_type/sync.py makes) and the type's
+# own catalog, pool and scan. The protocol it speaks is compiled once, by acl's embedded quack server (its message,
+# uri and log TUs), so the type needs the embed. Hidden symbols, as the embed's: a stock quack loaded beside must not
+# bind its calls to our copies
+if(NOT ACL_QUACK_EMBED_ENABLED)
+    message(FATAL_ERROR "hugr_node: the hugr type needs acl's embedded quack server (unset ACL_NO_QUACK_EMBED)")
+endif()
+set(HUGR_TYPE_DIR ${CMAKE_CURRENT_LIST_DIR}/src/hugr_type)
+include_directories(${HUGR_TYPE_DIR}/include)
+set(HUGR_TYPE_SOURCES
+    ${HUGR_TYPE_DIR}/hugr_client.cpp
+    ${HUGR_TYPE_DIR}/hugr_client_affinity.cpp
+    ${HUGR_TYPE_DIR}/hugr_client_fetch_ahead.cpp
+    ${HUGR_TYPE_DIR}/hugr_pool.cpp
+    ${HUGR_TYPE_DIR}/hugr_remote.cpp
+    ${HUGR_TYPE_DIR}/hugr_catalog.cpp
+    ${HUGR_TYPE_DIR}/hugr_scan.cpp
+    ${HUGR_TYPE_DIR}/hugr_type.cpp)
+if(NOT MSVC)
+    set_source_files_properties(${HUGR_TYPE_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
+endif()
+
 list(APPEND EXTENSION_SOURCES
+    ${HUGR_TYPE_SOURCES}
     ${TRESOR_SOURCES}
     ${ACL_OTEL_SOURCES}
     ${CMAKE_CURRENT_LIST_DIR}/src/hugr_node_extension.cpp

@@ -63,6 +63,13 @@ jobs:
           git -C tresor submodule update --init --depth 1 duckdb-ext-common
           git -C acl-otel submodule update --init --depth 1 duckdb-ext-common
 
+      # spec 011: the hugr type's copy of quack's client is what src/hugr_type/sync.py makes from the pins
+      - name: The hugr type's copy of quack's client is current
+        run: |
+          pip install clang_format==11.0.1
+          python3 src/hugr_type/sync.py
+          git diff --exit-code -- src/hugr_type
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -105,10 +112,12 @@ jobs:
           cache: false
 
       # spec 005: acl_otel's export; spec 006: a node bootstraps itself - from the same make target (kista is cloned
-      # from its main by the script)
-      - name: End to end - tresor inside the cluster, acl_otel's export, the bootstrap
+      # from its main by the script); spec 011: the hugr type across processes
+      - name: End to end - tresor inside the cluster, acl_otel's export, the bootstrap, the hugr type
         run: |
           TRESOR_SERVER_DIR=_tresor-server make test-e2e 2>&1 | tee e2e.log
           grep -q '^PASS: tresor in the cluster' e2e.log
           grep -q '^PASS: acl_otel in hugr_node' e2e.log
           grep -q '^PASS: a node bootstraps itself' e2e.log
+          grep -q '^PASS: the hugr type across processes' e2e.log
+          grep -q "^PASS: the hugr type's identity through tresor" e2e.log

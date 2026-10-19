@@ -12,6 +12,7 @@
 #include "acl_extension.hpp"
 #include "acl_otel_extension.hpp"
 #include "hugr_node_agent.hpp"
+#include "hugr_type.hpp"
 #include "tresor_extension.hpp"
 
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -26,6 +27,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	LoadAclOtelCore(loader);
 	acl::RegisterAclCluster(loader, store);
 	hugr_node::RegisterHugrNodeAgent(loader, store); // spec 006: the node process and its bootstrap
+	hugr::RegisterHugrType(loader);                  // spec 011: another platform as a source
 }
 
 } // namespace

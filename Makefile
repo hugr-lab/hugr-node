@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 TEST_CPP_SOURCES := $(wildcard test/cpp/test_*.cpp)
 TEST_CPP_DIR := build/test
 TEST_CPP_BINS := $(patsubst test/cpp/%.cpp,$(TEST_CPP_DIR)/%,$(TEST_CPP_SOURCES))
-TEST_CPP_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include -I src/include -I duckdb-acl/src/include \
+TEST_CPP_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include -I src/include -I src/hugr_type/include -I duckdb-acl/src/include \
 	-I duckdb-acl/test/cpp -I duckdb-acl/duckdb-ext-common/contracts
 ifeq ($(shell uname),Darwin)
 TEST_CPP_DUCKDB_LIB := build/release/src/libduckdb.dylib
@@ -49,11 +49,15 @@ test-cpp:
 # spec 005: acl_otel's export from a node to a fake OTLP receiver (python) - inert with no endpoint, records after one.
 # spec 006: a node bootstraps itself (Keycloak, tresor-server, Postgres, kista, a fake control plane; needs the
 # HUGR_NODE_E2E=1 build for its postgres_scanner)
+# spec 011: the hugr type across processes - two B nodes behind a stand-in front, A attached through it (python only);
+# its identity through tresor - A's link a secret whose token tresor mints for the node (Keycloak, tresor-server)
 .PHONY: test-e2e
 test-e2e:
 	test/e2e/tresor/run.sh
 	test/e2e/otel/run.sh
 	test/e2e/bootstrap/run.sh
+	test/e2e/federation/run.sh
+	test/e2e/federation/tresor.sh
 
 # a local vcpkg checkout, as duckdb-acl's `make vcpkg-setup`
 .PHONY: vcpkg-setup

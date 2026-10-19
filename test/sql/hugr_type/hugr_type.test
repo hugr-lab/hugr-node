@@ -1,0 +1,475 @@
+# name: test/sql/hugr_type/hugr_type.test
+# description: spec 011 - the `hugr` type against a live B in the same process: B is this node's own quack door
+#   (duckdb-acl's embedded server), A attaches it with the node's secret. A reads exactly what B's acl shows A's role
+#   (a hidden column is not in `b`, a view is read as a table), two scans run on two loans, nothing is written
+#   through `b`, an ended session and a restarted door are reconnected once before any row, and the pool shows its
+#   connections without their ids.
+# group: [hugr_node]
+
+require hugr_node
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+ATTACH ':memory:' AS phys;
+
+statement ok
+CREATE TABLE phys.main.orders(id INTEGER, tenant VARCHAR, ssn VARCHAR);
+
+statement ok
+INSERT INTO phys.main.orders VALUES (1, 'acme', 's1'), (2, 'globex', 's2');
+
+# more rows than a PREPARE carries inline: the rest is FETCHed ahead
+statement ok
+CREATE TABLE phys.main.big AS SELECT i AS id FROM range(300000) t(i);
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+SELECT acl_define_issuer('test/idp/s', '{"url": "test/idp/s", "client": {"audiences": ["api://acl-test"], "roles_from": ["roles"], "attributes": {"tid": "tenant"}}}');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+# B publishes two of the three columns to A's role
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.orders AS phys.main.orders COLUMNS (id, tenant);
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.big AS phys.main.big;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL VIEW c.doubled AS 'SELECT id * 2 AS twice FROM phys.main.orders';
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+query I
+SELECT acl_quack_serve('quack:localhost:31591', 'hugr-type-server-token');
+----
+quack:localhost:31591
+
+# A's node token for B: a test fixture (iss test/idp/s, role analyst). On a platform node the secret is tresor's,
+# its token minted for the node at every read
+statement ok
+CREATE SECRET bsec (TYPE hugr, SCOPE 'hugr://localhost:31591', TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A');
+
+# the token is a secret of its own: redacted where secrets are listed
+query I
+SELECT secret_string LIKE '%token=redacted%' FROM duckdb_secrets() WHERE name = 'bsec';
+----
+true
+
+# a hugr secret names the door its token goes to
+statement error
+CREATE SECRET nowhere (TYPE hugr, TOKEN 'x');
+----
+<REGEX>:.*hugr: a hugr secret names B's door - SCOPE 'hugr://<host>:<port>'.*
+
+statement ok
+CREATE SECRET elsewhere (TYPE hugr, SCOPE 'hugr://b.example:443', TOKEN 'x');
+
+statement ok
+CREATE SECRET closed_door (TYPE hugr, SCOPE 'hugr://localhost:31599', TOKEN 'x');
+
+statement ok
+CREATE SECRET not_hugr (TYPE http, SCOPE 'hugr://localhost:31591', BEARER_TOKEN 'x');
+
+# --- what the ATTACH refuses -----------------------------------------------------------------------------------------
+
+# the token goes where its secret says, never only where an ATTACH says (gate coverage probe: the cluster bundle
+# writes ATTACHes, and must not point the node's token for B at another host)
+statement error
+ATTACH 'localhost:31591' AS b0 (TYPE hugr, SECRET elsewhere, DISABLE_SSL true);
+----
+<REGEX>:.*hugr: b0: secret "elsewhere" is not for this door - its SCOPE must name 'hugr://localhost:31591'.*
+
+statement error
+ATTACH 'localhost:31591' AS b0 (TYPE hugr, SECRET not_hugr, DISABLE_SSL true);
+----
+<REGEX>:.*hugr: b0: secret "not_hugr" is of type http, not hugr.*
+
+statement error
+ATTACH 'localhost:31591' AS b0 (TYPE hugr, DISABLE_SSL true);
+----
+<REGEX>:.*hugr: name the secret that holds B's token.*
+
+statement error
+ATTACH 'localhost:31591' AS b0 (TYPE hugr, SECRET bsec, DISABLE_SSL true, TOKEN 'x');
+----
+<REGEX>:.*hugr: unknown ATTACH option "token".*
+
+statement error
+ATTACH 'example.com:443' AS b0 (TYPE hugr, SECRET bsec, DISABLE_SSL true);
+----
+<REGEX>:.*hugr: disable_ssl is for a loopback B only.*
+
+statement error
+ATTACH 'localhost:31591' AS b0 (TYPE hugr, SECRET nobody, DISABLE_SSL true);
+----
+<REGEX>:.*hugr: b0: no secret "nobody" the node may use.*
+
+statement error
+ATTACH 'localhost:31591' AS b0 (TYPE hugr, SECRET bsec, DISABLE_SSL true, POOL_SIZE 0);
+----
+<REGEX>:.*hugr: pool_size must be between 1 and 1024.*
+
+# a door that is not there: the ATTACH fails at once with what the client saw, it does not wait
+statement error
+ATTACH 'localhost:31599' AS b0 (TYPE hugr, SECRET closed_door, DISABLE_SSL true);
+----
+<REGEX>:.*hugr: no connection to b0.*
+
+# --- B as B shows it to A's role -------------------------------------------------------------------------------------
+
+statement ok
+ATTACH 'localhost:31591' AS b (TYPE hugr, SECRET bsec, DISABLE_SSL true, POOL_SIZE 2, HEARTBEAT_TIMEOUT 3600);
+
+query II
+SELECT * FROM b.main.orders ORDER BY id;
+----
+1	acme
+2	globex
+
+# the column B does not publish to A's role is not in `b`
+statement error
+SELECT ssn FROM b.main.orders;
+----
+<REGEX>:.*ssn.*
+
+# a view of B is read as a table: B's acl resolves its name
+query I
+SELECT twice FROM b.main.doubled ORDER BY 1;
+----
+2
+4
+
+query T
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'b' ORDER BY 1;
+----
+big
+doubled
+orders
+
+# the rest FETCHed ahead, in full
+query II
+SELECT count(*), sum(id) FROM b.main.big;
+----
+300000	44999850000
+
+# two scans of B in one statement: two loans of the pool
+query I
+SELECT count(*) FROM b.main.big x JOIN b.main.big y USING (id);
+----
+300000
+
+# an early stop gives the connection back after B's query is over
+query I
+SELECT id FROM b.main.big LIMIT 1;
+----
+0
+
+query II
+SELECT count(*), sum(id) FROM b.main.big;
+----
+300000	44999850000
+
+# --- nothing is written through `b` ----------------------------------------------------------------------------------
+
+statement error
+INSERT INTO b.main.orders VALUES (3, 'initech');
+----
+<REGEX>:.*read-only.*
+
+statement error
+CREATE TABLE b.main.t(i INTEGER);
+----
+<REGEX>:.*read-only.*
+
+statement error
+DELETE FROM b.main.orders;
+----
+<REGEX>:.*read-only.*
+
+# --- the pool: its size, its connections, never their ids -------------------------------------------------------------
+
+query IIIII
+SELECT catalog, server, pool_size, busy, waiting FROM hugr_pools();
+----
+b	quack:localhost:31591	2	0	0
+
+query I
+SELECT len(connections) BETWEEN 1 AND 2 FROM hugr_pools();
+----
+true
+
+query I
+SELECT list_bool_and(list_transform(connections, lambda c: NOT c.busy)) FROM hugr_pools();
+----
+true
+
+# --- B ended the sessions: the next read reconnects once, before any row ------------------------------------------
+
+statement ok
+SET VARIABLE retries = (SELECT coalesce(sum(value), 0) FROM acl_metrics() WHERE name = 'hugr.pool.retries');
+
+query I
+SELECT count(*) > 0 FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '"id":"([^"]+)"[^}]*"door":"quack"', 1)) AS id) WHERE acl_session_kill(id);
+----
+true
+
+query II
+SELECT * FROM b.main.orders ORDER BY id;
+----
+1	acme
+2	globex
+
+query I
+SELECT coalesce(sum(value), 0) - getvariable('retries') FROM acl_metrics() WHERE name = 'hugr.pool.retries';
+----
+1
+
+# --- B's door restarted: its connections are not known any more, the next read reconnects ----------------------------
+
+query I
+SELECT acl_quack_stop('quack:localhost:31591') LIKE '%session(s) closed%';
+----
+true
+
+query I
+SELECT acl_quack_serve('quack:localhost:31591', 'hugr-type-server-token');
+----
+quack:localhost:31591
+
+query II
+SELECT count(*), sum(id) FROM b.main.big;
+----
+300000	44999850000
+
+query I
+SELECT coalesce(sum(value), 0) - getvariable('retries') FROM acl_metrics() WHERE name = 'hugr.pool.retries';
+----
+2
+
+# --- A's users read B through A's virtual objects, A's RLS on top of B's slice ---------------------------------------
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG a;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE a.orders AS b.main.orders RLS (tenant = 'acme');
+
+statement ok
+ACL ADMIN CREATE ROLE reader;
+
+statement ok
+ACL ADMIN GRANT CATALOG a TO ROLE reader WITH (select) MAIN;
+
+query II
+ACL ROLE "reader" SELECT * FROM orders;
+----
+1	acme
+
+# B itself is not a name A's users have, and the pool is the operator's
+statement error
+ACL ROLE "reader" SELECT * FROM b.main.orders;
+----
+<REGEX>:.*no access.*
+
+statement error
+ACL ROLE "reader" SELECT * FROM hugr_pools();
+----
+<REGEX>:.*hugr_pools.*
+
+# --- B's catalog is read again after catalog_ttl -----------------------------------------------------------------------
+
+statement ok
+ATTACH 'localhost:31591' AS bt (TYPE hugr, SECRET bsec, DISABLE_SSL true, CATALOG_TTL 1);
+
+statement error
+SELECT * FROM bt.main.later;
+----
+<REGEX>:.*later.*
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.later AS phys.main.orders COLUMNS (id);
+
+sleep 1100 milliseconds
+
+query I
+SELECT count(*) FROM bt.main.later;
+----
+2
+
+statement ok
+DETACH bt;
+
+# --- a scan gives its connection back when B's stream ends, not when its statement ends ---------------------------------
+
+statement ok
+ATTACH 'localhost:31591' AS b1 (TYPE hugr, SECRET bsec, DISABLE_SSL true, POOL_SIZE 1, POOL_WAIT 2, HEARTBEAT_TIMEOUT 3600);
+
+# a join of two reads past the inline rows, and three reads in one statement, on a pool of one
+query I
+SELECT count(*) FROM b1.main.big x JOIN b1.main.big y USING (id);
+----
+300000
+
+query I
+SELECT (SELECT count(*) FROM b1.main.big) + (SELECT count(*) FROM b1.main.big) + (SELECT count(*) FROM b1.main.big);
+----
+900000
+
+# the retry on a pool of one: the ended connection gives its place back before the new one is asked for
+statement ok
+SET VARIABLE retries = (SELECT coalesce(sum(value), 0) FROM acl_metrics() WHERE name = 'hugr.pool.retries');
+
+query I
+SELECT count(*) > 0 FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '"id":"([^"]+)"[^}]*"door":"quack"', 1)) AS id) WHERE acl_session_kill(id);
+----
+true
+
+query I
+SELECT count(*) FROM b1.main.big;
+----
+300000
+
+query I
+SELECT coalesce(sum(value), 0) - getvariable('retries') >= 1 FROM acl_metrics() WHERE name = 'hugr.pool.retries';
+----
+true
+
+statement ok
+DETACH b1;
+
+# --- B's shape changes under A: columns are asked for by name, and a changed type fails cleanly -------------------------
+
+statement ok
+CREATE TABLE phys.main.d1(a VARCHAR, b VARCHAR);
+
+statement ok
+INSERT INTO phys.main.d1 VALUES ('a1', 'b1');
+
+statement ok
+CREATE TABLE phys.main.d2(b VARCHAR, a VARCHAR);
+
+statement ok
+INSERT INTO phys.main.d2 VALUES ('b2', 'a2');
+
+statement ok
+CREATE TABLE phys.main.d3(a INTEGER, b VARCHAR);
+
+statement ok
+INSERT INTO phys.main.d3 VALUES (3, 'b3');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.drift AS phys.main.d1;
+
+statement ok
+ATTACH 'localhost:31591' AS bd (TYPE hugr, SECRET bsec, DISABLE_SSL true, HEARTBEAT_TIMEOUT 3600);
+
+query TT
+SELECT a, b FROM bd.main.drift;
+----
+a1	b1
+
+# B reorders two columns of one type: A, whose snapshot has the old order, still reads each column as itself (a
+# position would read b as a, under a's masks and RLS)
+statement ok
+ACL ADMIN DROP RELATION c.drift;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.drift AS phys.main.d2;
+
+query TT
+SELECT a, b FROM bd.main.drift;
+----
+a2	b2
+
+# B changes a type: the statement fails as an error of its own - never A's node invalidated - and the next one,
+# after B's catalog is read again, reads the new shape
+statement ok
+ACL ADMIN DROP RELATION c.drift;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.drift AS phys.main.d3;
+
+statement error
+SELECT a, b FROM bd.main.drift;
+----
+<REGEX>:.*hugr: bd.main.drift changed on B since this node read B's catalog.*
+
+sleep 1100 milliseconds
+
+query IT
+SELECT a, b FROM bd.main.drift;
+----
+3	b3
+
+statement ok
+DETACH bd;
+
+# --- a principal of A attaches nothing ----------------------------------------------------------------------------------
+
+statement error
+ACL ROLE "reader" ATTACH 'localhost:31591' AS bx (TYPE hugr, SECRET bsec, DISABLE_SSL true);
+----
+<REGEX>:.*not permitted.*
+
+# --- the pool's gauges -------------------------------------------------------------------------------------------------------
+
+query I
+SELECT count(*) = 3 FROM acl_metrics() WHERE name = 'hugr.pool.connections';
+----
+true
+
+# --- the cluster profile attaches B like any source: with its secret, no extension to install -------------------------
+
+statement ok
+ACL ADMIN CLUSTER ATTACH 'localhost:31591' AS bc (TYPE hugr, SECRET bsec, DISABLE_SSL true);
+
+query I
+SELECT count(*) FROM bc.main.orders;
+----
+2
+
+query I
+SELECT spec LIKE '%"type": "hugr"%"secret": "bsec"%' FROM acl_cluster_items() WHERE name = 'bc';
+----
+true
+
+statement ok
+ACL ADMIN CLUSTER DETACH bc;
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=false;
+
+# --- DETACH ends the pool ---------------------------------------------------------------------------------------------
+
+statement ok
+DETACH b;
+
+query I
+SELECT count(*) FROM hugr_pools();
+----
+0
+
+statement ok
+SELECT acl_quack_stop('quack:localhost:31591');
