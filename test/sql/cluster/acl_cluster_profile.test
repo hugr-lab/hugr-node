@@ -115,6 +115,12 @@ ACL ADMIN CLUSTER ATTACH 'host=db dbname=sales' AS pg (TYPE postgres);
 ----
 <REGEX>:.*connects with a credential - name the secret.*
 
+# spec 011: another platform connects with a token, from a secret
+statement error
+ACL ADMIN CLUSTER ATTACH 'b.example:443' AS b (TYPE hugr);
+----
+<REGEX>:.*a hugr source connects with a credential - name the secret.*
+
 # the refusal names the key, never the value
 statement error
 ACL ADMIN CLUSTER ATTACH 'host=db password=hunter2' AS pg (TYPE postgres, SECRET s);

@@ -23,7 +23,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 TEST_CPP_SOURCES := $(wildcard test/cpp/test_*.cpp)
 TEST_CPP_DIR := build/test
 TEST_CPP_BINS := $(patsubst test/cpp/%.cpp,$(TEST_CPP_DIR)/%,$(TEST_CPP_SOURCES))
-TEST_CPP_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include -I src/include -I duckdb-acl/src/include \
+TEST_CPP_INCLUDES := -I duckdb/src/include -I duckdb/third_party/fmt/include -I src/include -I src/hugr_type/include -I duckdb-acl/src/include \
 	-I duckdb-acl/test/cpp -I duckdb-acl/duckdb-ext-common/contracts
 ifeq ($(shell uname),Darwin)
 TEST_CPP_DUCKDB_LIB := build/release/src/libduckdb.dylib
