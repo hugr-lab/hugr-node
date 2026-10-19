@@ -86,7 +86,7 @@ SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V
 true
 
 query I
-SELECT acl_node_load() LIKE '%"group":null,"group_known":true,%';
+SELECT acl_node_load() LIKE '%"group":null,"group_known":true,"group_default":false,%';
 ----
 true
 
@@ -168,6 +168,13 @@ SELECT acl_node_load() LIKE '%"general":{"live":1,%';
 ----
 true
 
+# duckdb-acl spec 096's addendum: the report says the node's group is the policy's default - a front seats a
+# principal whose group it does not know yet on such a node
+query I
+SELECT acl_node_load() LIKE '%"group":"general","group_known":true,"group_default":true,%';
+----
+true
+
 # a principal with a group is not a member of the default by implication
 query I
 SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJhbmFseXN0Il19.RPD7WZXscyjtSETOfilmFNkrBXqC0P_SMLTmWOzAPxKydzv6BEnQud-W60LY1mixyyZvFI_-DjznCAWOZvm5C5wZR64ynr6RkbZxinJwWXWS6-NmTX4BANU7PFwTF9nSAESaMdbxJ-F_hpeAtnUikd_Hd1m5f6QhLjT4rRgotxRenvsxJmKSqNSqeLNlKXPz_-ZXOB-5vfxD_Vp4yxN9x9HMGGV7OTo1ZHJcZGSE0ZP6O6ZE5FIbiuUJ7nEJCD1Szcjqdeol8Y3ihnFgPeQUGq4vcZ_ETviwVJCr9awk0klK5fhGCys2wCaPA4W0b5tPwGzPJl5Orq_PkXcH8skW5g') IS NULL;
@@ -190,6 +197,12 @@ query I
 SELECT count(*) FROM acl_resource_groups() WHERE is_default;
 ----
 0
+
+# the mark gone, the report says so at once (the write is this node's: the cached read is dropped)
+query I
+SELECT acl_node_load() LIKE '%"group":"general","group_known":true,"group_default":false,%';
+----
+true
 
 query I
 SELECT acl_session_open('eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6ImEiLCJyb2xlcyI6WyJwbGFpbiJdfQ.a7leR6-nf1r8uq_fJ9N0h1hFJZhcn14DNjaXpIC21UrzwxgY1bZXZS33xdVwHM97g5BoXvJGV9Lg04MKb8PcwggFe5xUeZUHaojmiN9JWDFKxQQT_c-WqczCbcV_xq8W0D7VnCwX3ND0Z0wJWgCEJMHQ_aOEWbiEy_IO7XZef57hqEt1o6SFeD_Yt0RWCzAVfwuNGXa7Wn3kY3eT1V-V_FWoyDVtrwA0xT4UmL7f1zV2Wn5SFba5eA52HV_fzi9WBut8OmcXVTBZVZ58_MeHVTTIRf2CKiiYIbBLGzE_ZJ8tMxVoSVx-Dzb3BpLc5nnOhRTLCxahownp3zXq1nfOxw') IS NULL;
