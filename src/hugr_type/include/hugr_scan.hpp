@@ -19,8 +19,12 @@ class HugrCatalog;
 struct HugrScanBindData : public FunctionData {
 	HugrCatalog *catalog = nullptr;
 	shared_ptr<Pool> pool;
-	//! the object as B sees it (the local schema path, without the ATTACH alias)
+	//! the object as B sees it (B's catalog, then the schema's path there), and as A names it
 	QualifiedName remote_name;
+	string local_name;
+	//! its columns as the snapshot read them: what the scan asks B for by name, and what B's answer must be
+	vector<string> column_names;
+	vector<LogicalType> column_types;
 	optional_ptr<TableCatalogEntry> table_entry;
 
 	unique_ptr<FunctionData> Copy() const override;

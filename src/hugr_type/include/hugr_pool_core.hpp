@@ -108,6 +108,54 @@ inline string LabelOf(const string &connection_id) {
 	return dot == string::npos ? string() : connection_id.substr(0, dot);
 }
 
+//! The secret names this door: one of its scopes is `hugr://<host>[:<port>]` (or `hugr:…`) of the ATTACH's door,
+//! the port quack's default (9494) when left out. The token goes where its secret says, never only where an ATTACH
+//! says - whoever may write an ATTACH (the cluster bundle) does not decide where the node's token for B is sent.
+inline bool ScopeNamesDoor(const vector<string> &scopes, const string &host, uint16_t port) {
+	for (auto &scope : scopes) {
+		auto rest = scope;
+		StringUtil::Trim(rest);
+		auto lower = StringUtil::Lower(rest);
+		if (StringUtil::StartsWith(lower, "hugr://")) {
+			rest = rest.substr(7);
+		} else if (StringUtil::StartsWith(lower, "hugr:")) {
+			rest = rest.substr(5);
+		} else {
+			continue; // another scheme names no door
+		}
+		rest = rest.substr(0, rest.find('/'));
+		string scope_host;
+		uint16_t scope_port = 9494;
+		auto port_at = string::npos;
+		if (StringUtil::StartsWith(rest, "[")) {
+			auto close = rest.find(']');
+			if (close == string::npos) {
+				continue;
+			}
+			scope_host = rest.substr(1, close - 1);
+			port_at = rest.size() > close + 1 && rest[close + 1] == ':' ? close + 1 : string::npos;
+			if (port_at == string::npos && rest.size() > close + 1) {
+				continue;
+			}
+		} else {
+			port_at = rest.rfind(':');
+			scope_host = rest.substr(0, port_at);
+		}
+		if (port_at != string::npos) {
+			auto digits = rest.substr(port_at + 1);
+			if (digits.empty() || digits.size() > 5 || digits.find_first_not_of("0123456789") != string::npos ||
+			    std::stoul(digits) > 65535) {
+				continue;
+			}
+			scope_port = static_cast<uint16_t>(std::stoul(digits));
+		}
+		if (!scope_host.empty() && StringUtil::CIEquals(scope_host, host) && scope_port == port) {
+			return true;
+		}
+	}
+	return false;
+}
+
 //! The pool of one link: who is lent what, in arrival order, and when a connection retires. CONN has
 //! `bool Usable() const` - false once its heartbeat failed or B invalidated its database.
 template <class CONN>

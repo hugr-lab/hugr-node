@@ -15,9 +15,9 @@ namespace hugr {
 
 //! PREPARE `query` on the loan's connection. B's answer that ends the connection (a lapsed lease, a gone node, an
 //! ended session, no answer) is retried once on a new connection, which replaces `loan` - a PREPARE is before any
-//! row reached A's pipeline. Anything else is the statement's, rethrown as B raised it.
+//! row reached A's pipeline. Anything else is the statement's, rethrown as B raised it. `wait` as Pool::Borrow's.
 unique_ptr<PrepareResponseMessage> Prepare(Pool &pool, ClientContext &context, Loan &loan, const string &query,
-                                           hugeint_t query_uuid);
+                                           hugeint_t query_uuid, bool wait = true);
 
 //! A query read whole on its own loan - the catalog's listings: PREPARE, then FETCH until B says the end. `wait`
 //! false: a refused connect is the answer at once (the ATTACH).

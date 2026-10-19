@@ -66,7 +66,7 @@ quack:localhost:31591
 # A's node token for B: a test fixture (iss test/idp/s, role analyst). On a platform node the secret is tresor's,
 # its token minted for the node at every read
 statement ok
-CREATE SECRET bsec (TYPE hugr, TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A');
+CREATE SECRET bsec (TYPE hugr, SCOPE 'hugr://localhost:31591', TOKEN 'eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5In0.eyJpc3MiOiJ0ZXN0L2lkcC9zIiwiYXVkIjoiYXBpOi8vYWNsLXRlc3QiLCJleHAiOjQxMDI0NDQ4MDAsInN1YiI6InUiLCJyb2xlcyI6WyJhbmFseXN0Il0sInRpZCI6ImFjbWUifQ.C2rTehH2D3jptrk0TWAepMNA5XjhgHBCEYVr1NzJm7xa7ygxGtgCV9NpejZV3FFT2ex7QaC5xaoFHy59n5VbOw8I9t5_5qUvGkbDuSvyEYCLBlzdSczLOn7Su7k9rSIsMVvmbamtp_IhgyF1_ct0e1hm03Q2Vrm509omfcDvs9W8AyV9aPHUWui8bC-7hzw__gyiiZsRH8PEqZr3JqSPL5FdHp54d7YdGkgMZAR-TkB68NhjvcEmIaNG4Dr2ncL78Brj21nwtTIo3HbeNmhKzUbEp0uwH_-XkV2kxkKQXc2Tysjble9-G50jiFYfciBfmh6rGkct3o-XcVwdC3YV1A');
 
 # the token is a secret of its own: redacted where secrets are listed
 query I
@@ -74,7 +74,34 @@ SELECT secret_string LIKE '%token=redacted%' FROM duckdb_secrets() WHERE name = 
 ----
 true
 
+# a hugr secret names the door its token goes to
+statement error
+CREATE SECRET nowhere (TYPE hugr, TOKEN 'x');
+----
+<REGEX>:.*hugr: a hugr secret names B's door - SCOPE 'hugr://<host>:<port>'.*
+
+statement ok
+CREATE SECRET elsewhere (TYPE hugr, SCOPE 'hugr://b.example:443', TOKEN 'x');
+
+statement ok
+CREATE SECRET closed_door (TYPE hugr, SCOPE 'hugr://localhost:31599', TOKEN 'x');
+
+statement ok
+CREATE SECRET not_hugr (TYPE http, SCOPE 'hugr://localhost:31591', BEARER_TOKEN 'x');
+
 # --- what the ATTACH refuses -----------------------------------------------------------------------------------------
+
+# the token goes where its secret says, never only where an ATTACH says (gate coverage probe: the cluster bundle
+# writes ATTACHes, and must not point the node's token for B at another host)
+statement error
+ATTACH 'localhost:31591' AS b0 (TYPE hugr, SECRET elsewhere, DISABLE_SSL true);
+----
+<REGEX>:.*hugr: b0: secret "elsewhere" is not for this door - its SCOPE must name 'hugr://localhost:31591'.*
+
+statement error
+ATTACH 'localhost:31591' AS b0 (TYPE hugr, SECRET not_hugr, DISABLE_SSL true);
+----
+<REGEX>:.*hugr: b0: secret "not_hugr" is of type http, not hugr.*
 
 statement error
 ATTACH 'localhost:31591' AS b0 (TYPE hugr, DISABLE_SSL true);
@@ -99,18 +126,18 @@ ATTACH 'localhost:31591' AS b0 (TYPE hugr, SECRET nobody, DISABLE_SSL true);
 statement error
 ATTACH 'localhost:31591' AS b0 (TYPE hugr, SECRET bsec, DISABLE_SSL true, POOL_SIZE 0);
 ----
-<REGEX>:.*hugr: pool_size must be greater than zero.*
+<REGEX>:.*hugr: pool_size must be between 1 and 1024.*
 
 # a door that is not there: the ATTACH fails at once with what the client saw, it does not wait
 statement error
-ATTACH 'localhost:31599' AS b0 (TYPE hugr, SECRET bsec, DISABLE_SSL true);
+ATTACH 'localhost:31599' AS b0 (TYPE hugr, SECRET closed_door, DISABLE_SSL true);
 ----
 <REGEX>:.*hugr: no connection to b0.*
 
 # --- B as B shows it to A's role -------------------------------------------------------------------------------------
 
 statement ok
-ATTACH 'localhost:31591' AS b (TYPE hugr, SECRET bsec, DISABLE_SSL true, POOL_SIZE 2);
+ATTACH 'localhost:31591' AS b (TYPE hugr, SECRET bsec, DISABLE_SSL true, POOL_SIZE 2, HEARTBEAT_TIMEOUT 3600);
 
 query II
 SELECT * FROM b.main.orders ORDER BY id;
@@ -294,24 +321,124 @@ SELECT count(*) FROM bt.main.later;
 statement ok
 DETACH bt;
 
-# --- a statement that needs more loans than the pool has waits pool_wait, then fails with the pool's state -------------
+# --- a scan gives its connection back when B's stream ends, not when its statement ends ---------------------------------
 
 statement ok
-ATTACH 'localhost:31591' AS b1 (TYPE hugr, SECRET bsec, DISABLE_SSL true, POOL_SIZE 1, POOL_WAIT 1);
+ATTACH 'localhost:31591' AS b1 (TYPE hugr, SECRET bsec, DISABLE_SSL true, POOL_SIZE 1, POOL_WAIT 2, HEARTBEAT_TIMEOUT 3600);
 
-statement error
+# a join of two reads past the inline rows, and three reads in one statement, on a pool of one
+query I
 SELECT count(*) FROM b1.main.big x JOIN b1.main.big y USING (id);
 ----
-<REGEX>:.*hugr: no connection to b1 within 1 s \(1 of 1 in use, 0 waiting\).*
+300000
 
-# the pool is not stuck: the loan that held it went back with its statement
 query I
-SELECT count(*) FROM b1.main.orders;
+SELECT (SELECT count(*) FROM b1.main.big) + (SELECT count(*) FROM b1.main.big) + (SELECT count(*) FROM b1.main.big);
 ----
-2
+900000
+
+# the retry on a pool of one: the ended connection gives its place back before the new one is asked for
+statement ok
+SET VARIABLE retries = (SELECT coalesce(sum(value), 0) FROM acl_metrics() WHERE name = 'hugr.pool.retries');
+
+query I
+SELECT count(*) > 0 FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '"id":"([^"]+)"[^}]*"door":"quack"', 1)) AS id) WHERE acl_session_kill(id);
+----
+true
+
+query I
+SELECT count(*) FROM b1.main.big;
+----
+300000
+
+query I
+SELECT coalesce(sum(value), 0) - getvariable('retries') >= 1 FROM acl_metrics() WHERE name = 'hugr.pool.retries';
+----
+true
 
 statement ok
 DETACH b1;
+
+# --- B's shape changes under A: columns are asked for by name, and a changed type fails cleanly -------------------------
+
+statement ok
+CREATE TABLE phys.main.d1(a VARCHAR, b VARCHAR);
+
+statement ok
+INSERT INTO phys.main.d1 VALUES ('a1', 'b1');
+
+statement ok
+CREATE TABLE phys.main.d2(b VARCHAR, a VARCHAR);
+
+statement ok
+INSERT INTO phys.main.d2 VALUES ('b2', 'a2');
+
+statement ok
+CREATE TABLE phys.main.d3(a INTEGER, b VARCHAR);
+
+statement ok
+INSERT INTO phys.main.d3 VALUES (3, 'b3');
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.drift AS phys.main.d1;
+
+statement ok
+ATTACH 'localhost:31591' AS bd (TYPE hugr, SECRET bsec, DISABLE_SSL true, HEARTBEAT_TIMEOUT 3600);
+
+query TT
+SELECT a, b FROM bd.main.drift;
+----
+a1	b1
+
+# B reorders two columns of one type: A, whose snapshot has the old order, still reads each column as itself (a
+# position would read b as a, under a's masks and RLS)
+statement ok
+ACL ADMIN DROP RELATION c.drift;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.drift AS phys.main.d2;
+
+query TT
+SELECT a, b FROM bd.main.drift;
+----
+a2	b2
+
+# B changes a type: the statement fails as an error of its own - never A's node invalidated - and the next one,
+# after B's catalog is read again, reads the new shape
+statement ok
+ACL ADMIN DROP RELATION c.drift;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.drift AS phys.main.d3;
+
+statement error
+SELECT a, b FROM bd.main.drift;
+----
+<REGEX>:.*hugr: bd.main.drift changed on B since this node read B's catalog.*
+
+sleep 1100 milliseconds
+
+query IT
+SELECT a, b FROM bd.main.drift;
+----
+3	b3
+
+statement ok
+DETACH bd;
+
+# --- a principal of A attaches nothing ----------------------------------------------------------------------------------
+
+statement error
+ACL ROLE "reader" ATTACH 'localhost:31591' AS bx (TYPE hugr, SECRET bsec, DISABLE_SSL true);
+----
+<REGEX>:.*not permitted.*
+
+# --- the pool's gauges -------------------------------------------------------------------------------------------------------
+
+query I
+SELECT count(*) = 3 FROM acl_metrics() WHERE name = 'hugr.pool.connections';
+----
+true
 
 # --- the cluster profile attaches B like any source: with its secret, no extension to install -------------------------
 

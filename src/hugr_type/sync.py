@@ -37,7 +37,8 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 ACL = ROOT / "duckdb-acl"
 QUACK = ACL / "third_party" / "quack"
-DUCKDB_PATCHES = ACL / "duckdb" / ".github" / "patches" / "extensions" / "quack"
+# duckdb's patches for quack: hugr-node's duckdb's, which must be duckdb-acl's pin (checked in main())
+DUCKDB_PATCHES = ROOT / "duckdb" / ".github" / "patches" / "extensions" / "quack"
 OUR_PATCHES = ROOT / "src" / "hugr_type" / "patches"
 OUT = ROOT / "src" / "hugr_type"
 
@@ -75,14 +76,30 @@ PATCHES = [
      ""),
     ("hugr_client.cpp", '#include "hugr_secret.hpp"\n', ""),
     # the node's own HTTP parameters, never a statement's: a connection to B is the node's, and a statement's context
-    # would look the http secrets for B's URL up as that statement's user
+    # would look the http secrets for B's URL up as that statement's user. Read for the `hugr://` scope, so an http
+    # secret scoped to https:// (a bearer token, extra headers, verify_ssl) is never sent to another platform
     ("hugr_client.cpp",
+     "\t\tauto request_url = uri.Http() + \"/quack\";\n"
      "\t\tif (context && context->transaction.HasActiveTransaction()) {\n"
      "\t\t\thttp_params = http_util.InitializeParameters(*context, request_url);\n"
      "\t\t} else {\n"
      "\t\t\thttp_params = http_util.InitializeParameters(db, request_url);\n"
      "\t\t}\n",
-     "\t\thttp_params = http_util.InitializeParameters(db, request_url);\n"),
+     "\t\t// the node's own parameters (a connection to B is the node's, never a statement's), for the `hugr://`\n"
+     "\t\t// scope: an http secret scoped to https:// - a bearer token, extra headers - is for other servers\n"
+     "\t\thttp_params = http_util.InitializeParameters(db, \"hugr://\" + uri.Host() + \":\" + to_string(uri.Port()));\n"),
+    # a redirect would re-send the CONNECT - the token - elsewhere, in cleartext too; B's TLS is never turned off
+    ("hugr_client.cpp",
+     "\thttp_params->timeout = HTTP_TIMEOUT_SECONDS;\n\thttp_params->retries = 0;\n",
+     "\thttp_params->timeout = HTTP_TIMEOUT_SECONDS;\n\thttp_params->retries = 0;\n"
+     "\thttp_params->follow_location = false;\n\thttp_params->override_verify_ssl = false;\n"),
+    # a log names the connection by its node's label only: the id is the session on B (spec 134), and a log is read
+    # by more than the operator
+    ("hugr_client.cpp",
+     "\tauto msg = QuackLogType::ConstructLogMessage(request_type, connection_id, string(), client_query_id, query,\n",
+     "\tauto dot = connection_id.find('.');\n"
+     "\tauto label = dot == string::npos ? string() : connection_id.substr(0, dot);\n"
+     "\tauto msg = QuackLogType::ConstructLogMessage(request_type, label, string(), client_query_id, query,\n"),
     # httplib was the pinned client's own transport; the client left talks through duckdb's HTTPUtil
     ("include/hugr_client.hpp", '\n#include "httplib.hpp"\n', "\n"),
     ("hugr_client.cpp",
@@ -124,27 +141,61 @@ PATCHES = [
     ("include/hugr_client.hpp",
      "\tmutable atomic<bool> server_invalidated {false};\n",
      "\tmutable atomic<bool> server_invalidated {false};\n\tatomic<bool> heartbeat_failed {false};\n"),
+    # a heartbeat on a client of its own, bounded like the final DISCONNECT (2 s, no retry): a half-open B fails it in
+    # seconds - the pool then replaces the connection - instead of holding the heartbeat thread, and every teardown
+    # that joins it, for the request timeout (a day)
     ("hugr_client.cpp",
      "\tauto client = TakeClient(nullptr);\n"
      "\tclient->Request<SuccessResponse>(nullptr, make_uniq<HeartbeatRequestMessage>(connection_id));\n"
      "\tStoreClient(std::move(client));\n",
      "\ttry {\n"
-     "\t\tauto client = TakeClient(nullptr);\n"
+     "\t\tauto client = HugrClient::GetClient(db, uri);\n"
+     "\t\tclient->SetAffinity(affinity);\n"
+     "\t\tclient->PrepareTeardownRequest();\n"
      "\t\tclient->Request<SuccessResponse>(nullptr, make_uniq<HeartbeatRequestMessage>(connection_id));\n"
-     "\t\tStoreClient(std::move(client));\n"
      "\t\theartbeat_failed = false;\n"
      "\t} catch (...) {\n"
      "\t\theartbeat_failed = true;\n"
      "\t\tthrow;\n"
      "\t}\n"),
+    # a CANCEL that finds no cached client takes a new one - it must never silently do nothing - and holds the cache's
+    # lock only to take and give back the client, not across the request
+    ("hugr_client.cpp",
+     "\tlock_guard<mutex> guard(lock);\n"
+     "\tif (cached_clients.empty()) {\n"
+     "\t\treturn;\n"
+     "\t}\n"
+     "\t// get a cached client, if any\n"
+     "\tauto &client = cached_clients.back();\n"
+     "\tclient->Request<SuccessResponse>(nullptr, make_uniq<CancelRequestMessage>(connection_id, query_uuid));\n",
+     "\tauto client = TakeClient(nullptr);\n"
+     "\tclient->Request<SuccessResponse>(nullptr, make_uniq<CancelRequestMessage>(connection_id, query_uuid));\n"
+     "\tStoreClient(std::move(client));\n"),
+    # a FETCH that failed before the constructor's first top-up was done makes Register throw out of the constructor:
+    # the destructor then never runs, and the queue (destroyed last) would wait for tasks that touch the members
+    # destroyed before it. Drain first
+    ("hugr_client_fetch_ahead.cpp",
+     "\tTopUp(context);\n}\n\nHugrFetcher::~HugrFetcher() {",
+     "\ttry {\n\t\tTopUp(context);\n\t} catch (...) {\n\t\tStopAndDrain();\n\t\tthrow;\n\t}\n}\n\n"
+     "HugrFetcher::~HugrFetcher() {"),
 ]
 
 BANNER = ("// GENERATED by src/hugr_type/sync.py from duckdb-acl's third_party/quack ({commit}) - do not edit.\n"
-          "// The `hugr` type's copy of quack's client transport (spec 011): *Quack* -> Hugr*, \"quack...\" -> "
-          "\"hugr...\".\n")
+          "// The `hugr` type's copy of quack's client transport (spec 011): names *Quack* -> Hugr*, the settings it\n"
+          "// reads quack_* -> hugr_*; every other string as quack wrote it.\n")
 
 QUACK_NAME = re.compile(r"\b\w*Quack\w*\b")
 INCLUDE = re.compile(r'^#include "(quack_[^"]+)"', re.M)
+STRING = re.compile(r'"(?:[^"\\\n]|\\.)*"')
+
+# The only text renamed inside a string literal: the settings the copies read, so a stock quack's setting never
+# steers the type (none of them is registered as hugr_*: the type passes its values explicitly). Every other literal
+# - the protocol's ("/quack", "X-Quack-Connection-Id", the cookies), the messages - stays as quack wrote it.
+SETTINGS = ["quack_fetch_read_ahead", "quack_debug_fetch_delay_ms", "quack_default_client_id",
+            "quack_default_heartbeat_timeout"]
+# what the protocol needs verbatim, checked in the copies after generation
+PROTOCOL_LITERALS = {"hugr_client.cpp": ['"/quack"', '"Set-Cookie"'],
+                     "hugr_client_affinity.cpp": ['"X-Quack-Connection-Id"']}
 
 
 def patched_source(commit):
@@ -167,9 +218,19 @@ def patched_source(commit):
     return scratch
 
 
+def head(path):
+    return subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], check=True, capture_output=True,
+                          text=True).stdout.strip()
+
+
 def main():
-    commit = subprocess.run(["git", "-C", str(QUACK), "rev-parse", "--short", "HEAD"], check=True,
-                            capture_output=True, text=True).stdout.strip()
+    # acl's embed is built from duckdb-acl's duckdb pin, the copies against hugr-node's: one duckdb, or the copies
+    # and the server they talk to differ (read from duckdb-acl's tree, so its duckdb need not be checked out)
+    acl_duckdb = subprocess.run(["git", "-C", str(ACL), "rev-parse", "HEAD:duckdb"], check=True, capture_output=True,
+                                text=True).stdout.strip()
+    if head(ROOT / "duckdb") != acl_duckdb:
+        sys.exit("sync: hugr-node's duckdb and duckdb-acl's pin are not the same commit - re-pin first")
+    commit = head(QUACK)[:7]
     scratch = patched_source(commit)
     try:
         src = scratch / "src"
@@ -216,12 +277,26 @@ def main():
                         line = line.replace(header, "hugr_" + header[len("quack_"):])  # removed by a patch below
                     out.append(line)
                     continue
-                line = QUACK_NAME.sub(rename, line)
-                line = re.sub(r'"quack(\w*)', r'"hugr\1', line)
-                out.append(line)
+                # names are renamed outside string literals only; inside one, the listed settings only
+                pieces, last = [], 0
+                for m in STRING.finditer(line):
+                    pieces.append(QUACK_NAME.sub(rename, line[last:m.start()]))
+                    literal = m.group(0)
+                    for setting in SETTINGS:
+                        if literal.startswith('"' + setting):
+                            literal = '"hugr' + literal[len('"quack'):]
+                            seen_settings.add(setting)
+                    pieces.append(literal)
+                    last = m.end()
+                pieces.append(QUACK_NAME.sub(rename, line[last:]))
+                out.append("".join(pieces))
             return "".join(out)
 
+        seen_settings = set()
         written = {CLIENT[s]: rewrite(t) for s, t in texts.items()}
+        for setting in SETTINGS:
+            if setting not in seen_settings:
+                sys.exit(f"sync: the copies no longer read {setting} - re-audit SETTINGS")
         for target, start, end in CUTS:
             text = written[target]
             if text.count(start) != 1 or end not in text[text.find(start):]:
@@ -247,10 +322,18 @@ def main():
                 if name in keep:
                     sys.exit(f"sync: {target} defines {name}, a name of the shared headers")
 
+        for target, literals in PROTOCOL_LITERALS.items():
+            for literal in literals:
+                if literal not in written[target]:
+                    sys.exit(f"sync: {target} lost the protocol's {literal}")
         for target, text in written.items():
             out = OUT / target
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(BANNER.format(commit=commit) + text)
+            # quack is formatted by its own duckdb pin's .clang-format: normalised to ours (clang-format 11.0.1, the
+            # lint job's), as duckdb-acl's sync does, so a regeneration is clean - and comparable in CI
+            if shutil.which("clang-format"):
+                subprocess.run(["clang-format", "-i", str(out)], check=True)
         print(f"sync: {len(written)} files from quack {commit}; shared: {', '.join(sorted(shared))}")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)

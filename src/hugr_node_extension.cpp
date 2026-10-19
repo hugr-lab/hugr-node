@@ -27,7 +27,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	LoadAclOtelCore(loader);
 	acl::RegisterAclCluster(loader, store);
 	hugr_node::RegisterHugrNodeAgent(loader, store); // spec 006: the node process and its bootstrap
-	hugr::RegisterHugrType(loader);                   // spec 011: another platform as a source
+	hugr::RegisterHugrType(loader);                  // spec 011: another platform as a source
 }
 
 } // namespace

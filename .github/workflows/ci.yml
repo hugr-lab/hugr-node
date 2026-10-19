@@ -63,6 +63,13 @@ jobs:
           git -C tresor submodule update --init --depth 1 duckdb-ext-common
           git -C acl-otel submodule update --init --depth 1 duckdb-ext-common
 
+      # spec 011: the hugr type's copy of quack's client is what src/hugr_type/sync.py makes from the pins
+      - name: The hugr type's copy of quack's client is current
+        run: |
+          pip install clang_format==11.0.1
+          python3 src/hugr_type/sync.py
+          git diff --exit-code -- src/hugr_type
+
       - name: Install build dependencies
         run: |
           sudo apt-get update

@@ -96,6 +96,7 @@ public:
 	void NodeGone(const string &label);
 	//! The catalog is detached: idle connections now, lent ones at their return.
 	void Close();
+	bool Closed();
 
 	PoolView View();
 	const LinkOptions &Options() const {

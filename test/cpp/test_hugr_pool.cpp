@@ -91,6 +91,19 @@ int main(int argc, char *argv[]) {
 			Check(!MayRetry(Answer::REFUSED, false, false), "a refusal is the pool's wait, not a retry");
 		});
 
+		Scenario("the secret's scope names the door", [&] {
+			Check(ScopeNamesDoor({"hugr://b.example:443"}, "b.example", 443), "the door as written");
+			Check(ScopeNamesDoor({"hugr:B.Example:443/"}, "b.example", 443), "either form, any case, a path cut");
+			Check(ScopeNamesDoor({"https://x", "hugr://b.example"}, "b.example", 9494), "quack's port when left out");
+			Check(ScopeNamesDoor({"hugr://[::1]:31591"}, "::1", 31591), "an IPv6 door");
+			Check(!ScopeNamesDoor({"hugr://b.example:443"}, "c.example", 443), "another host is not the door");
+			Check(!ScopeNamesDoor({"hugr://b.example:443"}, "b.example", 8443), "another port is not the door");
+			Check(!ScopeNamesDoor({"hugr:", "hugr://", ""}, "b.example", 443), "a catch-all scope names no door");
+			Check(!ScopeNamesDoor({"https://b.example:443"}, "b.example", 443), "another scheme names no door");
+			Check(!ScopeNamesDoor({"hugr://b.example:443x", "hugr://b.example:99999"}, "b.example", 443),
+			      "a port that is no port names no door");
+		});
+
 		Scenario("the node's label", [&] {
 			Check(LabelOf("node-b1.3f9a7c") == "node-b1", "the label before the first dot");
 			Check(LabelOf("3f9a7c").empty(), "an unlabelled id names no node");
@@ -242,8 +255,9 @@ int main(int argc, char *argv[]) {
 			Check(WaitTimeoutMessage("b", 25, 4, 4, 3, "") == "hugr: no connection to b within 25 s (4 of 4 in use, 3 "
 			                                                  "waiting)",
 			      "the spec's text");
-			Check(WaitTimeoutMessage("b", 25, 0, 4, 1, "Authentication failed").find("B answered: Authentication "
-			                                                                          "failed") != std::string::npos,
+			Check(WaitTimeoutMessage("b", 25, 0, 4, 1, "Authentication failed")
+			              .find("B answered: Authentication "
+			                    "failed") != std::string::npos,
 			      "with B's last refusal");
 		});
 	});

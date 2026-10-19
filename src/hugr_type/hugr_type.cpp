@@ -20,13 +20,16 @@ namespace hugr {
 
 namespace {
 
-idx_t PositiveOption(const string &key, const Value &value) {
+//! A count or a number of seconds, 1..`most`: the pool computes in milliseconds, so a bound keeps it from overflowing
+idx_t PositiveOption(const string &key, const Value &value, idx_t most) {
 	auto number = value.DefaultCastAs(LogicalType::UBIGINT).GetValue<uint64_t>();
-	if (number == 0) {
-		throw InvalidInputException("hugr: %s must be greater than zero", key);
+	if (number == 0 || number > most) {
+		throw InvalidInputException("hugr: %s must be between 1 and %llu", key, most);
 	}
 	return number;
 }
+
+constexpr idx_t DAY_S = 86400;
 
 //! B's door as written: `host[:port]`, optionally `hugr:` in front
 string DoorOf(const string &path) {
@@ -55,26 +58,27 @@ unique_ptr<Catalog> HugrAttach(optional_ptr<StorageExtensionInfo>, ClientContext
 		if (key == "secret") {
 			secret = value.ToString();
 		} else if (key == "pool_size") {
-			options.pool_size = PositiveOption(key, value);
+			options.pool_size = PositiveOption(key, value, 1024);
 		} else if (key == "pool_wait") {
-			options.pool_wait_s = PositiveOption(key, value);
+			options.pool_wait_s = PositiveOption(key, value, 3600);
 		} else if (key == "idle_timeout") {
-			options.idle_timeout_s = PositiveOption(key, value);
+			options.idle_timeout_s = PositiveOption(key, value, DAY_S);
 		} else if (key == "max_lifetime") {
-			options.max_lifetime_s = PositiveOption(key, value);
+			options.max_lifetime_s = PositiveOption(key, value, 7 * DAY_S);
 		} else if (key == "read_ahead") {
-			options.read_ahead = PositiveOption(key, value);
+			options.read_ahead = PositiveOption(key, value, 1024);
 		} else if (key == "catalog_ttl") {
-			options.catalog_ttl_s = PositiveOption(key, value);
+			options.catalog_ttl_s = PositiveOption(key, value, DAY_S);
 		} else if (key == "heartbeat_timeout") {
-			options.heartbeat_timeout_s = PositiveOption(key, value);
+			options.heartbeat_timeout_s = PositiveOption(key, value, 3600);
 		} else if (key == "disable_ssl") {
 			disable_ssl = BooleanValue::Get(value.DefaultCastAs(LogicalType::BOOLEAN));
 		} else {
-			throw InvalidInputException("hugr: unknown ATTACH option \"%s\" (the options: secret, pool_size, pool_wait, "
-			                            "idle_timeout, max_lifetime, read_ahead, catalog_ttl, heartbeat_timeout, "
-			                            "disable_ssl)",
-			                            entry.first);
+			throw InvalidInputException(
+			    "hugr: unknown ATTACH option \"%s\" (the options: secret, pool_size, pool_wait, "
+			    "idle_timeout, max_lifetime, read_ahead, catalog_ttl, heartbeat_timeout, "
+			    "disable_ssl)",
+			    entry.first);
 		}
 	}
 	if (secret.empty()) {
@@ -110,11 +114,11 @@ public:
 //! CREATE SECRET (TYPE hugr, TOKEN '...'): the node's own form; on a platform node the secret lives in tresor, whose
 //! generated `token` is minted for the node at every read (spec 011, "The ATTACH")
 unique_ptr<BaseSecret> CreateHugrSecret(ClientContext &, CreateSecretInput &input) {
-	auto scope = input.scope;
-	if (scope.empty()) {
-		scope.emplace_back("hugr:");
+	if (input.scope.empty()) {
+		// the token goes to the door its secret names, and to no other (Pool::ReadToken)
+		throw InvalidInputException("hugr: a hugr secret names B's door - SCOPE 'hugr://<host>:<port>'");
 	}
-	auto secret = make_uniq<KeyValueSecret>(scope, input.type, input.provider, input.name);
+	auto secret = make_uniq<KeyValueSecret>(input.scope, input.type, input.provider, input.name);
 	for (auto &option : input.options) {
 		if (StringUtil::Lower(option.first) != "token") {
 			throw InvalidInputException("hugr: unknown secret parameter \"%s\" (the one parameter: token)",
@@ -204,29 +208,27 @@ void RegisterGauges(DatabaseInstance &db) {
 		return;
 	}
 	auto registry = PoolRegistry::Get(db);
+	hooks->Gauges().RegisterDynamic("hugr.pool.connections", "1", "connections of a hugr link, by state", [registry] {
+		vector<std::pair<vector<std::pair<string, string>>, int64_t>> rows;
+		for (auto &pool : registry->Pools()) {
+			auto view = pool->View();
+			for (auto state : {std::make_pair("busy", view.busy), std::make_pair("idle", view.idle),
+			                   std::make_pair("connecting", view.connecting)}) {
+				rows.push_back(
+				    {{{"catalog", view.catalog}, {"state", state.first}}, static_cast<int64_t>(state.second)});
+			}
+		}
+		return rows;
+	});
 	hooks->Gauges().RegisterDynamic(
-	    "hugr.pool.connections", "1", "connections of a hugr link, by state", [registry] {
+	    "hugr.pool.waiting", "1", "loans waiting for a connection of a hugr link", [registry] {
 		    vector<std::pair<vector<std::pair<string, string>>, int64_t>> rows;
 		    for (auto &pool : registry->Pools()) {
 			    auto view = pool->View();
-			    for (auto state : {std::make_pair("busy", view.busy), std::make_pair("idle", view.idle),
-			                       std::make_pair("connecting", view.connecting)}) {
-				    rows.push_back({{{"catalog", view.catalog}, {"state", state.first}},
-				                    static_cast<int64_t>(state.second)});
-			    }
+			    rows.push_back({{{"catalog", view.catalog}}, static_cast<int64_t>(view.waiting)});
 		    }
 		    return rows;
 	    });
-	hooks->Gauges().RegisterDynamic("hugr.pool.waiting", "1", "loans waiting for a connection of a hugr link",
-	                                [registry] {
-		                                vector<std::pair<vector<std::pair<string, string>>, int64_t>> rows;
-		                                for (auto &pool : registry->Pools()) {
-			                                auto view = pool->View();
-			                                rows.push_back({{{"catalog", view.catalog}},
-			                                                static_cast<int64_t>(view.waiting)});
-		                                }
-		                                return rows;
-	                                });
 }
 
 } // namespace

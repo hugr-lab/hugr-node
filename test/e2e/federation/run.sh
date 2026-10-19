@@ -4,15 +4,16 @@
 # by the label in X-Quack-Connection-Id and places new connections where it is told), and A attaching B through the
 # front with a `hugr` secret (a fixture token of test/idp/s - the nodes read test/idp/ from the repository root).
 # Checked:
-#   1. the front loses b1: b2 answers "not known", A continues on b2 within the statement, b1's connections go;
+#   1. the front loses b1: b2 answers "not known", A continues on b2 within the statement, b1's connection goes;
 #   2. A stopped (SIGSTOP) longer than its lease: its next statement succeeds;
 #   3. b1 drained, a short max_lifetime: A's reads continue on b2 and b1 holds none of A's sessions after a lifetime;
-#   4. B at capacity: a loan waits pool_wait and fails naming B's answer, and B is not stormed (the backoff);
+#   4. B at capacity: a loan waits pool_wait and fails, B's answer in hugr_pools(), and B is not stormed (the backoff);
 #   5. b1 killed during a long scan: that statement fails, the next one works;
-#   6. our copies of quack's client are not exported by the loadable (a stock quack loaded beside binds its own).
-# Needs python3 and the hugr_node build (build/release/duckdb). A missing tool or build is a SKIP (exit 0).
+#   6. TLS to B, its certificate verified against the node's ca_cert_file (no TLS bypass: an unknown CA is refused);
+#   7. our copies of quack's client are not exported by the loadable (a stock quack loaded beside binds its own).
+# Needs python3, openssl and the hugr_node build (build/release/duckdb). A missing tool or build is a SKIP (exit 0).
 #
-#   test/e2e/federation/run.sh      # FRONT_PORT / B1_PORT / B2_PORT to move the ports
+#   test/e2e/federation/run.sh      # FRONT_PORT / B1_PORT / B2_PORT / B2_TLS_PORT to move the ports
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 DUCKDB="${DUCKDB:-$ROOT/build/release/duckdb}"
@@ -20,6 +21,7 @@ LOADABLE="$ROOT/build/release/extension/hugr_node/hugr_node.duckdb_extension"
 FRONT_PORT="${FRONT_PORT:-31710}"
 B1_PORT="${B1_PORT:-31711}"
 B2_PORT="${B2_PORT:-31712}"
+B2_TLS_PORT="${B2_TLS_PORT:-31713}"
 
 skip() {
 	echo "SKIP: $*"
@@ -32,9 +34,9 @@ fail() {
 # a dump never shows a token
 redact() { sed -E 's/eyJ[A-Za-z0-9._-]*/<token>/g'; }
 
-command -v python3 >/dev/null || skip "python3 not found"
+for tool in python3 openssl curl; do command -v "$tool" >/dev/null || skip "$tool not found"; done
 [ -x "$DUCKDB" ] || skip "no hugr_node build at $DUCKDB (GEN=ninja make)"
-for port in "$FRONT_PORT" "$B1_PORT" "$B2_PORT"; do
+for port in "$FRONT_PORT" "$B1_PORT" "$B2_PORT" "$B2_TLS_PORT"; do
 	if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
 		fail "127.0.0.1:$port is taken - set FRONT_PORT / B1_PORT / B2_PORT"
 	fi
@@ -157,12 +159,14 @@ FRONT_PID=$!
 disown "$FRONT_PID"
 for _ in $(seq 50); do curl -s -o /dev/null "http://127.0.0.1:$FRONT_PORT/control/none" && break; sleep 0.1; done
 
-attach() { # <options>: A's link to B, through the front
-	run A "DETACH DATABASE IF EXISTS b;" "ATTACH 'localhost:$FRONT_PORT' AS b (TYPE hugr, SECRET bsec, DISABLE_SSL true$1);"
+attach() { # <alias> <options>: A's link to B, through the front
+	run A "DETACH DATABASE IF EXISTS $1;" "ATTACH 'localhost:$FRONT_PORT' AS $1 (TYPE hugr, SECRET bsec, DISABLE_SSL true$2);"
 }
-run A "CREATE SECRET bsec (TYPE hugr, TOKEN '$TOKEN');"
+# the secret names the front's door - the address A's token goes to
+run A "CREATE SECRET bsec (TYPE hugr, SCOPE 'hugr://localhost:$FRONT_PORT', TOKEN '$TOKEN');"
 front place b1
-attach ", POOL_SIZE 2"
+# a lease of an hour: no heartbeat lands between a check's cause and its read (step 2 asks for a short one)
+attach b ", POOL_SIZE 2, HEARTBEAT_TIMEOUT 3600"
 [ "$(says A "SELECT count(*) FROM b.main.orders")" = 2 ] || fail "A does not read B through the front"
 [ "$(labels)" = b1 ] || fail "A's connections are not on b1: $(labels)"
 echo "  two B nodes behind the front, A attached through it (on b1)"
@@ -173,12 +177,12 @@ front forget b1
 front place b2
 [ "$(says A "SELECT count(*) FROM b.main.orders")" = 2 ] || fail "A did not continue on b2"
 [ "$(metric hugr.pool.retries)" = "$((retries + 1))" ] || fail "the statement was not retried once"
-[ "$(labels)" = b2 ] || fail "b1's connections did not go: $(labels)"
+[ "$(labels)" = b2 ] || fail "b1's connection did not go: $(labels)"
 front know b1
-echo "ok: the front lost b1 - b2 said 'not known', A continued on b2 within the statement, b1's connections went"
+echo "ok: the front lost b1 - b2 said 'not known', A continued on b2 within the statement, b1's connection went"
 
 # --- 2. A stopped longer than its lease ----------------------------------------------------------------------------------
-attach ", HEARTBEAT_TIMEOUT 2"
+attach b ", HEARTBEAT_TIMEOUT 2"
 [ "$(says A "SELECT count(*) FROM b.main.orders")" = 2 ] || fail "A does not read B"
 kill -STOP "$A_PID"
 sleep 6
@@ -191,8 +195,8 @@ front place b1
 # b1 may still hold a session of step 1's: its DISCONNECT went through a front that had lost b1, so b1 ends it when its
 # lease lapses. What is A's here is what this link adds
 base="$(quack_sessions B1)"
-attach ", POOL_SIZE 2, MAX_LIFETIME 2"
-[ "$(says A "SELECT count(*) FROM b.main.huge x JOIN b.main.huge y USING (id)")" = 2000000 ] || fail "A does not read b1"
+attach b ", POOL_SIZE 2, MAX_LIFETIME 2, HEARTBEAT_TIMEOUT 3600"
+[ "$(says A "SELECT count(*) FROM b.main.orders")" = 2 ] || fail "A does not read b1"
 [ "$(labels)" = b1 ] || fail "A's connections are not on b1: $(labels)"
 [ "$(says B1 "SELECT acl_drain() IS NOT NULL")" = true ] || fail "b1 did not drain"
 front place b2 # a front takes a draining node out of placement (its discovery answers 503)
@@ -210,22 +214,31 @@ run B1 "SELECT acl_resume();"
 echo "ok: b1 drained - A's reads went on, its connections moved to b2 within a lifetime, b1 holds none of A's sessions"
 
 # --- 4. B at capacity -------------------------------------------------------------------------------------------------------
+# two links to B2, one connection each; then B2 seats one quack client only, and both sessions end: bb's read must
+# make a new connection, and B2 refuses it while b's connection holds the seat
+front place b2
+attach b ", POOL_SIZE 4, HEARTBEAT_TIMEOUT 3600"
+attach bb ", POOL_SIZE 4, POOL_WAIT 3, HEARTBEAT_TIMEOUT 3600"
+[ "$(says A "SELECT count(*) FROM bb.main.orders")" = 2 ] || fail "A does not read B2"
 refused="$(metric hugr.pool.refused)"
 run B2 "SET GLOBAL acl_quack_client_depth = 1024;" # 1024 slots / 1024 per client: one quack client seated
-front place b2
-attach ", POOL_SIZE 4, POOL_WAIT 3"
-fails A "SELECT count(*) FROM b.main.huge x JOIN b.main.huge y USING (id);" "no connection to b within 3 s.*node at capacity"
+[ "$(says B2 "SELECT count(*) FROM (SELECT unnest(regexp_extract_all(acl_sessions(), '\"id\":\"([^\"]+)\"[^}]*\"door\":\"quack\"', 1)) AS id) WHERE acl_session_kill(id)")" -ge 1 ] ||
+	fail "B2 ended none of A's sessions"
+fails A "SELECT count(*) FROM bb.main.orders;" "no connection to bb within 3 s"
+[ "$(says A "SELECT last_refusal LIKE 'acl: node at capacity%' FROM hugr_pools() WHERE catalog = 'bb'")" = true ] ||
+	fail "hugr_pools() does not show B's refusal"
 got="$(metric hugr.pool.refused)"
 [ "$((got - refused))" -ge 1 ] && [ "$((got - refused))" -le 5 ] ||
 	fail "B was asked $((got - refused)) times in 3 s - the backoff does not hold"
-[ "$(says A "SELECT count(*) FROM b.main.orders")" = 2 ] || fail "the pool is stuck after the wait"
 run B2 "RESET GLOBAL acl_quack_client_depth;"
-echo "ok: at B's capacity a loan waited pool_wait and named B's answer; B was asked $((got - refused)) times"
+[ "$(says A "SELECT count(*) FROM bb.main.orders")" = 2 ] || fail "the pool is stuck after the wait"
+run A "DETACH bb;"
+echo "ok: at B's capacity a loan waited pool_wait (B's answer in hugr_pools()); B was asked $((got - refused)) times"
 
 # --- 5. b1 killed during a long scan ------------------------------------------------------------------------------------------
 run B1 "SET GLOBAL acl_quack_target_batch_bytes = 65536;" # many small batches
 front place b1
-attach ", POOL_SIZE 2"
+attach b ", POOL_SIZE 2, HEARTBEAT_TIMEOUT 3600"
 [ "$(labels)" = b1 ] || fail "A's connections are not on b1: $(labels)"
 front place b2
 front slow "b1&ms=300"
@@ -241,7 +254,18 @@ tail -n +"$((before + 1))" "$TMP/A.log" | grep -q "Error" || {
 [ "$(says A "SELECT count(*) FROM b.main.orders")" = 2 ] || fail "the next statement did not work on b2"
 echo "ok: b1 killed during a scan - that statement failed, the next one read b2"
 
-# --- 6. our copies are not exported -------------------------------------------------------------------------------------------
+# --- 6. TLS to B: the certificate is verified, against the node's ca_cert_file ----------------------------------------------
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" \
+	-keyout "$TMP/b2.key" -out "$TMP/b2.crt" >/dev/null 2>&1 || fail "no certificate for B2"
+run B2 "SELECT acl_quack_serve('quack:localhost:$B2_TLS_PORT', 'e2e-server-token', '$TMP/b2.crt', '$TMP/b2.key');"
+run A "CREATE SECRET btls (TYPE hugr, SCOPE 'hugr://localhost:$B2_TLS_PORT', TOKEN '$TOKEN');"
+# a certificate of a CA the node does not trust: no connection, never a downgrade
+fails A "ATTACH 'localhost:$B2_TLS_PORT' AS bt (TYPE hugr, SECRET btls);" "no connection to bt"
+run A "SET GLOBAL ca_cert_file = '$TMP/b2.crt';" "ATTACH 'localhost:$B2_TLS_PORT' AS bt (TYPE hugr, SECRET btls);"
+[ "$(says A "SELECT count(*) FROM bt.main.orders")" = 2 ] || fail "A does not read B2 over TLS"
+echo "ok: TLS to B - an unknown CA refused, the node's ca_cert_file trusted"
+
+# --- 7. our copies are not exported -------------------------------------------------------------------------------------------
 if [ -f "$LOADABLE" ] && command -v nm >/dev/null; then
 	if [ "$(uname)" = Darwin ]; then exported="$(nm -gU "$LOADABLE")"; else exported="$(nm -D --defined-only "$LOADABLE")"; fi
 	count="$(echo "$exported" | c++filt | grep -c 'duckdb::Hugr\|duckdb::hugr::' || true)"

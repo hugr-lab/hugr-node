@@ -23,6 +23,9 @@ namespace {
 
 //! when a refresh that failed is tried again: B being away must not cost every statement a connect
 constexpr int64_t REFRESH_RETRY_MS = 30000;
+//! a stale catalog is read again at most this often: every refusal of B's acl is a binder error, and an object B
+//! lists but refuses must not cost each statement a reading of B's listings
+constexpr int64_t STALE_REFRESH_MS = 1000;
 
 //! B's schemas with their full paths, its MAIN catalog's first - quack's own walk of the (nested) schema tree
 const char *SCHEMAS_QUERY = R"(
@@ -56,23 +59,61 @@ CreateSchemaInfo SchemaInfo(const Identifier &name) {
 }
 
 //! The schema at `path` under `top`, every missing level made: a level B has no schema for is the stand-in for one of
-//! its catalogs. The first schema registered under a name keeps it (B's MAIN catalog's come first).
-HugrSchemaEntry &RegisterSchema(HugrCatalog &catalog, case_insensitive_map_t<unique_ptr<HugrSchemaEntry>> &top,
-                                const vector<Identifier> &path) {
+//! its catalogs. A schema whose place is taken already is not registered (null): the first one keeps the name - B's
+//! MAIN catalog's come first - and the other is left out, its objects with it, never merged into the first.
+optional_ptr<HugrSchemaEntry> RegisterSchema(HugrCatalog &catalog,
+                                             case_insensitive_map_t<unique_ptr<HugrSchemaEntry>> &top,
+                                             const vector<Identifier> &path, const vector<Identifier> &remote_path) {
 	reference<case_insensitive_map_t<unique_ptr<HugrSchemaEntry>>> level = top;
 	optional_ptr<HugrSchemaEntry> parent;
-	for (auto &part : path) {
-		auto key = part.GetIdentifierName();
+	for (idx_t i = 0; i < path.size(); i++) {
+		auto key = path[i].GetIdentifierName();
 		auto found = level.get().find(key);
-		if (found == level.get().end()) {
-			auto info = SchemaInfo(part);
+		auto last = i + 1 == path.size();
+		if (found != level.get().end()) {
+			if (last) {
+				return nullptr;
+			}
+		} else {
+			auto info = SchemaInfo(path[i]);
 			auto entry = make_uniq<HugrSchemaEntry>(catalog, info, parent.get());
+			// a stand-in is one of B's catalogs: its path there is the catalog alone
+			entry->remote_path = last ? remote_path : vector<Identifier> {remote_path[0]};
 			found = level.get().emplace(key, std::move(entry)).first;
 		}
 		parent = found->second.get();
 		level = parent->schemas;
 	}
-	return *parent;
+	return parent;
+}
+
+bool IsVarchar(const LogicalType &type) {
+	return type.id() == LogicalTypeId::VARCHAR;
+}
+
+//! B's listing has the shape the type asked for, or none of it is read: a hostile or a broken B must not make this
+//! node read past a row's end or a value of another type
+void CheckListing(const ColumnDataCollection &rows, const vector<bool (*)(const LogicalType &)> &columns,
+                  const char *what) {
+	auto &types = rows.Types();
+	if (types.size() < columns.size()) {
+		throw InvalidInputException("hugr: B's %s listing has %llu columns, not %llu", what, types.size(),
+		                            columns.size());
+	}
+	for (idx_t i = 0; i < columns.size(); i++) {
+		if (!columns[i](types[i])) {
+			throw InvalidInputException("hugr: B's %s listing has a column of type %s at %llu", what,
+			                            types[i].ToString(), i + 1);
+		}
+	}
+}
+
+bool IsIntegral(const LogicalType &type) {
+	return type.IsIntegral();
+}
+
+bool IsVarcharList(const LogicalType &type) {
+	return type.id() == LogicalTypeId::LIST && ListType::GetChildType(type).id() == LogicalTypeId::VARCHAR;
 }
 
 } // namespace
@@ -93,6 +134,13 @@ TableFunction HugrTableEntry::GetScanFunction(ClientContext &context, unique_ptr
 	bind_data->catalog = &hugr_catalog;
 	bind_data->pool = hugr_catalog.GetPool();
 	bind_data->remote_name = schema.Cast<HugrSchemaEntry>().RemoteName(name);
+	auto local_path = schema.GetSchemaPath();
+	local_path.insert(local_path.begin(), catalog.GetName());
+	bind_data->local_name = QualifiedName(std::move(local_path), name).ToString();
+	for (auto &column : columns.Physical()) {
+		bind_data->column_names.push_back(column.Name().GetIdentifierName());
+		bind_data->column_types.push_back(column.Type());
+	}
 	bind_data->table_entry = this;
 	bind_data_p = std::move(bind_data);
 	return HugrScanFunction();
@@ -120,7 +168,8 @@ unique_ptr<CreateInfo> HugrSchemaEntry::GetInfo() const {
 }
 
 QualifiedName HugrSchemaEntry::RemoteName(const Identifier &entry_name) const {
-	return QualifiedName(GetSchemaPath(), entry_name);
+	// catalog-qualified: B's MAIN catalog's schema `hr` and B's catalog `hr` never read as each other on B
+	return QualifiedName(remote_path, entry_name);
 }
 
 void HugrSchemaEntry::Scan(ClientContext &context, CatalogType type,
@@ -234,25 +283,40 @@ shared_ptr<HugrSnapshot> HugrCatalog::Load(ClientContext &context, bool wait) {
 	auto columns = ReadAll(*pool, context, COLUMNS_QUERY, wait);
 	auto snapshot = make_shared_ptr<HugrSnapshot>();
 
+	CheckListing(*schemas, {IsIntegral, IsVarchar, IsVarcharList, IsVarchar}, "schema");
+	CheckListing(*columns, {IsIntegral, IsVarchar, IsVarchar, IsVarchar}, "column");
 	unordered_map<int64_t, reference<HugrSchemaEntry>> by_oid;
 	for (auto &row : schemas->Rows()) {
+		if (row.GetValue(0).IsNull() || row.GetValue(1).IsNull() || row.GetValue(2).IsNull() ||
+		    row.GetValue(3).IsNull()) {
+			continue;
+		}
 		auto oid = row.GetValue(0).GetValue<int64_t>();
 		auto database = row.GetValue(1).GetValue<string>();
-		auto remote_path = ListValue::GetChildren(row.GetValue(2));
 		auto main = row.GetValue(3).GetValue<string>();
 		vector<Identifier> path;
+		vector<Identifier> remote_path {Identifier(database)};
 		if (!StringUtil::CIEquals(database, main)) {
 			// another catalog of the role: the catalog is a schema holding its schemas (quack's layout)
 			path.emplace_back(database);
 		}
-		for (auto &part : remote_path) {
+		bool complete = true;
+		auto parts = row.GetValue(2); // held: GetChildren answers a reference into it
+		for (auto &part : ListValue::GetChildren(parts)) {
+			if (part.IsNull()) {
+				complete = false;
+				break;
+			}
 			path.emplace_back(part.GetValue<string>());
+			remote_path.emplace_back(part.GetValue<string>());
 		}
-		if (path.empty()) {
+		if (!complete || remote_path.size() < 2) {
 			continue;
 		}
-		auto &schema = RegisterSchema(*this, snapshot->schemas, path);
-		by_oid.emplace(oid, schema);
+		auto schema = RegisterSchema(*this, snapshot->schemas, path, remote_path);
+		if (schema) {
+			by_oid.emplace(oid, *schema);
+		}
 	}
 
 	// one table per (schema oid, name), its columns in order; a type this node cannot spell leaves the object out
@@ -271,6 +335,10 @@ shared_ptr<HugrSnapshot> HugrCatalog::Load(ClientContext &context, bool wait) {
 	int64_t last_oid = -1;
 	string last_table;
 	for (auto &row : columns->Rows()) {
+		if (row.GetValue(0).IsNull() || row.GetValue(1).IsNull() || row.GetValue(2).IsNull() ||
+		    row.GetValue(3).IsNull()) {
+			continue;
+		}
 		auto oid = row.GetValue(0).GetValue<int64_t>();
 		auto table = row.GetValue(1).GetValue<string>();
 		if (!info || oid != last_oid || table != last_table) {
@@ -306,7 +374,9 @@ shared_ptr<HugrSnapshot> HugrCatalog::Load(ClientContext &context, bool wait) {
 shared_ptr<HugrSnapshot> HugrCatalog::Current(optional_ptr<ClientContext> context) {
 	{
 		lock_guard<mutex> guard(snapshot_lock);
-		auto due = stale || NowMs() - loaded_at >= static_cast<int64_t>(pool->Options().catalog_ttl_s) * 1000;
+		auto age = NowMs() - loaded_at;
+		auto due =
+		    (stale && age >= STALE_REFRESH_MS) || age >= static_cast<int64_t>(pool->Options().catalog_ttl_s) * 1000;
 		if (!due || !context || refreshing) {
 			return current;
 		}
@@ -338,6 +408,7 @@ shared_ptr<HugrSnapshot> HugrCatalog::SnapshotOf(CatalogTransaction transaction)
 		return Current(nullptr);
 	}
 	auto &hugr_transaction = transaction.transaction->Cast<HugrTransaction>();
+	lock_guard<mutex> guard(hugr_transaction.pin_lock);
 	if (!hugr_transaction.snapshot) {
 		hugr_transaction.snapshot = Current(transaction.context);
 	}

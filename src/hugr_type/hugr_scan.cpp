@@ -13,6 +13,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 
 #include <queue>
 
@@ -24,6 +25,9 @@ unique_ptr<FunctionData> HugrScanBindData::Copy() const {
 	result->catalog = catalog;
 	result->pool = pool;
 	result->remote_name = remote_name;
+	result->local_name = local_name;
+	result->column_names = column_names;
+	result->column_types = column_types;
 	result->table_entry = table_entry;
 	return std::move(result);
 }
@@ -35,9 +39,10 @@ bool HugrScanBindData::Equals(const FunctionData &other_p) const {
 
 namespace {
 
+//! A chunk of B's answer: exactly the scan's projection, as the query asked for it (BuildQuery)
 class ChunkResult {
 public:
-	ChunkResult(DataChunk &chunk_p, bool projected_p) : projected(projected_p) {
+	explicit ChunkResult(DataChunk &chunk_p) {
 		chunk = make_uniq<DataChunk>();
 		chunk->InitializeEmpty(chunk_p.GetTypes());
 		chunk->Reference(chunk_p);
@@ -45,8 +50,6 @@ public:
 	DataChunk &Chunk() {
 		return *chunk;
 	}
-	//! the chunk is the scan's projection already (the query sent carried it)
-	bool projected;
 
 private:
 	unique_ptr<DataChunk> chunk;
@@ -60,14 +63,25 @@ struct HugrScanGlobalState : public GlobalTableFunctionState {
 		return max_threads;
 	}
 
-	//! The scan is over (its end, an early stop, an error): stop the read-ahead, end the remote query if it still
-	//! runs - B's CANCEL returns once it is (it joins the producer), so the next borrower's PREPARE supersedes
-	//! nothing - and give the connection back.
+	//! B's answer ended the connection (a scan thread saw it): it does not go back to the pool.
+	void Answered(Answer answer) {
+		lock_guard<mutex> guard(loan_lock);
+		loan.Answered(answer);
+	}
+
+	//! B's stream ended - a FETCH past its total: nothing is in flight and B's query is over, so the connection goes
+	//! back now, not when the statement ends (a scan's state lives until then, a streamed result's longer).
+	void Finished() {
+		completed = true;
+		lock_guard<mutex> guard(loan_lock);
+		loan.Release();
+	}
+
+	//! The scan is over before its end (an early stop, an error), or ended: a query still running on B is
+	//! cancelled first - B's CANCEL returns once it is over (it joins the producer) and answers the FETCHes in
+	//! flight, so the drain after it waits for no batch B was still to produce - then the connection goes back,
+	//! and the next borrower's PREPARE supersedes nothing.
 	void End() {
-		if (fetcher) {
-			fetcher->StopAndDrain();
-			fetcher.reset();
-		}
 		if (loan && !completed && needs_more_fetch) {
 			try {
 				loan.Client().CancelQuery(query_uuid);
@@ -76,19 +90,23 @@ struct HugrScanGlobalState : public GlobalTableFunctionState {
 				loan.Answered(Answer::RECONNECT); // a connection whose query state is unknown never goes back
 			}
 		}
+		if (fetcher) {
+			fetcher->StopAndDrain();
+			fetcher.reset();
+		}
 		loan.Release();
 	}
 
 	Loan loan;
+	mutex loan_lock;
 	shared_ptr<HugrFetcher> fetcher;
+	optional_ptr<const HugrScanBindData> bind_data;
+	//! the types of B's answer, column by column, as the query asked for them
+	vector<LogicalType> expected;
 	idx_t max_threads = 1;
-	vector<ColumnIndex> column_ids;
-	vector<idx_t> projection_ids;
 	hugeint_t query_uuid;
 	bool needs_more_fetch = false;
-	bool projected = false;
 	atomic<bool> completed {false};
-	atomic<idx_t> active_scanners {0};
 
 	vector<ChunkResult> TryGetResults() {
 		lock_guard<mutex> guard(lock);
@@ -104,41 +122,62 @@ struct HugrScanLocalState : public LocalTableFunctionState {
 	optional_idx current_batch_index;
 	optional_idx fetch_claim;
 	bool fetch_exhausted = false;
-	bool finish_reported = false;
 	std::queue<ChunkResult> results;
 };
 
-string BuildQuery(const HugrScanBindData &bind_data, const TableFunctionInitInput &input) {
+//! The query sent to B, and the types its answer must have. Columns are asked for BY NAME, never by position: B's
+//! shape may have changed since the snapshot (a column hidden from A's role), and a position would then read
+//! another column under this one's masks.
+string BuildQuery(const HugrScanBindData &bind_data, const TableFunctionInitInput &input,
+                  vector<LogicalType> &expected) {
 	string select;
+	auto add = [&](const string &item, const LogicalType &type) {
+		select += (select.empty() ? "" : ", ") + item;
+		expected.push_back(type);
+	};
 	for (auto &column : input.column_indexes) {
-		if (!select.empty()) {
-			select += ", ";
-		}
 		if (column.IsVirtualColumn()) {
 			auto virtual_column = column.GetPrimaryIndex();
 			if (virtual_column == COLUMN_IDENTIFIER_EMPTY) {
 				// count(*): any value will do, of the type HugrGetVirtualColumns declared
-				select += "NULL::BOOLEAN";
+				add("NULL::BOOLEAN", LogicalType::BOOLEAN);
 			} else if (virtual_column == COLUMN_IDENTIFIER_ROW_ID) {
 				throw NotImplementedException("hugr does not support rowid on remote tables");
 			} else {
 				throw InternalException("Unsupported virtual column index");
 			}
 		} else {
-			select += "#" + to_string(column.GetPrimaryIndex() + 1);
+			auto index = column.GetPrimaryIndex();
+			add(KeywordHelper::WriteQuoted(bind_data.column_names[index], '"'), bind_data.column_types[index]);
 		}
 	}
-	auto from = "FROM " + bind_data.remote_name.ToString();
-	return select.empty() ? from : "SELECT " + select + " " + from;
+	if (select.empty()) {
+		// no projection: every column, in the snapshot's order
+		for (idx_t i = 0; i < bind_data.column_names.size(); i++) {
+			add(KeywordHelper::WriteQuoted(bind_data.column_names[i], '"'), bind_data.column_types[i]);
+		}
+	}
+	return "SELECT " + select + " FROM " + bind_data.remote_name.ToString();
+}
+
+//! B answered in another shape than the snapshot's (a type changed, a column moved): the statement fails cleanly -
+//! never a chunk referenced over the wrong layout - and the next transaction reads B's catalog again.
+void CheckShape(const HugrScanBindData &bind_data, const vector<LogicalType> &expected,
+                const vector<LogicalType> &answered) {
+	if (answered == expected) {
+		return;
+	}
+	bind_data.catalog->MarkStale();
+	throw InvalidInputException("hugr: %s changed on B since this node read B's catalog - the next statement reads "
+	                            "it again",
+	                            bind_data.local_name);
 }
 
 unique_ptr<GlobalTableFunctionState> HugrScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<HugrScanBindData>();
 	auto state = make_uniq<HugrScanGlobalState>();
-	state->column_ids = input.column_indexes;
-	state->projection_ids = input.projection_ids;
-	state->projected = !input.column_indexes.empty();
-	auto query = BuildQuery(bind_data, input);
+	state->bind_data = &bind_data;
+	auto query = BuildQuery(bind_data, input, state->expected);
 
 	state->loan = bind_data.pool->Borrow(context);
 	state->query_uuid = UUID::GenerateRandomUUID();
@@ -156,8 +195,10 @@ unique_ptr<GlobalTableFunctionState> HugrScanInitGlobal(ClientContext &context, 
 	}
 	state->needs_more_fetch = response->NeedsMoreFetch();
 	state->query_uuid = response->QueryUUID();
+	CheckShape(bind_data, state->expected, response->Types());
 	for (auto &chunk : response->MutableResults()) {
-		state->results.emplace_back(chunk->Chunk(), state->projected);
+		CheckShape(bind_data, state->expected, chunk->Chunk().GetTypes());
+		state->results.emplace_back(chunk->Chunk());
 	}
 	state->max_threads = state->needs_more_fetch ? GlobalTableFunctionState::MAX_THREADS : 1;
 	if (state->needs_more_fetch) {
@@ -175,45 +216,10 @@ unique_ptr<LocalTableFunctionState> HugrScanInitLocal(ExecutionContext &context,
                                                       GlobalTableFunctionState *global_state_p) {
 	auto &state = global_state_p->Cast<HugrScanGlobalState>();
 	auto local = make_uniq<HugrScanLocalState>();
-	state.active_scanners++;
 	for (auto &chunk : state.TryGetResults()) {
 		local->results.push(std::move(chunk));
 	}
 	return std::move(local);
-}
-
-void FinishScan(HugrScanGlobalState &state, HugrScanLocalState &local) {
-	if (local.finish_reported) {
-		return;
-	}
-	local.finish_reported = true;
-	if (state.active_scanners.fetch_sub(1) != 1) {
-		return;
-	}
-	// the last scanner: B's stream ended (a FETCH past its total), nothing is in flight
-	state.completed = true;
-}
-
-void Emit(HugrScanGlobalState &state, ChunkResult &chunk, DataChunk &output) {
-	auto &response_chunk = chunk.Chunk();
-	if (chunk.projected) {
-		output.Reference(response_chunk);
-		return;
-	}
-	auto &projection_ids = state.projection_ids;
-	auto columns = projection_ids.empty() ? state.column_ids.size() : projection_ids.size();
-	for (idx_t i = 0; i < columns; i++) {
-		auto &index = projection_ids.empty() ? state.column_ids[i] : state.column_ids[projection_ids[i]];
-		if (index.IsVirtualColumn()) {
-			if (index.GetPrimaryIndex() != COLUMN_IDENTIFIER_EMPTY) {
-				throw NotImplementedException("hugr does not support rowid on remote tables");
-			}
-			output.data[i].Reference(Value(output.data[i].GetType()), count_t(response_chunk.size()));
-			continue;
-		}
-		output.data[i].Reference(response_chunk.data[index.GetPrimaryIndex()]);
-	}
-	output.CheckCardinality(response_chunk.size());
 }
 
 void HugrScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
@@ -224,7 +230,7 @@ void HugrScan(ClientContext &context, TableFunctionInput &input, DataChunk &outp
 			auto chunk = std::move(local.results.front());
 			local.results.pop();
 			if (chunk.Chunk().size() > 0) {
-				Emit(state, chunk, output);
+				output.Reference(chunk.Chunk());
 				return;
 			}
 		}
@@ -240,7 +246,7 @@ void HugrScan(ClientContext &context, TableFunctionInput &input, DataChunk &outp
 				if (error.Type() != ExceptionType::INTERRUPT) {
 					auto answer = ClassifyAnswer(error.RawMessage());
 					if (EndsConnection(answer)) {
-						state.loan.Answered(answer);
+						state.Answered(answer);
 					}
 				}
 				throw;
@@ -248,19 +254,19 @@ void HugrScan(ClientContext &context, TableFunctionInput &input, DataChunk &outp
 			switch (result) {
 			case HugrFetchResult::BATCH:
 				for (auto &chunk : chunks) {
-					local.results.emplace(*chunk, state.projected);
+					CheckShape(*state.bind_data, state.expected, chunk->GetTypes());
+					local.results.emplace(*chunk);
 				}
 				local.current_batch_index = batch_index;
 				continue;
 			case HugrFetchResult::FINISHED:
 				local.fetch_exhausted = true;
-				FinishScan(state, local);
+				state.Finished();
 				return;
 			case HugrFetchResult::BLOCKED:
 				return;
 			}
 		}
-		FinishScan(state, local);
 		return;
 	}
 }

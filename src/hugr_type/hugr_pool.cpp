@@ -75,8 +75,9 @@ void Loan::Answered(Answer answer) {
 	if (!conn) {
 		return;
 	}
-	if (EndsConnection(answer)) {
-		keep = false;
+	if (EndsConnection(answer) && keep.exchange(false)) {
+		// counted once per connection: the connections B's answers ended, by why
+		pool->Count("hugr.pool.reconnects", AnswerName(answer));
 	}
 	if (answer == Answer::NODE_GONE) {
 		pool->NodeGone(LabelOf(conn->client->ConnectionId()));
@@ -99,8 +100,8 @@ void Loan::Release() {
 // ---- Pool ---------------------------------------------------------------------------------------------------------
 
 Pool::Pool(DatabaseInstance &db_p, string catalog_p, QuackUri uri_p, string secret_p, LinkOptions options_p)
-    : db(db_p), catalog(std::move(catalog_p)), uri(std::move(uri_p)), secret(std::move(secret_p)),
-      options(options_p), core(options_p) {
+    : db(db_p), catalog(std::move(catalog_p)), uri(std::move(uri_p)), secret(std::move(secret_p)), options(options_p),
+      core(options_p) {
 	sweeper = make_uniq<QuackPeriodicWorker>();
 	sweeper->Start([] { return milliseconds(SWEEP_INTERVAL_MS); },
 	               [this] {
@@ -114,7 +115,8 @@ Pool::Pool(DatabaseInstance &db_p, string catalog_p, QuackUri uri_p, string secr
 }
 
 Pool::~Pool() {
-	sweeper->Stop();
+	// cheap when the catalog closed the pool: a reader of the registry (a gauge, hugr_pools()) may hold the last
+	// reference, and runs under the audit registry's lock
 	Close();
 }
 
@@ -155,6 +157,10 @@ string Pool::ReadToken() {
 		throw InvalidInputException("hugr: %s: secret \"%s\" is of type %s, not hugr", catalog, secret,
 		                            base.GetType().GetIdentifierName());
 	}
+	if (!ScopeNamesDoor(base.GetScope(), uri.Host(), uri.Port())) {
+		throw InvalidInputException("hugr: %s: secret \"%s\" is not for this door - its SCOPE must name 'hugr://%s:%d'",
+		                            catalog, secret, uri.Host(), uri.Port());
+	}
 	auto kv = dynamic_cast<const KeyValueSecret *>(&base);
 	Value token;
 	if (!kv || !kv->TryGetValue("token", token) || token.IsNull() || token.ToString().empty()) {
@@ -173,9 +179,6 @@ shared_ptr<HugrClientConnection> Pool::Connect(ClientContext &context) {
 Loan Pool::Borrow(ClientContext &context, bool wait, bool fresh) {
 	vector<shared_ptr<PooledConnection>> retired;
 	unique_lock<mutex> guard(lock);
-	if (closed) {
-		throw InvalidInputException("hugr: the catalog %s is detached", catalog);
-	}
 	auto deadline = NowMs() + static_cast<int64_t>(options.pool_wait_s) * 1000;
 	auto ticket = core.Join();
 	auto leave = [&] {
@@ -183,6 +186,13 @@ Loan Pool::Borrow(ClientContext &context, bool wait, bool fresh) {
 		changed.notify_all();
 	};
 	while (true) {
+		if (closed) {
+			// detached (now, or while this loan waited)
+			leave();
+			guard.unlock();
+			Retire(retired);
+			throw InvalidInputException("hugr: the catalog %s is detached", catalog);
+		}
 		if (core.First(ticket)) {
 			shared_ptr<PooledConnection> lent;
 			auto step = core.Next(NowMs(), lent, retired, fresh);
@@ -228,19 +238,24 @@ Loan Pool::Borrow(ClientContext &context, bool wait, bool fresh) {
 				if (waitable) {
 					last_refusal = failure.RawMessage();
 				}
+				auto timeout = WaitTimeoutMessage(catalog, options.pool_wait_s, core.Busy(), options.pool_size,
+				                                  core.Waiting(), string());
 				guard.unlock();
 				// a refusal of B, or no answer: wait for a connection in use, or for the backoff. Anything else (no
-				// secret, a protocol B does not speak) - and anything at all for a borrower that may not wait - is the
-				// answer now
-				if (waitable) {
-					Count("hugr.pool.refused", AnswerName(answer));
-				}
-				if (!wait || !waitable || NowMs() >= deadline) {
-					if (waitable) {
-						throw IOException("hugr: no connection to %s (%s) - B answered: %s", catalog,
-						                  uri.CanonicalUri(), failure.RawMessage());
-					}
+				// secret, a protocol B does not speak) is the answer now
+				if (!waitable) {
 					failure.Throw();
+				}
+				Count("hugr.pool.refused", AnswerName(answer));
+				if (!wait) {
+					// the ATTACH, the operator's: B's answer as it was
+					throw IOException("hugr: no connection to %s (%s) - B answered: %s", catalog, uri.CanonicalUri(),
+					                  failure.RawMessage());
+				}
+				if (NowMs() >= deadline) {
+					// a statement's: the pool's state, never B's address or its words (they are in hugr_pools())
+					Count("hugr.pool.wait_timeouts");
+					throw IOException(timeout);
 				}
 				guard.lock();
 				ticket = core.JoinFront();
@@ -248,9 +263,18 @@ Loan Pool::Borrow(ClientContext &context, bool wait, bool fresh) {
 			}
 		}
 		auto now = NowMs();
+		if (!wait) {
+			// a borrower that may not wait (the ATTACH, a catalog refresh inside a statement's bind): none free now
+			auto busy = core.Busy();
+			leave();
+			guard.unlock();
+			Retire(retired);
+			throw IOException("hugr: no connection to %s free now (%llu of %llu in use)", catalog, busy,
+			                  options.pool_size);
+		}
 		if (now >= deadline) {
 			auto message = WaitTimeoutMessage(catalog, options.pool_wait_s, core.Busy(), options.pool_size,
-			                                  core.Waiting() - 1, last_refusal);
+			                                  core.Waiting() - 1, string());
 			leave();
 			guard.unlock();
 			Retire(retired);
@@ -288,6 +312,7 @@ void Pool::NodeGone(const string &label) {
 }
 
 void Pool::Close() {
+	sweeper->Stop();
 	vector<shared_ptr<PooledConnection>> retired;
 	{
 		lock_guard<mutex> guard(lock);
@@ -296,6 +321,11 @@ void Pool::Close() {
 	}
 	changed.notify_all();
 	Retire(retired);
+}
+
+bool Pool::Closed() {
+	lock_guard<mutex> guard(lock);
+	return closed;
 }
 
 PoolView Pool::View() {
@@ -339,7 +369,9 @@ vector<shared_ptr<Pool>> PoolRegistry::Pools() {
 	lock_guard<mutex> guard(lock);
 	vector<shared_ptr<Pool>> out;
 	for (auto &weak : pools) {
-		if (auto pool = weak.lock()) {
+		// a detached catalog's pool may outlive it in a prepared statement's plan: no longer listed
+		auto pool = weak.lock();
+		if (pool && !pool->Closed()) {
 			out.push_back(std::move(pool));
 		}
 	}

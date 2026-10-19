@@ -45,8 +45,10 @@ public:
 
 	unique_ptr<CreateInfo> GetInfo() const override;
 
-	//! The name of an entry here as B sees it: the local schema path, without the ATTACH alias.
+	//! The name of an entry here as B sees it: B's catalog, then the schema's path there.
 	QualifiedName RemoteName(const Identifier &entry_name) const;
+	//! B's catalog and this schema's path in it (a stand-in for one of B's catalogs: just the catalog)
+	vector<Identifier> remote_path;
 
 	case_insensitive_map_t<unique_ptr<HugrSchemaEntry>> schemas;
 	case_insensitive_map_t<unique_ptr<HugrTableEntry>> tables;
@@ -77,7 +79,9 @@ class HugrTransaction : public Transaction {
 public:
 	HugrTransaction(TransactionManager &manager, ClientContext &context) : Transaction(manager, context) {
 	}
-	//! what this transaction reads, from its first lookup on
+	//! what this transaction reads, from its first lookup on - pinned under the lock: a transaction's catalog is
+	//! looked at by several pipelines' inits at once
+	mutex pin_lock;
 	shared_ptr<HugrSnapshot> snapshot;
 };
 
