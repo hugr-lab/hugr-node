@@ -204,6 +204,112 @@ struct JsonDoc {
 	duckdb_yyjson::yyjson_doc *doc;
 };
 
+//! spec 015: an issuer's, a client's or a group's name goes into a management statement as an identifier - a plain
+//! name of at most 63 (a resource group is named after a Kubernetes object: letters, digits, '-', '_')
+void RequireFirstPolicyName(const string &value, const char *what) {
+	bool plain = !value.empty() && value.size() <= 63 && std::all_of(value.begin(), value.end(), [](char c) {
+		return StringUtil::CharacterIsAlphaNumeric(c) || c == '_' || c == '-';
+	});
+	if (!plain) {
+		throw InvalidInputException("hugr_node: the bootstrap document's first_policy names %s \"%s\" that is not a "
+		                            "plain name ([A-Za-z0-9_-], at most 63)",
+		                            what, value);
+	}
+}
+
+//! spec 015: the first policy, every field required - a partial one would write an IdP nobody can sign in through
+FirstPolicy ParseFirstPolicy(duckdb_yyjson::yyjson_val *object, const string &node_group) {
+	using namespace duckdb_yyjson; // NOLINT
+	auto refuse = [](const char *what) {
+		throw InvalidInputException("hugr_node: the bootstrap document's first_policy %s", what);
+	};
+	if (!yyjson_is_obj(object)) {
+		refuse("is not an object");
+	}
+	FirstPolicy out;
+	auto issuer = yyjson_obj_get(object, "issuer");
+	if (!issuer || !yyjson_is_obj(issuer)) {
+		refuse("has no issuer");
+	}
+	out.issuer_name = StrField(issuer, "name");
+	RequireFirstPolicyName(out.issuer_name, "an issuer");
+	out.issuer_url = StrField(issuer, "url");
+	// its keys are read by discovery from it, over https only (acl_jwks_locations); the value never reaches an error
+	if (!StringUtil::StartsWith(out.issuer_url, "https://") || StringUtil::Contains(out.issuer_url, "@")) {
+		refuse("names an issuer url that is not an https URL without userinfo");
+	}
+	out.roles_claim = StrField(issuer, "roles_claim");
+	if (out.roles_claim.empty()) {
+		refuse("names no issuer roles_claim - the claim that carries the administrators' value");
+	}
+	auto audiences = yyjson_obj_get(issuer, "audiences");
+	size_t idx, max;
+	yyjson_val *item;
+	if (audiences && yyjson_is_arr(audiences)) {
+		yyjson_arr_foreach(audiences, idx, max, item) {
+			if (!yyjson_is_str(item) || !*yyjson_get_str(item)) {
+				refuse("has an issuer audience that is not a non-empty string");
+			}
+			out.audiences.emplace_back(yyjson_get_str(item));
+		}
+	}
+	if (out.audiences.empty()) {
+		refuse("names no issuer audiences - the platform's tokens carry them");
+	}
+	// names compare as the policy compares them: exactly
+	std::set<string> client_names, client_ids, group_names;
+	auto clients = yyjson_obj_get(object, "clients");
+	if (clients && yyjson_is_arr(clients)) {
+		yyjson_arr_foreach(clients, idx, max, item) {
+			FirstPolicy::Client client {StrField(item, "name"), StrField(item, "client_id")};
+			RequireFirstPolicyName(client.name, "a client");
+			if (client.client_id.empty()) {
+				refuse("names a client without its client_id");
+			}
+			// two clients for one application would accept the same tokens - the policy refuses them
+			if (!client_names.insert(client.name).second || !client_ids.insert(client.client_id).second) {
+				refuse("names a client or a client_id twice");
+			}
+			out.clients.push_back(std::move(client));
+		}
+	}
+	if (out.clients.empty()) {
+		refuse("names no client - the console's is how the administrator gets in");
+	}
+	out.administrators = StrField(object, "administrators");
+	if (out.administrators.empty()) {
+		refuse("names no administrators - the roles claim's value that makes the platform's administrator");
+	}
+	auto groups = yyjson_obj_get(object, "resource_groups");
+	bool has_default = false, has_own = false;
+	if (groups && yyjson_is_arr(groups)) {
+		yyjson_arr_foreach(groups, idx, max, item) {
+			FirstPolicy::Group group;
+			group.name = StrField(item, "name");
+			RequireFirstPolicyName(group.name, "a resource group");
+			auto is_default = yyjson_is_obj(item) ? yyjson_obj_get(item, "default") : nullptr;
+			if (is_default && !yyjson_is_bool(is_default)) {
+				refuse("has a resource group whose default is not true or false");
+			}
+			group.is_default = is_default && yyjson_get_bool(is_default);
+			if (group.is_default && has_default) {
+				refuse("marks more than one resource group default");
+			}
+			has_default = has_default || group.is_default;
+			if (!group_names.insert(group.name).second) {
+				refuse("names a resource group twice");
+			}
+			has_own = has_own || group.name == node_group;
+			out.resource_groups.push_back(std::move(group));
+		}
+	}
+	// a node whose group the policy lacks refuses everyone and drains (spec 010)
+	if (!has_own) {
+		refuse("names no resource group for this node's group");
+	}
+	return out;
+}
+
 } // namespace
 
 //===--------------------------------------------------------------------===//
@@ -393,6 +499,12 @@ BootstrapDocument BootstrapDocument::Parse(const string &json) {
 			    "%lld",
 			    static_cast<long long>(out.heartbeat_interval));
 		}
+		// spec 015: the platform's first policy, when the operator's platform names one
+		auto first_policy = yyjson_obj_get(root, "first_policy");
+		if (first_policy && !yyjson_is_null(first_policy)) {
+			out.first_policy = ParseFirstPolicy(first_policy, out.node_group);
+			out.has_first_policy = true;
+		}
 	}
 	auto repository = yyjson_obj_get(root, "repository");
 	if (!repository || !yyjson_is_obj(repository)) {
@@ -540,8 +652,71 @@ vector<PlanStep> RepositoryAndCatalogSteps(const BootstrapDocument &doc) {
 		// duckdb-acl spec 134: the name the node's sessions carry, for the front
 		steps.push_back({"5 policy catalog", "SET GLOBAL acl_node_label = " + Quoted(doc.node_label)});
 	}
-	steps.push_back(
-	    {"5 policy catalog", "SELECT acl_use_db(" + Quoted(POLICY_ALIAS) + ", " + Quoted(doc.catalog_schema) + ")"});
+	return steps;
+}
+
+//! the policy opened from the attached catalog; `init` (spec 015) creates its schema in an empty database - only
+//! there: init never migrates, and a catalog that has its schema is opened as any node opens it
+PlanStep UseCatalogStep(const BootstrapDocument &doc, bool init) {
+	return {"5 policy catalog", "SELECT acl_use_db(" + Quoted(POLICY_ALIAS) + ", " + Quoted(doc.catalog_schema) +
+	                                (init ? ", true" : "") + ")"};
+}
+
+//! spec 015: what decides whether the catalog's schema is created - shown by the plan, read by the run
+string CatalogSchemaSql(const BootstrapDocument &doc) {
+	return "SELECT count(*) FROM duckdb_tables() WHERE database_name = " + Quoted(POLICY_ALIAS) +
+	       " AND schema_name = " + Quoted(doc.catalog_schema) + " AND table_name = 'meta'";
+}
+
+const char *FIRST_ADMIN_ROLE = "platform_admin";
+const char *FIRST_POLICY_STEP = "5 first policy";
+
+//! spec 015: what decides whether the first policy is written - shown by the plan, read by the run
+string FirstPolicyGateNote(const BootstrapDocument &doc) {
+	return "-- only while the catalog lists no role mapping (acl_role_mappings()) and no issuer but " +
+	       Ident(doc.first_policy.issuer_name) + " (acl_issuers()); a resource group it holds is kept as it is";
+}
+
+//! spec 015: the first policy's statements, the anonymous hatch open for them alone. Each one is IF NOT EXISTS or an
+//! upsert of the same value, so a write that stopped part-way is completed by the next start; the mappings are last:
+//! the gate closes only when the whole policy is in. A group the catalog already holds is not re-created (a re-create
+//! replaces its limits)
+vector<PlanStep> FirstPolicySteps(const BootstrapDocument &doc, const std::set<string> &held_groups) {
+	auto &policy = doc.first_policy;
+	vector<PlanStep> steps;
+	auto add = [&](const string &sql) {
+		steps.push_back({FIRST_POLICY_STEP, sql});
+	};
+	auto quoted_list = [](const vector<string> &values) {
+		vector<string> out;
+		for (auto &value : values) {
+			out.push_back(Quoted(value));
+		}
+		return "(" + StringUtil::Join(out, ", ") + ")";
+	};
+	add("SET GLOBAL acl_allow_anonymous_admin = true");
+	add("ACL ADMIN CREATE ROLE IF NOT EXISTS " + string(FIRST_ADMIN_ROLE));
+	add("ACL ADMIN GRANT ADMIN cluster TO ROLE " + string(FIRST_ADMIN_ROLE));
+	add("ACL ADMIN GRANT ADMIN policy TO ROLE " + string(FIRST_ADMIN_ROLE));
+	for (auto &group : policy.resource_groups) {
+		if (!held_groups.count(group.name)) {
+			add("ACL ADMIN CREATE RESOURCE GROUP " + Ident(group.name) + (group.is_default ? " DEFAULT" : ""));
+		}
+		add("ACL ADMIN GRANT RESOURCE GROUP " + Ident(group.name) + " TO ROLE " + FIRST_ADMIN_ROLE);
+	}
+	add("ACL ADMIN CREATE ISSUER IF NOT EXISTS " + Ident(policy.issuer_name) + " URL " + Quoted(policy.issuer_url));
+	// a token counts only when the application asked for it (AZP); its roles are the mapped values of the claim
+	for (auto &client : policy.clients) {
+		add("ACL ADMIN CREATE CLIENT IF NOT EXISTS " + Ident(client.name) + " ISSUER " + Ident(policy.issuer_name) +
+		    " AUDIENCES " + quoted_list(policy.audiences) + " AZP (" + Quoted(client.client_id) + ") ROLES FROM (" +
+		    Quoted(policy.roles_claim) + ")");
+	}
+	// a role holding an admin scope is reached only through a client's own mapping (duckdb-acl spec 095)
+	for (auto &client : policy.clients) {
+		add("ACL ADMIN MAP CLAIM " + Quoted(policy.administrators) + " FROM CLIENT " + Ident(client.name) +
+		    " TO ROLE " + FIRST_ADMIN_ROLE);
+	}
+	add("SET GLOBAL acl_allow_anonymous_admin = false");
 	return steps;
 }
 
@@ -635,6 +810,17 @@ vector<PlanStep> BootstrapPlan(const AgentEnvironment &env_p, const BootstrapDoc
 	}
 	for (auto &step : RepositoryAndCatalogSteps(document)) {
 		plan.push_back(step);
+	}
+	if (document.has_first_policy) {
+		plan.push_back({"5 policy catalog", "-- init only while the database holds no schema: " +
+		                                        CatalogSchemaSql(document) + " answers 0"});
+	}
+	plan.push_back(UseCatalogStep(document, document.has_first_policy));
+	if (document.has_first_policy) {
+		plan.push_back({FIRST_POLICY_STEP, FirstPolicyGateNote(document)});
+		for (auto &step : FirstPolicySteps(document, std::set<string>())) {
+			plan.push_back(step);
+		}
 	}
 	for (auto &step : EngineSteps(env)) {
 		plan.push_back(step);
@@ -768,17 +954,57 @@ void Log(const string &line) {
 }
 
 //! one bootstrap statement on its own connection; a failure names its step. The log names the step, never the
-//! statement's values (they are addresses and file paths, but a log line has no business carrying them)
-unique_ptr<QueryResult> RunStep(DatabaseInstance &db, const string &step, const string &sql) {
+//! statement's values (they are addresses and file paths, but a log line has no business carrying them); a read that
+//! decides a step (`logged` false) is not one of its statements
+unique_ptr<QueryResult> RunStep(DatabaseInstance &db, const string &step, const string &sql, bool logged = true) {
 	Connection con(db);
 	auto result = con.Query(sql);
 	if (result->HasError()) {
 		throw InvalidInputException("hugr_node: bootstrap step \"%s\" failed: %s", step, result->GetError());
 	}
-	if (step != "stop") {
+	if (logged && step != "stop") {
 		Log("step " + step + ": ok");
 	}
 	return result;
+}
+
+int64_t CountOf(DatabaseInstance &db, const string &step, const string &sql) {
+	auto result = RunStep(db, step, sql, false);
+	acl::ResultRows rows(*result);
+	return rows.Count() == 0 ? 0 : rows.GetValue(0, 0).GetValue<int64_t>();
+}
+
+//! spec 015: the first policy, into a catalog nobody administers yet. A mapping is what lets a token's holder in, and
+//! the first policy writes its mappings last: a catalog without one, whose only issuer is the first policy's, has
+//! never been administered through it - anything else is left alone, so a later edit is never undone
+void WriteFirstPolicy(DatabaseInstance &db, const BootstrapDocument &document) {
+	auto mappings = CountOf(db, FIRST_POLICY_STEP, "SELECT count(*) FROM acl_role_mappings()");
+	auto other_issuers =
+	    CountOf(db, FIRST_POLICY_STEP,
+	            "SELECT count(*) FROM acl_issuers() WHERE name <> " + Quoted(document.first_policy.issuer_name));
+	if (mappings > 0 || other_issuers > 0) {
+		Log("step 5 first policy: the catalog holds its policy - nothing written");
+		return;
+	}
+	std::set<string> held_groups;
+	auto groups = RunStep(db, FIRST_POLICY_STEP, "SELECT \"group\" FROM acl_resource_groups()", false);
+	acl::ResultRows group_rows(*groups);
+	for (idx_t row = 0; row < group_rows.Count(); row++) {
+		held_groups.insert(group_rows.GetValue(0, row).ToString());
+	}
+	try {
+		for (auto &step : FirstPolicySteps(document, held_groups)) {
+			RunStep(db, step.step, step.sql);
+		}
+	} catch (std::exception &) {
+		// the hatch never stays open past these statements, whatever failed (the bootstrap stops here)
+		Connection con(db);
+		con.Query("SET GLOBAL acl_allow_anonymous_admin = false");
+		throw;
+	}
+	Log("step 5 first policy: written - issuer " + document.first_policy.issuer_name + ", " +
+	    std::to_string(document.first_policy.clients.size()) + " client(s), " +
+	    std::to_string(document.first_policy.resource_groups.size()) + " resource group(s)");
 }
 
 int64_t LiveSessions(DatabaseInstance &db) {
@@ -1258,6 +1484,12 @@ string RunPragma(ClientContext &context, const FunctionParameters &parameters) {
 		for (auto &step : RepositoryAndCatalogSteps(document)) {
 			RunStep(db, step.step, step.sql);
 		}
+	}
+	auto init = document.has_first_policy && CountOf(db, "5 policy catalog", CatalogSchemaSql(document)) == 0;
+	auto use = UseCatalogStep(document, init);
+	RunStep(db, use.step, use.sql);
+	if (document.has_first_policy) {
+		WriteFirstPolicy(db, document);
 	}
 	for (auto &step : EngineSteps(env)) {
 		RunStep(db, step.step, step.sql);

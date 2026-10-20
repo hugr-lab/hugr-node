@@ -310,6 +310,257 @@ SELECT * FROM hugr_node_bootstrap_plan('{"version": 2, "node_group": "g", "node_
 ----
 <REGEX>:.*heartbeat interval_seconds is a whole number of seconds.*
 
+# --- spec 015: the first policy - after the catalog (created when empty), before the engine; the mappings last ------
+
+statement ok
+CREATE MACRO fp_doc(fp) AS '{"version": 2, "node_group": "etl", "node_label": "n1", "tresor": {"host": "t",
+  "identity": {"issuer": "i", "client_id": "c"}}, "repository": {"prefix": "https://ext"},
+  "catalog": {"secret": "hugr_policy_catalog"}, "first_policy": ' || fp || '}';
+
+statement ok
+CREATE MACRO fp_ok() AS '{"issuer": {"name": "corp", "url": "https://login.example/t/v2.0",
+  "audiences": ["api://hugr", "api://hugr-tools"], "roles_claim": "roles"},
+  "clients": [{"name": "console", "client_id": "0000-console"}, {"name": "dbeaver", "client_id": "it''s"}],
+  "administrators": "hugr-admins", "resource_groups": [{"name": "etl", "default": true}, {"name": "bi-x"}]}';
+
+query II
+SELECT step, sql FROM hugr_node_bootstrap_plan(fp_doc(fp_ok()), environment := orchestrated_env())
+WHERE step IN ('5 first policy', '6 engine', '6 profile') OR sql LIKE '%acl_use_db%' OR sql LIKE '-- init%';
+----
+5 policy catalog	-- init only while the database holds no schema: SELECT count(*) FROM duckdb_tables() WHERE database_name = 'hugr_policy' AND schema_name = 'acl' AND table_name = 'meta' answers 0
+5 policy catalog	SELECT acl_use_db('hugr_policy', 'acl', true)
+5 first policy	-- only while the catalog lists no role mapping (acl_role_mappings()) and no issuer but "corp" (acl_issuers()); a resource group it holds is kept as it is
+5 first policy	SET GLOBAL acl_allow_anonymous_admin = true
+5 first policy	ACL ADMIN CREATE ROLE IF NOT EXISTS platform_admin
+5 first policy	ACL ADMIN GRANT ADMIN cluster TO ROLE platform_admin
+5 first policy	ACL ADMIN GRANT ADMIN policy TO ROLE platform_admin
+5 first policy	ACL ADMIN CREATE RESOURCE GROUP "etl" DEFAULT
+5 first policy	ACL ADMIN GRANT RESOURCE GROUP "etl" TO ROLE platform_admin
+5 first policy	ACL ADMIN CREATE RESOURCE GROUP "bi-x"
+5 first policy	ACL ADMIN GRANT RESOURCE GROUP "bi-x" TO ROLE platform_admin
+5 first policy	ACL ADMIN CREATE ISSUER IF NOT EXISTS "corp" URL 'https://login.example/t/v2.0'
+5 first policy	ACL ADMIN CREATE CLIENT IF NOT EXISTS "console" ISSUER "corp" AUDIENCES ('api://hugr', 'api://hugr-tools') AZP ('0000-console') ROLES FROM ('roles')
+5 first policy	ACL ADMIN CREATE CLIENT IF NOT EXISTS "dbeaver" ISSUER "corp" AUDIENCES ('api://hugr', 'api://hugr-tools') AZP ('it''s') ROLES FROM ('roles')
+5 first policy	ACL ADMIN MAP CLAIM 'hugr-admins' FROM CLIENT "console" TO ROLE platform_admin
+5 first policy	ACL ADMIN MAP CLAIM 'hugr-admins' FROM CLIENT "dbeaver" TO ROLE platform_admin
+5 first policy	SET GLOBAL acl_allow_anonymous_admin = false
+6 profile	-- each item of acl_cluster_effective() in its order: hugr_node_profile_statements()
+
+# the plan's statements as the node runs them, on a catalog: each one is accepted, and run again - a start after a
+# write that stopped part-way - changes nothing
+statement ok
+ATTACH ':memory:' AS fp_store;
+
+statement ok
+SELECT acl_use_db('fp_store', 'acl', true);
+
+loop pass 0 2
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = true;
+
+statement ok
+ACL ADMIN CREATE ROLE IF NOT EXISTS platform_admin;
+
+statement ok
+ACL ADMIN GRANT ADMIN cluster TO ROLE platform_admin;
+
+statement ok
+ACL ADMIN GRANT ADMIN policy TO ROLE platform_admin;
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP "etl" DEFAULT;
+
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP "etl" TO ROLE platform_admin;
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP "bi-x";
+
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP "bi-x" TO ROLE platform_admin;
+
+statement ok
+ACL ADMIN CREATE ISSUER IF NOT EXISTS "corp" URL 'https://login.example/t/v2.0';
+
+statement ok
+ACL ADMIN CREATE CLIENT IF NOT EXISTS "console" ISSUER "corp" AUDIENCES ('api://hugr', 'api://hugr-tools') AZP ('0000-console') ROLES FROM ('roles');
+
+statement ok
+ACL ADMIN CREATE CLIENT IF NOT EXISTS "dbeaver" ISSUER "corp" AUDIENCES ('api://hugr', 'api://hugr-tools') AZP ('it''s') ROLES FROM ('roles');
+
+statement ok
+ACL ADMIN MAP CLAIM 'hugr-admins' FROM CLIENT "console" TO ROLE platform_admin;
+
+statement ok
+ACL ADMIN MAP CLAIM 'hugr-admins' FROM CLIENT "dbeaver" TO ROLE platform_admin;
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin = false;
+
+endloop
+
+query II
+SELECT name, url FROM acl_issuers();
+----
+corp	https://login.example/t/v2.0
+
+query IIII
+SELECT name, issuer, azp, unmapped FROM acl_clients() ORDER BY name;
+----
+console	corp	["0000-console"]	ignore
+dbeaver	corp	["it's"]	ignore
+
+query III
+SELECT scope_name, external_value, role FROM acl_role_mappings() ORDER BY scope_name;
+----
+console	hugr-admins	platform_admin
+dbeaver	hugr-admins	platform_admin
+
+query II
+SELECT "group", is_default FROM acl_resource_groups() ORDER BY "group";
+----
+bi-x	NULL
+etl	true
+
+query II
+SELECT role, "group" FROM acl_role_resource_groups() ORDER BY "group";
+----
+platform_admin	bi-x
+platform_admin	etl
+
+query II
+SELECT role, scope FROM fp_store.acl.admins ORDER BY scope;
+----
+platform_admin	cluster
+platform_admin	policy
+
+# a document without a first policy writes nothing and opens the catalog as it is
+query I
+SELECT count(*) FROM hugr_node_bootstrap_plan(doc_v2(), environment := orchestrated_env())
+WHERE step = '5 first policy' OR sql LIKE '%acl_use_db(%, true)' OR sql LIKE '-- init%';
+----
+0
+
+# refusals, each naming what is wrong
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc('[]'), environment := orchestrated_env());
+----
+<REGEX>:.*first_policy is not an object.*
+
+# its keys are read by discovery over https; userinfo would send the read elsewhere (the URL is never in the error)
+foreach url http://login.example https://u:p@login.example
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), 'https://login.example', '{url}')),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy names an issuer url that is not an https URL without userinfo.*
+
+endloop
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), '"audiences": ["api://hugr", "api://hugr-tools"], ', '')),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy names no issuer audiences.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), '"api://hugr-tools"', '""')),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy has an issuer audience that is not a non-empty string.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), '"roles_claim": "roles"', '"roles_claim": ""')),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy names no issuer roles_claim.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc('{"issuer": {"name": "corp", "url": "https://x", "audiences": ["a"],
+  "roles_claim": "roles"}, "clients": [], "administrators": "a", "resource_groups": [{"name": "etl"}]}'),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy names no client - the console's is how the administrator gets in.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), '"client_id": "0000-console"', '"client_id": ""')),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy names a client without its client_id.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), '"administrators": "hugr-admins", ', '')),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy names no administrators.*
+
+# a name goes into a management statement as an identifier: a plain one only
+foreach name x.y x''y x\"y a/b
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), '"name": "console"', '"name": "{name}"')),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy names a client .* that is not a plain name.*
+
+endloop
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), '"name": "corp"', '"name": "corp corp"')),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy names an issuer "corp corp" that is not a plain name.*
+
+# two clients for one application would accept the same tokens; names compare exactly, as the policy compares them
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), '"client_id": "0000-console"', '"client_id": "it''s"')),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy names a client or a client_id twice.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), '"name": "dbeaver"', '"name": "console"')),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy names a client or a client_id twice.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), '{"name": "bi-x"}', '{"name": "etl"}')),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy names a resource group twice.*
+
+statement ok
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), '{"name": "bi-x"}', '{"name": "ETL"}')),
+  environment := orchestrated_env());
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), '"name": "etl"', '"name": "Etl"')),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy names no resource group for this node's group.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), '{"name": "bi-x"}', '{"name": "bi-x", "default": true}')),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy marks more than one resource group default.*
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), '{"name": "bi-x"}', '{"name": "bi-x", "default": "yes"}')),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy has a resource group whose default is not true or false.*
+
+# a node whose group the policy lacks refuses everyone and drains (spec 010): refused before anything is written
+statement error
+SELECT * FROM hugr_node_bootstrap_plan(fp_doc(replace(fp_ok(), '"name": "etl"', '"name": "other"')),
+  environment := orchestrated_env());
+----
+<REGEX>:.*first_policy names no resource group for this node's group.*
+
 # --- the profile's statements, in the profile's order -------------------------------------------------------------
 
 statement ok

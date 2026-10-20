@@ -27,6 +27,11 @@
 #      before it ran it waits no more, while a setting the nodes took at their bootstrap and the profile dropped does;
 #  13. a dropped resource group drains both by themselves, and recreating it resumes them;
 #  14. the heartbeat's node_id is the document's label, and the load report carries it as acl_node_label.
+# Then the first policy (spec 015), on a catalog schema nobody wrote yet:
+#  15. the first node writes it (an issuer, the console's client, platform_admin, the resource groups) and serves;
+#  16. the second node finds it and writes nothing;
+#  17. a token of the administrators' claim from the console's client is the platform's administrator (cluster and
+#      policy); the same token from another application is refused.
 # Needs docker, go, python3, curl, openssl and the hugr_node build with the e2e's postgres_scanner
 # (HUGR_NODE_E2E=1 GEN=ninja make). A missing tool or build is a SKIP (exit 0) on a developer's machine; CI asserts the
 # run happened.
@@ -55,6 +60,7 @@ TS_PORT="${TRESOR_SERVER_PORT:-18643}"
 REPO_PORT="${REPOSITORY_PORT:-18744}"
 CP_PORT="${CONTROL_PLANE_PORT:-18745}"
 ORCH_PORT="${ORCHESTRATOR_PORT:-18746}"
+IDP_PORT="${IDP_PORT:-18747}"
 FLIGHT_A_PORT="${FLIGHT_A_PORT:-18311}"
 FLIGHT_B_PORT="${FLIGHT_B_PORT:-18312}"
 PG_PORT="${POSTGRES_PORT:-18546}"
@@ -80,7 +86,8 @@ if [ -n "$NODE_IMAGE" ]; then
 	docker image inspect "$NODE_IMAGE" >/dev/null 2>&1 || fail "no image $NODE_IMAGE"
 fi
 [ -f "$ROOT/tresor/server/docker-compose.yml" ] || skip "no tresor submodule (git submodule update --init tresor)"
-for port in "$TS_PORT" "$REPO_PORT" "$CP_PORT" "$PG_PORT" "$FLIGHT_PORT" "$ORCH_PORT" "$FLIGHT_A_PORT" "$FLIGHT_B_PORT"; do
+for port in "$TS_PORT" "$REPO_PORT" "$CP_PORT" "$PG_PORT" "$FLIGHT_PORT" "$ORCH_PORT" "$IDP_PORT" "$FLIGHT_A_PORT" \
+	"$FLIGHT_B_PORT"; do
 	if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then fail "127.0.0.1:$port is taken"; fi
 done
 
@@ -89,7 +96,7 @@ COMPOSE=(docker compose -p hugr-node-bootstrap-kc -f "$ROOT/tresor/server/docker
 PG_CONTAINER="hugr-node-bootstrap-pg"
 cleanup() {
 	for pid in "${NODE_PID:-}" "${NODE_A_PID:-}" "${NODE_B_PID:-}" "${SERVER_PID:-}" "${KISTA_PID:-}" "${CP_PID:-}" \
-		"${ORCH_PID:-}"; do
+		"${ORCH_PID:-}" "${IDP_PID:-}"; do
 		[ -n "$pid" ] && kill "$pid" 2>/dev/null || true
 	done
 	docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
@@ -379,7 +386,7 @@ printf 'orch-token-a' >"$TMP/orch-token-a"
 printf 'orch-token-b' >"$TMP/orch-token-b"
 cat >"$TMP/orch.py" <<'PY'
 import http.server, json, ssl, sys
-prefix, ts_host, issuer, cert, key, port, beats = sys.argv[1:8]
+prefix, ts_host, issuer, cert, key, port, beats, overlay = sys.argv[1:9]
 labels = {"Bearer orch-token-a": "hugr-node-e2e-a", "Bearer orch-token-b": "hugr-node-e2e-b"}
 class Handler(http.server.BaseHTTPRequestHandler):
     def answer(self, status, body=b""):
@@ -393,6 +400,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                "tresor": {"host": ts_host, "identity": {"issuer": issuer, "client_id": "keynode", "scope": ""}},
                "repository": {"name": "hugr", "prefix": prefix},
                "catalog": {"secret": "hugr_policy_catalog", "schema": "acl"}, "heartbeat": {"interval_seconds": 2}}
+        try:
+            doc.update(json.load(open(overlay)))   # what a later part of the run answers instead
+        except FileNotFoundError:
+            pass
         self.answer(200, json.dumps(doc).encode())
     def do_POST(self):
         label = labels.get(self.headers.get("Authorization"))
@@ -408,7 +419,8 @@ ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, key)
 server.socket = ctx.wrap_socket(server.socket, server_side=True)
 server.serve_forever()
 PY
-python3 "$TMP/orch.py" "$PREFIX" "$TS_HOST" "$ISSUER" "$TMP/tls.crt" "$TMP/tls.key" "$ORCH_PORT" "$TMP/beats.jsonl" &
+python3 "$TMP/orch.py" "$PREFIX" "$TS_HOST" "$ISSUER" "$TMP/tls.crt" "$TMP/tls.key" "$ORCH_PORT" "$TMP/beats.jsonl" \
+	"$TMP/doc-overlay.json" &
 ORCH_PID=$!
 for _ in $(seq 50); do curl -s -o /dev/null --cacert "$TMP/ca.pem" "https://127.0.0.1:$ORCH_PORT/" && break; sleep 0.1; done
 
@@ -586,4 +598,112 @@ for node in a b; do
 	}
 done
 echo "ok: both orchestrated nodes stopped cleanly on SIGTERM"
+
+# --- spec 015: the first policy - written by the first node on a catalog nobody wrote yet ---------------------------
+# the platform's IdP: a discovery document and its keys over https (the node reads keys over https only), and tokens
+# signed with its key here
+IDP="https://127.0.0.1:$IDP_PORT/idp"
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$TMP/idp-key.pem" 2>/dev/null
+cat >"$TMP/idp.py" <<'PY'
+import base64, http.server, json, ssl, subprocess, sys
+key, cert, tls_key, port = sys.argv[1:5]
+iss = "https://127.0.0.1:%s/idp" % port
+modulus = subprocess.run(["openssl", "rsa", "-in", key, "-noout", "-modulus"], capture_output=True, text=True,
+                         check=True).stdout.strip().split("=", 1)[1]
+b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+docs = {"/idp/.well-known/openid-configuration": {"issuer": iss, "jwks_uri": iss + "/jwks",
+                                                  "id_token_signing_alg_values_supported": ["RS256"]},
+        "/idp/jwks": {"keys": [{"kty": "RSA", "kid": "e2e", "use": "sig", "alg": "RS256",
+                                "n": b64(bytes.fromhex(modulus)), "e": "AQAB"}]}}
+class Handler(http.server.BaseHTTPRequestHandler):
+    def head(self):
+        body = json.dumps(docs[self.path]).encode() if self.path in docs else b""
+        self.send_response(200 if body else 404); self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Type", "application/json"); self.end_headers()
+        return body
+    def do_HEAD(self): self.head()
+    def do_GET(self): self.wfile.write(self.head())
+    def log_message(self, *args): pass
+server = http.server.ThreadingHTTPServer(("127.0.0.1", int(port)), Handler)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cert, tls_key)
+server.socket = ctx.wrap_socket(server.socket, server_side=True)
+server.serve_forever()
+PY
+cat >"$TMP/mint.py" <<'PY'
+import base64, json, subprocess, sys, time
+key, iss, aud, azp, roles = sys.argv[1:6]
+b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+now = int(time.time())
+head = b64(json.dumps({"alg": "RS256", "typ": "JWT", "kid": "e2e"}).encode())
+body = b64(json.dumps({"iss": iss, "aud": aud, "azp": azp, "sub": "admin-1", "roles": json.loads(roles), "iat": now,
+                       "exp": now + 600}).encode())
+sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key], input=(head + "." + body).encode(),
+                     capture_output=True, check=True).stdout
+print(head + "." + body + "." + b64(sig))
+PY
+python3 "$TMP/idp.py" "$TMP/idp-key.pem" "$TMP/tls.crt" "$TMP/tls.key" "$IDP_PORT" &
+IDP_PID=$!
+for _ in $(seq 50); do curl -sf -o /dev/null --cacert "$TMP/ca.pem" "$IDP/jwks" && break; sleep 0.1; done
+
+# the operator's platform names its first policy: the orchestrator answers it from here on, with a catalog schema
+# nobody wrote and a group of its own
+cat >"$TMP/doc-overlay.json" <<EOF
+{"node_group": "first", "catalog": {"secret": "hugr_policy_catalog", "schema": "acl_first"},
+ "first_policy": {"issuer": {"name": "platform_idp", "url": "$IDP", "audiences": ["api://hugr"], "roles_claim": "roles"},
+                  "clients": [{"name": "console", "client_id": "hugr-console"}], "administrators": "hugr-admins",
+                  "resource_groups": [{"name": "first", "default": true}, {"name": "second"}]}}
+EOF
+start_orchestrated_node a "$FLIGHT_A_PORT" "$TMP/node-a-first.log"
+grep_ready() { grep -q 'hugr_node: ready' "$TMP/node-a-first.log"; }
+wait_for 90 grep_ready || {
+	redact <"$TMP/node-a-first.log" >&2
+	fail "the node on an empty catalog did not become ready"
+}
+grep -q 'step 5 first policy: written - issuer platform_idp, 1 client(s), 2 resource group(s)' "$TMP/node-a-first.log" ||
+	fail "the first node did not write the first policy"
+echo "ok: the first node on an empty catalog wrote the first policy and serves"
+start_orchestrated_node b "$FLIGHT_B_PORT" "$TMP/node-b-first.log"
+grep_ready() { grep -q 'hugr_node: ready' "$TMP/node-b-first.log"; }
+wait_for 90 grep_ready || {
+	redact <"$TMP/node-b-first.log" >&2
+	fail "the second node on the first policy's catalog did not become ready"
+}
+grep -q 'step 5 first policy: the catalog holds its policy - nothing written' "$TMP/node-b-first.log" &&
+	! grep -q 'first policy: written\|step 5 first policy: ok' "$TMP/node-b-first.log" ||
+	fail "the second node wrote the first policy again"
+echo "ok: the second node found the first policy and wrote nothing"
+
+# the administrators' token from the console's client is the platform's administrator; from another application, no one
+as_principal() { # <azp> <sql>: an operator's process on the catalog, the statement under the token
+	local token
+	token="$(python3 "$TMP/mint.py" "$TMP/idp-key.pem" "$IDP" api://hugr "$1" '["hugr-admins"]')"
+	echo "LOAD '$PGEXT';"
+	echo "SET GLOBAL ca_cert_file = '$TMP/ca.pem';"
+	echo "ATTACH 'host=127.0.0.1 port=$PG_PORT dbname=postgres user=postgres password=pg-e2e' AS pg (TYPE postgres);"
+	echo "SELECT acl_use_db('pg', 'acl_first');"
+	echo "ACL TOKEN '$token' $2;"
+}
+as_principal hugr-console "SELECT bundles FROM platform.console_info()" >"$TMP/fp-admin.sql"
+"$DUCKDB" -no-agent -unsigned -csv -noheader <"$TMP/fp-admin.sql" >"$TMP/fp-admin.log" 2>&1 || true
+bundles="$(grep -E '^"?\[' "$TMP/fp-admin.log" || true)" # the row, not an error's text
+[[ "$bundles" == *cluster* && "$bundles" == *policy* ]] || {
+	redact <"$TMP/fp-admin.log" >&2
+	fail "the administrators' token from the console's client is not the platform's administrator"
+}
+as_principal another-app "SELECT bundles FROM platform.console_info()" >"$TMP/fp-other.sql"
+"$DUCKDB" -no-agent -unsigned -csv -noheader <"$TMP/fp-other.sql" >"$TMP/fp-other.log" 2>&1 || true
+grep -q 'token rejected: no client of issuer "platform_idp" accepts this token' "$TMP/fp-other.log" || {
+	redact <"$TMP/fp-other.log" >&2
+	fail "a token of another application was not refused"
+}
+echo "ok: the administrators' token from the console's client holds cluster and policy; from another application it is refused"
+
+for node in a b; do
+	pid_var="NODE_$(echo "$node" | tr a-z A-Z)_PID"
+	kill -TERM "${!pid_var}"
+	status=0
+	wait "${!pid_var}" || status=$?
+	eval "$pid_var="
+	[ "$status" = 0 ] || fail "node $node on the first policy's catalog did not stop cleanly (exit $status)"
+done
 echo "PASS: a node bootstraps itself"

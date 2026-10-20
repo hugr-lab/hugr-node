@@ -141,6 +141,30 @@ refused then: the orchestrator's document names them. `HUGR_POD_*` and `HUGR_TEM
   attached.
 - **The node's name.** The node sets `acl_node_group` and `acl_node_label` from the document. Its sessions carry the
   label, so a front routes by it.
+- **The first policy** (spec 015). A platform installed from nothing has an empty catalog: no token verifies, and a
+  node whose group the policy lacks refuses everyone. The document may carry the platform's first policy, as names,
+  never SQL:
+
+  ```json
+  "first_policy": {
+    "issuer": {"name": "corp", "url": "https://login.example/t/v2.0", "audiences": ["api://hugr"],
+               "roles_claim": "roles"},
+    "clients": [{"name": "console", "client_id": "<the console's application id>"}],
+    "administrators": "hugr-admins",
+    "resource_groups": [{"name": "etl", "default": true}, {"name": "bi"}]
+  }
+  ```
+
+  - A database that holds no schema yet is opened with `acl_use_db`'s `init`, which creates it (and never migrates).
+  - It writes the policy only while the catalog lists no role mapping and no issuer but this one. The policy: the
+    issuer; a client per application, accepting only that application's tokens (`AZP`); the role `platform_admin`
+    with `cluster` and `policy`, mapped from the `administrators` value of the roles claim for each client; each
+    resource group (one default), bound to `platform_admin`.
+  - The mappings are written last, so a start that stopped part-way is completed by the next one, and a catalog that
+    has its policy is never written again.
+  - Every field is required, nothing is named twice, and the node's own group must be among the resource groups.
+  - `platform_admin` holds no `passthrough`, so it cannot hand out administration: grant a bundle, map a claim to an
+    administering role, or change the issuer or a client that carries such a mapping.
 - **The engine follows the pod.**
   - The defaults: `memory_limit` at 80% of the pod's memory, `threads` at its CPU, `max_temp_directory_size` at 90%
     of the spill volume.
