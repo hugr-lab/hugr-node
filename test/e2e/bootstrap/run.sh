@@ -30,8 +30,8 @@
 # Then the first policy (spec 015), on a catalog schema nobody wrote yet:
 #  15. the first node writes it (an issuer, the console's client, platform_admin, the resource groups) and serves;
 #  16. the second node finds it and writes nothing;
-#  17. a token of the administrators' claim from the console's client is the platform's administrator (cluster and
-#      policy); the same token from another application is refused.
+#  17. a token of the administrators' claim from the console's client is the platform's administrator (cluster,
+#      policy, passthrough); the same token from another application is refused.
 # Needs docker, go, python3, curl, openssl and the hugr_node build with the e2e's postgres_scanner
 # (HUGR_NODE_E2E=1 GEN=ninja make). A missing tool or build is a SKIP (exit 0) on a developer's machine; CI asserts the
 # run happened.
@@ -686,7 +686,7 @@ as_principal() { # <azp> <sql>: an operator's process on the catalog, the statem
 as_principal hugr-console "SELECT bundles FROM platform.console_info()" >"$TMP/fp-admin.sql"
 "$DUCKDB" -no-agent -unsigned -csv -noheader <"$TMP/fp-admin.sql" >"$TMP/fp-admin.log" 2>&1 || true
 bundles="$(grep -E '^"?\[' "$TMP/fp-admin.log" || true)" # the row, not an error's text
-[[ "$bundles" == *cluster* && "$bundles" == *policy* ]] || {
+[[ "$bundles" == *cluster* && "$bundles" == *policy* && "$bundles" == *passthrough* ]] || {
 	redact <"$TMP/fp-admin.log" >&2
 	fail "the administrators' token from the console's client is not the platform's administrator"
 }
@@ -696,7 +696,7 @@ grep -q 'token rejected: no client of issuer "platform_idp" accepts this token' 
 	redact <"$TMP/fp-other.log" >&2
 	fail "a token of another application was not refused"
 }
-echo "ok: the administrators' token from the console's client holds cluster and policy; from another application it is refused"
+echo "ok: the administrators' token from the console's client holds cluster, policy and passthrough; from another application it is refused"
 
 for node in a b; do
 	pid_var="NODE_$(echo "$node" | tr a-z A-Z)_PID"

@@ -698,6 +698,8 @@ vector<PlanStep> FirstPolicySteps(const BootstrapDocument &doc, const std::set<s
 	add("ACL ADMIN CREATE ROLE IF NOT EXISTS " + string(FIRST_ADMIN_ROLE));
 	add("ACL ADMIN GRANT ADMIN cluster TO ROLE " + string(FIRST_ADMIN_ROLE));
 	add("ACL ADMIN GRANT ADMIN policy TO ROLE " + string(FIRST_ADMIN_ROLE));
+	// the owner (2026-10-20): the platform's administrator hands out administration and holds the break-glass door
+	add("ACL ADMIN GRANT ADMIN passthrough TO ROLE " + string(FIRST_ADMIN_ROLE));
 	for (auto &group : policy.resource_groups) {
 		if (!held_groups.count(group.name)) {
 			add("ACL ADMIN CREATE RESOURCE GROUP " + Ident(group.name) + (group.is_default ? " DEFAULT" : ""));

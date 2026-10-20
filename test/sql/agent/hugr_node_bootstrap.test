@@ -334,6 +334,7 @@ WHERE step IN ('5 first policy', '6 engine', '6 profile') OR sql LIKE '%acl_use_
 5 first policy	ACL ADMIN CREATE ROLE IF NOT EXISTS platform_admin
 5 first policy	ACL ADMIN GRANT ADMIN cluster TO ROLE platform_admin
 5 first policy	ACL ADMIN GRANT ADMIN policy TO ROLE platform_admin
+5 first policy	ACL ADMIN GRANT ADMIN passthrough TO ROLE platform_admin
 5 first policy	ACL ADMIN CREATE RESOURCE GROUP "etl" DEFAULT
 5 first policy	ACL ADMIN GRANT RESOURCE GROUP "etl" TO ROLE platform_admin
 5 first policy	ACL ADMIN CREATE RESOURCE GROUP "bi-x"
@@ -367,6 +368,9 @@ ACL ADMIN GRANT ADMIN cluster TO ROLE platform_admin;
 
 statement ok
 ACL ADMIN GRANT ADMIN policy TO ROLE platform_admin;
+
+statement ok
+ACL ADMIN GRANT ADMIN passthrough TO ROLE platform_admin;
 
 statement ok
 ACL ADMIN CREATE RESOURCE GROUP "etl" DEFAULT;
@@ -433,6 +437,7 @@ query II
 SELECT role, scope FROM fp_store.acl.admins ORDER BY scope;
 ----
 platform_admin	cluster
+platform_admin	passthrough
 platform_admin	policy
 
 # a document without a first policy writes nothing and opens the catalog as it is

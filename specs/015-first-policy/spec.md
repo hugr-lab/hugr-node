@@ -62,7 +62,7 @@ and does the rest there.
      catalog with one is left alone: a later edit is never undone.
   3. **The statements.** In the node's own process, with `acl_allow_anonymous_admin` on only for them (off again
      after them, whatever failed), in this order:
-     - `CREATE ROLE IF NOT EXISTS platform_admin`, then `GRANT ADMIN cluster` and `GRANT ADMIN policy` to it;
+     - `CREATE ROLE IF NOT EXISTS platform_admin`, then `GRANT ADMIN cluster`, `policy` and `passthrough` to it;
      - for each group, `CREATE RESOURCE GROUP "<g>" [DEFAULT]`, unless the catalog holds that group already (a
        re-create would replace its limits), and `GRANT RESOURCE GROUP "<g>" TO ROLE platform_admin`;
      - `CREATE ISSUER IF NOT EXISTS "<name>" URL '<url>'`;
@@ -92,10 +92,11 @@ and does the rest there.
   a later edit changes nothing.
 - **The node writes the policy unprefixed** (anonymous admin) only before its doors open, and only these statements.
   The setting is off again before the engine step, and the doors refuse to serve while it is on.
-- **What `platform_admin` cannot do.** It holds `cluster` and `policy`, never `passthrough`. In duckdb-acl, handing
-  out administration is passthrough's alone (spec 117): granting a bundle, mapping a claim to a role that
-  administers, giving a mapped role a catalog's `manage`, and changing the issuer or a client that carries such a
-  mapping.
+- **`platform_admin` holds `passthrough` too** (the owner, 2026-10-20). In duckdb-acl, handing out administration is
+  passthrough's alone (spec 117): granting a bundle, mapping a claim to a role that administers, giving a mapped role
+  a catalog's `manage`, and changing the issuer or a client that carries such a mapping. Without it the platform's
+  administrator could do none of that, and no one in a deployed platform holds it otherwise. It is also `ACL NATIVE`,
+  the break-glass door. So the administrators' claim value is the platform's most powerful one: give it to few.
 
 ## Testing
 
@@ -105,8 +106,8 @@ and does the rest there.
   what is wrong.
 - **The bootstrap e2e** (`test/e2e/bootstrap/run.sh`, checks 15-17): a node started on an empty catalog schema with a
   first policy writes it and serves, and a second node writes nothing. A token of the administrators' claim from the
-  console's client holds `cluster` and `policy` (`platform.console_info()`), against an IdP served over https in the
-  run. The same token from another application is refused.
+  console's client holds `cluster`, `policy` and `passthrough` (`platform.console_info()`), against an IdP served over
+  https in the run. The same token from another application is refused.
 - **hugr-platform's demo** (its spec 004) keeps its seed for now. The seed writes an issuer and mappings first, so
   the first policy is skipped there. Moving the demo's policy to the administrator's path (the console, the front) is
   its own step.

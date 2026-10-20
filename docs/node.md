@@ -157,14 +157,14 @@ refused then: the orchestrator's document names them. `HUGR_POD_*` and `HUGR_TEM
 
   - A database that holds no schema yet is opened with `acl_use_db`'s `init`, which creates it (and never migrates).
   - It writes the policy only while the catalog lists no role mapping and no issuer but this one. The policy: the
-    issuer; a client per application, accepting only that application's tokens (`AZP`); the role `platform_admin`
-    with `cluster` and `policy`, mapped from the `administrators` value of the roles claim for each client; each
-    resource group (one default), bound to `platform_admin`.
+    issuer; a client per application, accepting only that application's tokens (`AZP`); the role `platform_admin` with
+    `cluster`, `policy` and `passthrough`, mapped from the `administrators` value of the roles claim for each client;
+    each resource group (one default), bound to `platform_admin`.
   - The mappings are written last, so a start that stopped part-way is completed by the next one, and a catalog that
     has its policy is never written again.
   - Every field is required, nothing is named twice, and the node's own group must be among the resource groups.
-  - `platform_admin` holds no `passthrough`, so it cannot hand out administration: grant a bundle, map a claim to an
-    administering role, or change the issuer or a client that carries such a mapping.
+  - `platform_admin` holds `passthrough`: it hands out administration and has `ACL NATIVE`, the break-glass door. Give
+    the administrators' claim value to few.
 - **The engine follows the pod.**
   - The defaults: `memory_limit` at 80% of the pod's memory, `threads` at its CPU, `max_temp_directory_size` at 90%
     of the spill volume.
