@@ -20,7 +20,10 @@ The hugr platform's part of a node, on top of [duckdb-acl](https://github.com/hu
 - **the node in an orchestrated cluster** - with `HUGR_ORCHESTRATOR` the node enters through hugr-platform's operator
   with its pod's own token, sizes its engine from the pod, and ticks: the profile's hot items applied on every node,
   restart and drain items reported pending, a self-drain when its resource group is gone, and the heartbeat
-  (spec 010, [docs/node.md](docs/node.md)).
+  (spec 010, [docs/node.md](docs/node.md));
+- **the first policy** - a platform installed from nothing: the first node on a catalog nobody administers writes the
+  IdP, the console's client, `platform_admin` and the resource groups its bootstrap document names (spec 015,
+  [docs/node.md](docs/node.md)).
 
 duckdb-acl is the open node's access control (MIT), tresor its client of the secrets service (MIT), acl-otel its
 OpenTelemetry export (BUSL). This repository builds one extension, `hugr_node`, from the three and its own part, which plugs into acl through the registration points

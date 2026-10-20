@@ -61,6 +61,23 @@ struct AgentEnvironment {
 	}
 };
 
+//! Spec 015 (version 2): the platform's first policy - an IdP, the applications whose tokens count, the claim value
+//! that makes the administrators, the deployment's resource groups. Names and values, never SQL nor a secret
+struct FirstPolicy {
+	string issuer_name, issuer_url, roles_claim;
+	vector<string> audiences;
+	struct Client {
+		string name, client_id;
+	};
+	vector<Client> clients;
+	string administrators;
+	struct Group {
+		string name;
+		bool is_default = false;
+	};
+	vector<Group> resource_groups;
+};
+
 //! What the control plane answers at GET <HUGR_CONTROL_PLANE>/v1/bootstrap (version 1), or the orchestrator at
 //! GET <HUGR_ORCHESTRATOR>/v1/bootstrap (version 2, spec 010): pointers and names, never a secret
 struct BootstrapDocument {
@@ -75,6 +92,9 @@ struct BootstrapDocument {
 	string node_label;
 	string tresor_host, tresor_issuer, tresor_client_id, tresor_scope;
 	int64_t heartbeat_interval = 15;
+	//! version 2 (spec 015): written by the node that attaches a catalog nobody administers yet
+	bool has_first_policy = false;
+	FirstPolicy first_policy;
 
 	//! refuses an unknown version, a missing field (named) and a prefix that is not https
 	static BootstrapDocument Parse(const string &json);
