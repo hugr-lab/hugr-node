@@ -5,7 +5,7 @@
 # Built by the release workflow on each platform's own runner from that platform's assets
 # (scripts/release_assets.sh); the build context is the assets directory:
 #   docker build -f docker/Dockerfile --build-arg VERSION=<tag> --build-arg REVISION=<sha> \
-#       --build-arg DUCKDB_VERSION=<source id> <assets dir>
+#       --build-arg DUCKDB_VERSION=<the release manifest's duckdb_version: v2.0.0> <assets dir>
 #
 # ubuntu:24.04 is the glibc the binary was built against (the ubuntu-24.04 runners). tini is PID 1: it forwards
 # SIGTERM, so a node stopped during its bootstrap ends at once (its own handler serves only once the doors are open)
