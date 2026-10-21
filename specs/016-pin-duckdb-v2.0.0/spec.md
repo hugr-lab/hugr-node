@@ -51,3 +51,8 @@ Run on macOS, all green:
   published to kista as `v2.0.0`, the release kind), the hugr type across processes and its identity through tresor.
 
 On the PR: CI, the release's dry run (the image's e2e, now with a v2.0.0 channel) and the distribution build.
+
+## Addendum (2026-10-21): tresor at its first release
+
+tresor tagged v0.1.0 at 550791c: 036180c and docs only (protocol version 1, the CHANGELOG, the release's wording), its
+pins unchanged (duckdb v2.0.0, ext-common v0.13.0, `ACL_COMMIT` 41ec046). hugr_node pins the tag: 036180c → 550791c.
