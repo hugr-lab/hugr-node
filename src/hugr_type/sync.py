@@ -37,8 +37,10 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 ACL = ROOT / "duckdb-acl"
 QUACK = ACL / "third_party" / "quack"
-# duckdb's patches for quack: hugr-node's duckdb's, which must be duckdb-acl's pin (checked in main())
+# duckdb's patches for quack: hugr-node's duckdb's, which must be duckdb-acl's pin (checked in main()); applied only
+# when duckdb's own quack.cmake applies them (v2.0.0's carries none, as duckdb-acl's sync reads it, its spec 141)
 DUCKDB_PATCHES = ROOT / "duckdb" / ".github" / "patches" / "extensions" / "quack"
+DUCKDB_QUACK_CONFIG = ROOT / "duckdb" / ".github" / "config" / "extensions" / "quack.cmake"
 OUR_PATCHES = ROOT / "src" / "hugr_type" / "patches"
 OUT = ROOT / "src" / "hugr_type"
 
@@ -202,9 +204,17 @@ def patched_source(commit):
     scratch = pathlib.Path(tempfile.mkdtemp(prefix="hugr-type-sync-"))
     shutil.copytree(QUACK / "src", scratch / "src")
     duckdb_patches = sorted(DUCKDB_PATCHES.glob("*.patch"))
-    if not duckdb_patches:
-        # a copy made without them would compile against the wrong duckdb and pass the sync
-        sys.exit(f"sync: no quack patches under {DUCKDB_PATCHES} - is duckdb-acl's duckdb checked out?")
+    if not DUCKDB_QUACK_CONFIG.exists():
+        sys.exit(f"sync: no {DUCKDB_QUACK_CONFIG} - is hugr-node's duckdb checked out?")
+    if "APPLY_PATCHES" in DUCKDB_QUACK_CONFIG.read_text():
+        if not duckdb_patches:
+            # a copy made without them would compile against the wrong duckdb and pass the sync
+            sys.exit(f"sync: duckdb's quack.cmake applies patches, and none are under {DUCKDB_PATCHES}")
+    else:
+        # duckdb builds this quack as it is: so do the copies, and a patch left in duckdb's tree is not applied
+        if duckdb_patches:
+            sys.exit(f"sync: duckdb's quack.cmake applies no patches, yet {DUCKDB_PATCHES} holds some")
+        print("duckdb carries no patches for this quack: its src as it is, with ours")
     for patch in duckdb_patches + sorted(OUR_PATCHES.glob("*.patch")):
         targets = re.findall(r"^\+\+\+ b/(\S+)", patch.read_text(), flags=re.M)
         if targets and not any(t.startswith("src/") for t in targets):

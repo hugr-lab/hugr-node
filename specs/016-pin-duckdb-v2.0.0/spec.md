@@ -26,6 +26,10 @@ day:
   `dev` kind. It used to refuse a release ("register it with its C API version by hand"). A CPP build is served under
   its exact version, so it needs no C API maximum.
 - **The distribution builds the tag**: `duckdb_version: v2.0.0`.
+- **The hugr type's copy of quack's client** (spec 011) follows duckdb-acl's quack, f96420e. duckdb applies no patches
+  to quack since v2.0.0, so `src/hugr_type/sync.py` copies it as it is (with ours), as duckdb-acl's sync does. It
+  refused a pin without duckdb patches before - found by this PR's CI. The copied files are unchanged but their
+  banner.
 - **The release's extensions** follow duckdb-acl's pins (spec 008): postgres_scanner c0f5a3c, ducklake 417a911, mssql
   7e1bb1c (until its own re-pin, #511, merges).
 - **Nothing in `src/` changes.**
