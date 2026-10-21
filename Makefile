@@ -16,6 +16,10 @@ VCPKG_TOOLCHAIN_PATH ?= $(PROJ_DIR)vcpkg/scripts/buildsystems/vcpkg.cmake
 # (spec 026) found it. hugr_node builds duckdb from the pinned source, as they do.
 override DUCKDB_PREBUILT_LIBRARY :=
 override DUCKDB_PREBUILT_EXTENSIONS :=
+# Spec 016: the pin is duckdb's v2.0.0 tag, and duckdb 2.0 no longer reads `git describe` - a build is
+# v2.0.0-dev<commits>, its extensions' folder the commit, unless the version is given. Given here, the node and the
+# extensions of its release are v2.0.0: what DuckDB's own repositories serve, and what kista mirrors. Bump with the pin.
+export DUCKDB_VERSION ?= v2.0.0
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # --- the platform part's C++ test (duckdb-acl's style: one program per test/cpp/test_*.cpp, linked against the

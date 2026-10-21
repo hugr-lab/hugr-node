@@ -20,12 +20,12 @@ for file in "$@"; do
 	meta="$(python3 "$HERE/ext_footer.py" "$file")"
 	name="$(field "$meta" name)"
 	version="$(field "$meta" duckdb_version)"
-	case "$version" in
-	v*) echo "publish_to_kista: $file is built for the release $version - register it with its C API version by hand" >&2
-		exit 1 ;;
-	esac
+	# a release's builds (vX.Y.Z) are kista's release kind, a commit's its dev kind; a CPP build is served under its
+	# exact version, so it needs no C API maximum
+	kind=dev
+	case "$version" in v[0-9]*.[0-9]*.[0-9]*) kind=release ;; esac
 	if ! ka version list | grep -qw -- "$version"; then
-		ka version add "$version" -kind dev >/dev/null
+		ka version add "$version" -kind "$kind" >/dev/null
 	fi
 	if ! ka channel versions "$CHANNEL" | grep -qx -- "$version"; then
 		ka channel versions "$CHANNEL" -add "$version" >/dev/null
