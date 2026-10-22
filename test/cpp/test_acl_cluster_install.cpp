@@ -3,9 +3,9 @@
 // a version and a repository - the repository's signature, which DuckDB verifies at every INSTALL and
 // LOAD, is the integrity check, and a SHA256 clause is refused. The repository is a local directory in duckdb's
 // versioned layout
-// (<repo>/<name>/<version>/<revision>/<platform>/<name>.duckdb_extension.gz), holding this build's
-// own postgres_scanner - a loadable built against this exact duckdb. Skipped when the build has none
-// (a plain build: postgres_scanner comes with ACL_INTEGRATION=1).
+// (<repo>/<name>/<version>/<revision>/<platform>/<name>.duckdb_extension.gz), holding postgres_scanner as DuckDB
+// publishes it for this build's version and platform (extensions.duckdb.org - DuckDB v2.0.0 is released, spec 019):
+// every build runs the test, not only one that makes the scanner. Skipped when it cannot be fetched (offline).
 // Build + run via `GEN=ninja make test-cpp`.
 
 #include "acl_test_util.hpp"
@@ -14,7 +14,6 @@
 #include "duckdb/main/extension_helper.hpp"
 
 #include <cstdlib>
-#include <sys/stat.h>
 #include <unistd.h>
 
 using namespace duckdb;
@@ -22,7 +21,8 @@ using namespace acl_test;
 
 namespace {
 
-const char *const LOADABLE = "build/release/extension/postgres_scanner/postgres_scanner.duckdb_extension";
+//! DuckDB's own repository: what kista mirrors
+const char *const PUBLISHED = "https://extensions.duckdb.org";
 
 //! A valid RSA public key (duckdb's own repository test key): the repository needs one pinned; the
 //! loadable is unsigned, which allow_unsigned_extensions admits in this test only
@@ -50,11 +50,6 @@ bool Refused(Connection &con, const std::string &sql, const std::string &why) {
 
 int main() {
 	return RunMain("the cluster profile installs from a trusted repository (specs 093, 103)", [] {
-		struct stat info;
-		if (stat(LOADABLE, &info) != 0) {
-			std::cout << "  SKIP: no postgres_scanner loadable in this build (ACL_INTEGRATION=1 builds one)\n";
-			return;
-		}
 		char root[] = "/tmp/acl-cluster-XXXXXX";
 		if (!Check(mkdtemp(root) != nullptr, "a directory of the test's own")) {
 			return;
@@ -64,10 +59,14 @@ int main() {
 		           DuckDB::Platform();
 		Check(std::system(("mkdir -p '" + dir + "' '" + base + "/repos' '" + base + "/ext'").c_str()) == 0,
 		      "the repository's layout");
-		Check(
-		    std::system(("gzip -c '" + std::string(LOADABLE) + "' > '" + dir + "/postgres_scanner.duckdb_extension.gz'")
-		                    .c_str()) == 0,
-		    "the extension in it");
+		auto url = std::string(PUBLISHED) + "/" + ExtensionHelper::GetVersionDirectoryName() + "/" +
+		           DuckDB::Platform() + "/postgres_scanner.duckdb_extension.gz";
+		if (std::system(
+		        ("curl -fsSL --max-time 120 -o '" + dir + "/postgres_scanner.duckdb_extension.gz' '" + url + "'")
+		            .c_str()) != 0) {
+			std::cout << "  SKIP: " << url << " could not be fetched\n";
+			return;
+		}
 
 		DBConfig config;
 		config.SetOptionByName("allow_extension_repositories", Value("allowed"));
@@ -107,6 +106,34 @@ int main() {
 			        "already in the profile");
 			Refused(con, "ACL ADMIN CLUSTER UPDATE EXTENSION postgres_scanner VERSION 'v9.9.10' SHA256 'ab'",
 			        "spec 103");
+		});
+
+		Scenario("an update keeps the repository and the comment it does not name (spec 019)", [&] {
+			One(con, "ACL ADMIN CLUSTER UPDATE EXTENSION postgres_scanner VERSION 'v9.9.9' COMMENT 'the lake''s'");
+			Check(One(con, "SELECT comment FROM acl_cluster_items() WHERE name = 'postgres_scanner'") == "the lake's",
+			      "COMMENT sets the comment");
+			// a second trusted repository: an update naming none keeps the item's, never refused for the choice
+			Exec(con, "CREATE EXTENSION REPOSITORY other WITH PREFIX '" + base + "/repo' USING PUBLIC KEY '" +
+			              PUBLIC_KEY + "'");
+			auto answer = One(con, "ACL ADMIN CLUSTER UPDATE EXTENSION postgres_scanner VERSION 'v9.9.10'");
+			Check(answer.find("'class': restart") != std::string::npos, "an update with two repositories: " + answer);
+			auto spec = One(con, "SELECT spec FROM acl_cluster_items() WHERE name = 'postgres_scanner'");
+			Check(spec.find("\"repository\": \"trusted\"") != std::string::npos &&
+			          spec.find("\"version\": \"v9.9.10\"") != std::string::npos,
+			      "the item's repository kept, its version moved: " + spec);
+			Check(One(con, "SELECT comment FROM acl_cluster_items() WHERE name = 'postgres_scanner'") == "the lake's",
+			      "and its comment kept");
+			Refused(con, "ACL ADMIN CLUSTER UPDATE EXTENSION postgres_scanner VERSION 'v9.9.11' FROM nowhere",
+			        "not a trusted repository");
+			Check(One(con, "SELECT spec FROM acl_cluster_items() WHERE name = 'postgres_scanner'") == spec,
+			      "a refused update writes nothing");
+			One(con, "ACL ADMIN CLUSTER UPDATE EXTENSION postgres_scanner VERSION 'v9.9.10' FROM other");
+			Check(One(con, "SELECT spec FROM acl_cluster_items() WHERE name = 'postgres_scanner'")
+			              .find("\"repository\": \"other\"") != std::string::npos,
+			      "FROM moves the item to another trusted repository");
+			// an install still names its repository when the node trusts several
+			Refused(con, "ACL ADMIN CLUSTER INSTALL EXTENSION mysql_scanner VERSION 'v1'",
+			        "name the repository with FROM");
 		});
 
 		Scenario("an update or a removal is restart class: described, not applied live", [&] {

@@ -27,7 +27,7 @@ placed; `manage` and `passthrough` are placed like anyone.
 
 ```sql
 CLUSTER INSTALL EXTENSION <name> VERSION '<v>' [FROM <repository>] [IN GROUP <group>] [COMMENT '<text>']
-CLUSTER UPDATE  EXTENSION <name> VERSION '<v>' [IN GROUP <group>]
+CLUSTER UPDATE  EXTENSION <name> VERSION '<v>' [FROM <repository>] [IN GROUP <group>] [COMMENT '<text>']
 CLUSTER REMOVE  EXTENSION <name> [IN GROUP <group>]
 CLUSTER ATTACH '<path>' AS <alias> (TYPE <type> [, SECRET <secret>] [, <option> [<value>]] …)
         [LINEAGE '<identity>'] [DEPENDS ON (<alias>, …)] [IN GROUP <group>] [COMMENT '<text>']
@@ -96,7 +96,8 @@ in its heartbeat; the orchestrator rolls the nodes (hugr-node spec 010, hugr-pla
   path the node's tokens travel).
   Only a GLOBAL setting may be profiled.
 - **Extensions come from a trusted repository.** `FROM` names a repository created with duckdb's
-  `CREATE EXTENSION REPOSITORY`; with exactly one, it may be left out. A path, a URL, `core` and
+  `CREATE EXTENSION REPOSITORY`; with exactly one, an install may leave it out. An update keeps what it does not name
+  (spec 019): without `FROM` the item's repository (still one the node trusts), without `COMMENT` its comment. A path, a URL, `core` and
   `community` are refused, and `VERSION` is required.
   - duckdb installs such an extension under `repositories/<repository>/` and loads it with
     `LOAD <name> FROM <repository>`.

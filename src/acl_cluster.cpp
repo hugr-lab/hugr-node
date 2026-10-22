@@ -341,6 +341,14 @@ string CurrentSpec(const ReadFn &read, CatalogBackend &catalog, const string &sc
 	return row->RowCount() == 0 ? string() : row->Collection().GetValue(0, 0).ToString();
 }
 
+//! The item's stored comment ("" when it has none)
+string CurrentComment(const ReadFn &read, CatalogBackend &catalog, const string &scope, const string &kind,
+                      const string &name) {
+	auto row = read("SELECT coalesce(\"comment\", '') FROM " + catalog.Tbl("cluster_items") + " WHERE \"scope\" = " +
+	                Lit(scope) + " AND \"kind\" = " + Lit(kind) + " AND lower(\"name\") = lower(" + Lit(name) + ")");
+	return row->RowCount() == 0 ? string() : row->Collection().GetValue(0, 0).ToString();
+}
+
 string UpsertItem(CatalogBackend &catalog, const string &scope, const string &kind, const string &name,
                   const string &spec, const string &item_class, const string &comment, bool keep_pos) {
 	auto table = catalog.Tbl("cluster_items");
@@ -493,6 +501,17 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, con
 	ClusterAnswer answer;
 	answer.item_class = v == "install" ? "hot" : "restart";
 	string repo = repository;
+	vector<string> trusted; // the node's user-provided repositories
+	auto require_trusted = [&](const string &candidate) {
+		for (auto &n : trusted) {
+			if (StringUtil::CIEquals(n, candidate)) {
+				return;
+			}
+		}
+		throw BinderException("acl cluster: \"%s\" is not a trusted repository of this node - the profile installs "
+		                      "only from a repository created with CREATE EXTENSION REPOSITORY",
+		                      candidate);
+	};
 	if (v != "remove") {
 		if (version.empty()) {
 			throw BinderException("acl cluster: an extension in the profile names its VERSION - every node installs "
@@ -503,27 +522,21 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, con
 		auto repos = NodeQuery(*db, "SELECT repository_name FROM duckdb_extension_repositories() WHERE type = "
 		                            "'USER_PROVIDED' ORDER BY 1");
 		ResultRows rows(*repos);
-		vector<string> names;
 		for (idx_t i = 0; i < rows.Count(); i++) {
-			names.push_back(rows.GetValue(0, i).ToString());
+			trusted.push_back(rows.GetValue(0, i).ToString());
 		}
-		if (repo.empty()) {
-			if (names.size() != 1) {
+		// spec 019: an update without FROM keeps the item's repository - read with the item, below
+		if (repo.empty() && v == "install") {
+			if (trusted.size() != 1) {
 				throw BinderException("acl cluster: name the repository with FROM <name> - this node trusts %s",
-				                      names.empty()
+				                      trusted.empty()
 				                          ? string("no user-provided repository (CREATE EXTENSION REPOSITORY)")
-				                          : StringUtil::Join(names, ", "));
+				                          : StringUtil::Join(trusted, ", "));
 			}
-			repo = names[0];
+			repo = trusted[0];
 		}
-		bool known = false;
-		for (auto &n : names) {
-			known = known || StringUtil::CIEquals(n, repo);
-		}
-		if (!known) {
-			throw BinderException("acl cluster: \"%s\" is not a trusted repository of this node - the profile installs "
-			                      "only from a repository created with CREATE EXTENSION REPOSITORY",
-			                      repo);
+		if (!repo.empty()) {
+			require_trusted(repo);
 		}
 	}
 	answer.version = catalog->WriteWithReads(
@@ -553,12 +566,37 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, con
 			    statements.push_back(DeleteItem(*catalog, scope, "extension", name));
 			    return;
 		    }
+		    // spec 019: an update keeps what it does not name - the item's repository (still one this node
+		    // trusts) and its comment
+		    auto note = comment;
+		    if (v == "update") {
+			    if (repository.empty()) {
+				    repo = JsonField(current, "repository");
+				    for (auto &n : trusted) {
+					    if (StringUtil::CIEquals(n, repo)) {
+						    repo = n;
+					    }
+				    }
+				    bool known = false;
+				    for (auto &n : trusted) {
+					    known = known || n == repo;
+				    }
+				    if (!known) {
+					    throw BinderException("acl cluster: extension \"%s\" comes from \"%s\", which this node no "
+					                          "longer trusts - name its repository with FROM",
+					                          name, repo);
+				    }
+			    }
+			    if (note.empty()) {
+				    note = CurrentComment(read, *catalog, scope, "extension", name);
+			    }
+		    }
 		    // spec 103: version and repository only - DuckDB verifies the repository's signature at every
 		    // INSTALL and LOAD, and a released version is immutable there; a hash of the signed file would
 		    // change with every key rotation and differ per channel for the same code
 		    auto spec = JsonObjectOf({{"version", version}, {"repository", repo}});
 		    statements.push_back(
-		        UpsertItem(*catalog, scope, "extension", name, spec, answer.item_class, comment, !current.empty()));
+		        UpsertItem(*catalog, scope, "extension", name, spec, answer.item_class, note, !current.empty()));
 	    },
 	    "config_version",
 	    [&](int64_t) {
@@ -1473,7 +1511,7 @@ unique_ptr<SQLStatement> ParseCluster(AdminScanner &s) {
 		for (;;) {
 			if (verb != "remove" && s.Accept("version")) {
 				version = s.Quoted("version");
-			} else if (verb == "install" && s.Accept("from")) {
+			} else if (verb != "remove" && s.Accept("from")) { // spec 019: an update may move the item
 				repository = s.NameValue("a repository name");
 			} else if (verb != "remove" && s.Accept("sha256")) {
 				// spec 103: refused, never ignored - a script that still pins a hash must not believe it does
