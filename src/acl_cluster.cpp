@@ -572,14 +572,9 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, con
 		    if (v == "update") {
 			    if (repository.empty()) {
 				    repo = JsonField(current, "repository");
-				    for (auto &n : trusted) {
-					    if (StringUtil::CIEquals(n, repo)) {
-						    repo = n;
-					    }
-				    }
 				    bool known = false;
 				    for (auto &n : trusted) {
-					    known = known || n == repo;
+					    known = known || StringUtil::CIEquals(n, repo);
 				    }
 				    if (!known) {
 					    throw BinderException("acl cluster: extension \"%s\" comes from \"%s\", which this node no "
