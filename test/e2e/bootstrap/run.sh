@@ -188,7 +188,10 @@ docker exec "$PG_CONTAINER" pg_isready -U postgres >/dev/null 2>&1 || fail "Post
 if [ -n "${REPOSITORY_DIR:-}" ]; then
 	kista_src="$(cd "$REPOSITORY_DIR" && pwd)"
 else
-	git clone -q --depth 1 https://github.com/hugr-lab/duckdb-extension-repository "$TMP/kista-src" || fail "no kista"
+	# the release the platform's umbrella chart pins (hugr-platform charts/hugr), never main: kista's main moves
+	# (its spec 0030 asks a version's core extensions) and would break this test from outside
+	git clone -q --depth 1 --branch "${KISTA_REF:-v0.1.4}" https://github.com/hugr-lab/duckdb-extension-repository \
+		"$TMP/kista-src" 2>/dev/null || fail "no kista at ${KISTA_REF:-v0.1.4}"
 	kista_src="$TMP/kista-src"
 fi
 (cd "$kista_src" && GOWORK=off CGO_ENABLED=0 go build -o "$TMP/bin/kista" ./cmd/kista) || fail "kista did not build"
