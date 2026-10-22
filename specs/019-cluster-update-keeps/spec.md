@@ -31,3 +31,10 @@ An update rewrote two parts of the item it did not name:
 - with a second repository trusted, an update with no `FROM` keeps the stored one, and is not refused;
 - `FROM` an untrusted repository is refused, writing nothing;
 - `COMMENT` replaces the comment.
+
+## Also
+
+The bootstrap e2e cloned kista's main, which moved (its spec 0030: a version names its core extensions) and failed
+this PR's CI from outside. It now takes the kista release the platform's umbrella chart pins (`KISTA_REF`, v0.1.4), as
+the platform's demo pins its node. `scripts/publish_to_kista.sh` follows kista's new rule when the chart moves to a
+release with it.
