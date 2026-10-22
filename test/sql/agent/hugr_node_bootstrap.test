@@ -192,6 +192,43 @@ SELECT count(*) FROM hugr_node_bootstrap_plan(doc_v2(), environment := orchestra
 ----
 0
 
+# spec 017: the upgrade's canary migrates the catalog after attaching it, before opening it
+query II
+SELECT step, sql FROM hugr_node_bootstrap_plan('{"version": 2, "node_group": "g", "node_label": "n1", "tresor": {"host": "t",
+  "identity": {"issuer": "i", "client_id": "c"}}, "repository": {"prefix": "https://ext"},
+  "catalog": {"secret": "hugr_policy_catalog", "migrate": true}}', environment := orchestrated_env())
+WHERE step = '5 policy catalog';
+----
+5 policy catalog	-- the catalog's type: the type of secret 'hugr_policy_catalog' in duckdb_secrets(), its extension from "hugr"
+5 policy catalog	ATTACH '' AS hugr_policy (TYPE <the secret's type>, SECRET "hugr_policy_catalog")
+5 policy catalog	SET GLOBAL acl_node_group = 'g'
+5 policy catalog	SET GLOBAL acl_node_label = 'n1'
+5 policy catalog	-- migrate only a catalog that has its schema: SELECT count(*) FROM duckdb_tables() WHERE database_name = 'hugr_policy' AND schema_name = 'acl' AND table_name = 'meta' answers 1
+5 policy catalog	SELECT acl_migrate_catalog('hugr_policy', 'acl')
+5 policy catalog	SELECT acl_use_db('hugr_policy', 'acl')
+
+# ...and a node the operator did not tell never migrates
+query I
+SELECT count(*) FROM hugr_node_bootstrap_plan(doc_v2(), environment := orchestrated_env())
+WHERE sql LIKE '%acl_migrate_catalog%';
+----
+0
+
+query I
+SELECT count(*) FROM hugr_node_bootstrap_plan('{"version": 2, "node_group": "g", "node_label": "n1", "tresor": {"host": "t",
+  "identity": {"issuer": "i", "client_id": "c"}}, "repository": {"prefix": "https://ext"},
+  "catalog": {"secret": "hugr_policy_catalog", "migrate": false}}', environment := orchestrated_env())
+WHERE sql LIKE '%acl_migrate_catalog%';
+----
+0
+
+statement error
+SELECT * FROM hugr_node_bootstrap_plan('{"version": 2, "node_group": "g", "node_label": "n1", "tresor": {"host": "t",
+  "identity": {"issuer": "i", "client_id": "c"}}, "repository": {"prefix": "https://ext"},
+  "catalog": {"secret": "hugr_policy_catalog", "migrate": "yes"}}', environment := orchestrated_env());
+----
+<REGEX>:.*the bootstrap document's catalog migrate is true or false.*
+
 # one source per value: what the document names is refused in the environment
 foreach variable HUGR_TRESOR HUGR_IDENTITY_ISSUER HUGR_IDENTITY_CLIENT_ID HUGR_IDENTITY_SCOPE HUGR_CONTROL_PLANE
 

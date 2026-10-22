@@ -538,6 +538,14 @@ BootstrapDocument BootstrapDocument::Parse(const string &json) {
 	if (!schema.empty()) {
 		out.catalog_schema = schema;
 	}
+	// spec 017: the canary's flag - the operator's alone, never a node's own decision
+	auto migrate = yyjson_obj_get(catalog, "migrate");
+	if (migrate && !yyjson_is_null(migrate)) {
+		if (!yyjson_is_bool(migrate)) {
+			throw InvalidInputException("hugr_node: the bootstrap document's catalog migrate is true or false");
+		}
+		out.catalog_migrate = yyjson_get_bool(migrate);
+	}
 	if (out.version == 1 && out.catalog_type.empty()) {
 		throw InvalidInputException("hugr_node: the bootstrap document's catalog has no type");
 	}
@@ -666,6 +674,13 @@ PlanStep UseCatalogStep(const BootstrapDocument &doc, bool init) {
 string CatalogSchemaSql(const BootstrapDocument &doc) {
 	return "SELECT count(*) FROM duckdb_tables() WHERE database_name = " + Quoted(POLICY_ALIAS) +
 	       " AND schema_name = " + Quoted(doc.catalog_schema) + " AND table_name = 'meta'";
+}
+
+//! spec 017: the canary migrates the catalog to its build's schema before it opens it (acl's own steps, one
+//! transaction; a catalog at the build's version answers "already")
+PlanStep MigrateCatalogStep(const BootstrapDocument &doc) {
+	return {"5 policy catalog",
+	        "SELECT acl_migrate_catalog(" + Quoted(POLICY_ALIAS) + ", " + Quoted(doc.catalog_schema) + ")"};
 }
 
 const char *FIRST_ADMIN_ROLE = "platform_admin";
@@ -816,6 +831,11 @@ vector<PlanStep> BootstrapPlan(const AgentEnvironment &env_p, const BootstrapDoc
 	if (document.has_first_policy) {
 		plan.push_back({"5 policy catalog", "-- init only while the database holds no schema: " +
 		                                        CatalogSchemaSql(document) + " answers 0"});
+	}
+	if (document.catalog_migrate) {
+		plan.push_back({"5 policy catalog",
+		                "-- migrate only a catalog that has its schema: " + CatalogSchemaSql(document) + " answers 1"});
+		plan.push_back(MigrateCatalogStep(document));
 	}
 	plan.push_back(UseCatalogStep(document, document.has_first_policy));
 	if (document.has_first_policy) {
@@ -1342,7 +1362,33 @@ void WatchGroup(DatabaseInstance &db, acl::PolicyStore &store, TickState &state)
 	state.self_drained = decision.self_drained;
 }
 
-//! the heartbeat's body: hugr-platform spec 001's contract
+//! spec 017: the catalog as this build judges it (acl_catalog_schema(), its fields by name - `catalog` is reported as
+//! `schema`), its type, and the extension the node installed from the repository for it ('' when its build links it)
+string CatalogStateJson(acl::PolicyStore &store, const BootstrapDocument &document) {
+	string out = "{\"type\":" + acl::JsonQuote(document.catalog_type) +
+	             ",\"extension\":" + acl::JsonQuote(document.catalog_extension);
+	try {
+		auto state = store.CatalogSchemaState();
+		auto &children = StructValue::GetChildren(state);
+		for (idx_t i = 0; i < children.size(); i++) {
+			auto name = StructType::GetChildName(state.type(), i).GetIdentifierName();
+			auto &v = children[i];
+			string json;
+			if (v.IsNull()) {
+				json = "null";
+			} else if (v.type().id() == LogicalTypeId::BIGINT) {
+				json = std::to_string(v.GetValue<int64_t>());
+			} else {
+				json = acl::JsonQuote(v.ToString());
+			}
+			out += "," + acl::JsonQuote(name == "catalog" ? string("schema") : name) + ":" + json;
+		}
+	} catch (std::exception &) { // NOLINT: the report says what it can
+	}
+	return out + "}";
+}
+
+//! the heartbeat's body: hugr-platform spec 001's contract, and spec 017's build and catalog
 string HeartbeatBody(DatabaseInstance &db, acl::PolicyStore &store, const BootstrapDocument &document,
                      const TickState &state) {
 	string pending = "[";
@@ -1369,8 +1415,10 @@ string HeartbeatBody(DatabaseInstance &db, acl::PolicyStore &store, const Bootst
 	}
 	return "{\"node_id\":" + acl::JsonQuote(document.node_label) +
 	       ",\"image\":" + acl::JsonQuote(HugrNodeExtension().Version()) +
-	       ",\"duckdb\":" + acl::JsonQuote(DuckDB::SourceID()) + ",\"config\":{\"target\":" + std::to_string(target) +
-	       ",\"applied\":" + std::to_string(state.applied) +
+	       ",\"duckdb\":" + acl::JsonQuote(DuckDB::SourceID()) +
+	       ",\"duckdb_version\":" + acl::JsonQuote(DuckDB::LibraryVersion()) +
+	       ",\"platform\":" + acl::JsonQuote(DuckDB::Platform()) + ",\"catalog\":" + CatalogStateJson(store, document) +
+	       ",\"config\":{\"target\":" + std::to_string(target) + ",\"applied\":" + std::to_string(state.applied) +
 	       ",\"needs_restart\":" + (state.needs_restart ? "true" : "false") + ",\"pending\":" + pending +
 	       "},\"drift\":" + drift + ",\"load\":" + load_json + "}";
 }
@@ -1487,7 +1535,17 @@ string RunPragma(ClientContext &context, const FunctionParameters &parameters) {
 			RunStep(db, step.step, step.sql);
 		}
 	}
-	auto init = document.has_first_policy && CountOf(db, "5 policy catalog", CatalogSchemaSql(document)) == 0;
+	// read only when it decides something: the listing walks every attached catalog, tresor's included
+	auto has_schema = (document.has_first_policy || document.catalog_migrate) &&
+	                  CountOf(db, "5 policy catalog", CatalogSchemaSql(document)) > 0;
+	auto init = document.has_first_policy && !has_schema;
+	if (document.catalog_migrate && has_schema) {
+		auto migrate = MigrateCatalogStep(document);
+		auto answer = RunStep(db, migrate.step, migrate.sql, false);
+		acl::ResultRows answer_rows(*answer);
+		Log("step 5 policy catalog: migrate - " +
+		    (answer_rows.Count() == 0 ? string("no answer") : answer_rows.GetValue(0, 0).ToString()));
+	}
 	auto use = UseCatalogStep(document, init);
 	RunStep(db, use.step, use.sql);
 	if (document.has_first_policy) {

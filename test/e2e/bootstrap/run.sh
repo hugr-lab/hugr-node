@@ -32,6 +32,10 @@
 #  16. the second node finds it and writes nothing;
 #  17. a token of the administrators' claim from the console's client is the platform's administrator (cluster,
 #      policy, passthrough); the same token from another application is refused.
+# Then an upgrade's catalog migration (spec 017), on the first catalog stamped one schema version back:
+#  18. a node not told to migrate stops at step 5 with acl's "migrate it first", and opens no port;
+#  19. a node told (the document's catalog.migrate) migrates it, serves, and its heartbeat carries its DuckDB release,
+#      its platform and the catalog's state at its build's version.
 # Needs docker, go, python3, curl, openssl and the hugr_node build with the e2e's postgres_scanner
 # (HUGR_NODE_E2E=1 GEN=ninja make). A missing tool or build is a SKIP (exit 0) on a developer's machine; CI asserts the
 # run happened.
@@ -706,4 +710,72 @@ for node in a b; do
 	eval "$pid_var="
 	[ "$status" = 0 ] || fail "node $node on the first policy's catalog did not stop cleanly (exit $status)"
 done
+
+# --- spec 017: an upgrade's catalog migration - the canary alone migrates, on the operator's word ---------------------
+# plain SQL on the catalog's database, outside acl: what a release older than the node's build left there
+catalog_sql() { # <sql>...
+	{
+		echo "LOAD '$PGEXT';"
+		echo "ATTACH 'host=127.0.0.1 port=$PG_PORT dbname=postgres user=postgres password=pg-e2e' AS pg (TYPE postgres);"
+		printf '%s\n' "$@"
+	} >"$TMP/catalog.sql"
+	"$DUCKDB" -no-agent -unsigned -bail -csv -noheader <"$TMP/catalog.sql" 2>&1
+}
+stamp() { catalog_sql "SELECT \"value\" FROM pg.acl.meta WHERE \"key\" = 'schema_version';" | tail -1; }
+BUILD_SCHEMA="$(stamp)"
+[[ "$BUILD_SCHEMA" =~ ^[0-9]+$ ]] || fail "the catalog's schema version cannot be read: $BUILD_SCHEMA"
+# one version back: the build's last step runs again on the next migration (acl's steps are written to allow it)
+catalog_sql "UPDATE pg.acl.meta SET \"value\" = '$((BUILD_SCHEMA - 1))' WHERE \"key\" IN ('schema_version', 'min_reader_version');" \
+	>/dev/null
+rm -f "$TMP/doc-overlay.json" # the orchestrated document again: group e2e, schema acl, no flag
+flight_a_open() { (exec 3<>"/dev/tcp/127.0.0.1/$FLIGHT_A_PORT") 2>/dev/null; }
+start_orchestrated_node a "$FLIGHT_A_PORT" "$TMP/node-a-old.log"
+a_exited() { ! kill -0 "$NODE_A_PID" 2>/dev/null; }
+wait_for 90 a_exited || fail "a node on an older catalog, not told to migrate, did not stop"
+status=0
+wait "$NODE_A_PID" || status=$?
+NODE_A_PID=""
+[ "$status" != 0 ] && grep -q 'bootstrap step "5 policy catalog" failed' "$TMP/node-a-old.log" &&
+	grep -q 'migrate it first' "$TMP/node-a-old.log" && ! flight_a_open || {
+	redact <"$TMP/node-a-old.log" >&2
+	fail "a node on an older catalog, not told to migrate, did not stop at step 5 with acl's refusal (exit $status)"
+}
+[ "$(stamp)" = "$((BUILD_SCHEMA - 1))" ] || fail "a node not told to migrate changed the catalog's stamp"
+echo "ok: a node on a catalog one schema version back, not told to migrate, stopped at step 5 and changed nothing"
+
+cat >"$TMP/doc-overlay.json" <<'EOF'
+{"catalog": {"secret": "hugr_policy_catalog", "schema": "acl", "migrate": true}}
+EOF
+: >"$TMP/beats.jsonl" # this run's heartbeats only
+start_orchestrated_node a "$FLIGHT_A_PORT" "$TMP/node-a-migrate.log"
+grep_ready() { grep -q 'hugr_node: ready' "$TMP/node-a-migrate.log"; }
+wait_for 90 grep_ready || {
+	redact <"$TMP/node-a-migrate.log" >&2
+	fail "the node told to migrate did not become ready"
+}
+grep -q "step 5 policy catalog: migrate - .* migrated from schema version $((BUILD_SCHEMA - 1)) to $BUILD_SCHEMA" \
+	"$TMP/node-a-migrate.log" || {
+	redact <"$TMP/node-a-migrate.log" >&2
+	fail "the node told to migrate did not say it migrated the catalog"
+}
+[ "$(stamp)" = "$BUILD_SCHEMA" ] || fail "the catalog is not at the build's schema version after the migration"
+label=hugr-node-e2e-a
+wait_for 20 has_beat "$label" || fail "no heartbeat from $label after the migration"
+expected_release="$("$DUCKDB" -no-agent -csv -noheader -c "SELECT library_version FROM pragma_version()")"
+expected_platform="$("$DUCKDB" -no-agent -csv -noheader -c "SELECT platform FROM pragma_platform()")"
+[ -n "$NODE_IMAGE" ] || [ "$(beat "$label" 'b["duckdb_version"]')" = "$expected_release" ] ||
+	fail "$label's heartbeat does not carry its DuckDB release: $(beat "$label" 'b.get("duckdb_version")')"
+[ -n "$NODE_IMAGE" ] || [ "$(beat "$label" 'b["platform"]')" = "$expected_platform" ] ||
+	fail "$label's heartbeat does not carry its platform: $(beat "$label" 'b.get("platform")')"
+[ "$(beat "$label" '(b["catalog"]["type"], b["catalog"]["extension"], b["catalog"]["schema"] == b["catalog"]["build"], b["catalog"]["mode"])')" = \
+	"('postgres', 'postgres_scanner', True, 'current')" ] ||
+	fail "$label's heartbeat does not carry the catalog's state at its build: $(beat "$label" 'b.get("catalog")')"
+[ "$(beat "$label" 'b["catalog"]["schema"]')" = "$BUILD_SCHEMA" ] ||
+	fail "$label reports schema $(beat "$label" 'b["catalog"]["schema"]'), the catalog is at $BUILD_SCHEMA"
+echo "ok: told to migrate, the node migrated the catalog to schema $BUILD_SCHEMA, serves, and its heartbeat says its DuckDB release, its platform and the catalog's state"
+kill -TERM "$NODE_A_PID"
+status=0
+wait "$NODE_A_PID" || status=$?
+NODE_A_PID=""
+[ "$status" = 0 ] || fail "the node that migrated the catalog did not stop cleanly (exit $status)"
 echo "PASS: a node bootstraps itself"
