@@ -95,6 +95,8 @@ struct BootstrapDocument {
 	//! version 2 (spec 015): written by the node that attaches a catalog nobody administers yet
 	bool has_first_policy = false;
 	FirstPolicy first_policy;
+	//! spec 017: the operator's word that this node (the upgrade's canary) migrates the catalog at step 5
+	bool catalog_migrate = false;
 
 	//! refuses an unknown version, a missing field (named) and a prefix that is not https
 	static BootstrapDocument Parse(const string &json);
