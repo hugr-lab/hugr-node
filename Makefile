@@ -63,8 +63,15 @@ test-e2e:
 	test/e2e/federation/run.sh
 	test/e2e/federation/tresor.sh
 
-# a local vcpkg checkout, as duckdb-acl's `make vcpkg-setup`
+# a local vcpkg checkout, as duckdb-acl's `make vcpkg-setup`: the commit duckdb's merged manifest names as its
+# builtin-baseline - an overlay port that includes the checkout's own port must find the version it was written for
+# (postgres_scanner's vcpkg-tool-meson 1.9.0 took the head's 1.12.1 portfile and downloaded 1.9.0 against 1.12.1's
+# hash; duckdb-acl since 2026-10-23, here 2026-11-05)
+VCPKG_COMMIT ?= $(shell sed -n 's/.*"builtin-baseline": "\([0-9a-f]*\)".*/\1/p' duckdb/scripts/merge_vcpkg_deps.py)
 .PHONY: vcpkg-setup
 vcpkg-setup:
+	@test -n "$(VCPKG_COMMIT)" || (echo "vcpkg-setup: no builtin-baseline in duckdb/scripts/merge_vcpkg_deps.py" && exit 1)
 	@test -d vcpkg || git clone https://github.com/microsoft/vcpkg.git vcpkg
+	@git -C vcpkg cat-file -e $(VCPKG_COMMIT)^{commit} 2>/dev/null || git -C vcpkg fetch origin
+	git -C vcpkg checkout -q --detach $(VCPKG_COMMIT)
 	./vcpkg/bootstrap-vcpkg.sh -disableMetrics

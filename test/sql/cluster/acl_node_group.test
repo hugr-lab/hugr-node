@@ -401,7 +401,7 @@ true
 statement error
 ACL ADMIN ALTER RESOURCE GROUP general SET LIMITS;
 ----
-<REGEX>:.*expected default.*
+<REGEX>:.*write ALTER RESOURCE GROUP <group> SET \(<limit> <value>, ...\) \| SET COMMENT.*
 
 statement error
 ACL ADMIN ALTER RESOURCE GROUP nosuch SET DEFAULT;
@@ -411,7 +411,7 @@ ACL ADMIN ALTER RESOURCE GROUP nosuch SET DEFAULT;
 statement error
 ACL ADMIN CREATE RESOURCE GROUP twice (max_sessions 1) DEFAULT DEFAULT;
 ----
-<REGEX>:.*acl admin: unexpected trailing text.*
+<REGEX>:.*acl admin: DEFAULT is written twice.*
 
 statement error
 SELECT acl_alter_resource_group('general', 'colour', 'true');

@@ -136,6 +136,15 @@ int main() {
 			        "name the repository with FROM");
 		});
 
+		Scenario("a source whose path names its type keeps its extension in the profile (spec 020)", [&] {
+			// a group's item is not applied on this node (it belongs to no group): the profile only
+			Exec(con, "ACL ADMIN CREATE RESOURCE GROUP far (max_sessions 1)");
+			One(con, "ACL ADMIN CLUSTER ATTACH 'postgres:dbname=x host=127.0.0.1' AS pgx (SECRET pg) IN GROUP far");
+			Refused(con, "ACL ADMIN CLUSTER REMOVE EXTENSION postgres_scanner",
+			        "source \"pgx\" needs extension \"postgres_scanner\"");
+			One(con, "ACL ADMIN CLUSTER DETACH pgx IN GROUP far");
+		});
+
 		Scenario("an update or a removal is restart class: described, not applied live", [&] {
 			auto answer = One(con, "ACL ADMIN CLUSTER UPDATE EXTENSION postgres_scanner VERSION 'v9.9.10'");
 			Check(answer.find("'class': restart") != std::string::npos &&

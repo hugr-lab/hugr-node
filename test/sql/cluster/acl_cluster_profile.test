@@ -115,6 +115,34 @@ ACL ADMIN CLUSTER ATTACH 'host=db dbname=sales' AS pg (TYPE postgres);
 ----
 <REGEX>:.*connects with a credential - name the secret.*
 
+# spec 020: a path that names its type needs the secret as TYPE does
+statement error
+ACL ADMIN CLUSTER ATTACH 'postgres:dbname=sales host=db' AS pg;
+----
+<REGEX>:.*a postgres source connects with a credential - name the secret.*
+
+statement error
+ACL ADMIN CLUSTER ATTACH 'mysql:host=db database=sales' AS my;
+----
+<REGEX>:.*a mysql source connects with a credential - name the secret.*
+
+# spec 020: TYPE and SECRET are the attach's own arguments - among the options they would skip the requirement
+statement error
+SELECT acl_cluster_attach('', 'x1', 'dbname=x host=db', '', '', '{"TYPE": "postgres"}', '', '');
+----
+<REGEX>:.*TYPE is the attach's own argument, never one of its options.*
+
+statement error
+SELECT acl_cluster_attach('', 'x2', ':memory:', 'duckdb', '', '{}', 'src_a,,src_b', '');
+----
+<REGEX>:.*DEPENDS ON names each source once.*
+
+# spec 020: a database's encryption key is a credential too
+statement error
+ACL ADMIN CLUSTER ATTACH ':memory:' AS enc (TYPE duckdb, ENCRYPTION_KEY 'k');
+----
+<REGEX>:.*"ENCRYPTION_KEY" in the source's options is a credential.*
+
 # spec 011: another platform connects with a token, from a secret
 statement error
 ACL ADMIN CLUSTER ATTACH 'b.example:443' AS b (TYPE hugr);
