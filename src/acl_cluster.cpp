@@ -6,7 +6,8 @@
 
 #include "acl_cluster.hpp"
 
-#include "acl_admin_scanner.hpp"
+#include "acl_admin_sql.hpp"
+#include "acl_mgmt_rules.hpp"
 
 #include "acl_door_common.hpp"
 #include "acl_platform.hpp"
@@ -1485,130 +1486,223 @@ void ClusterAppliedFunc(DataChunk &args, ExpressionState &state, Vector &result)
 
 namespace {
 
-//! `ACL CLUSTER …` (spec 093): the cluster profile. Compiled to acl_cluster_* calls; the authorization
-//! (a passthrough scope - it changes the cluster's infrastructure) is AuthorizeMgmt's.
-unique_ptr<SQLStatement> ParseCluster(AdminScanner &s) {
-	auto group = [&]() -> string {
-		if (s.Accept("in")) {
-			s.Expect("group");
-			return s.NameValue("a resource group name");
+//! `ACL CLUSTER …` (spec 093): the cluster profile, as rules on duckdb's tokens (duckdb-acl spec 150 3g-3:
+//! RegisterMgmtRules) - each form compiled to its acl_cluster_* call; the authorization (the cluster bundle - it
+//! changes the cluster's infrastructure) is the one authorizer's.
+
+//! `AclClusterInGroup <- 'IN' 'GROUP' AclNameValue` where an optional clause stands, '' when absent
+string ClusterGroup(MgmtCall &call, ParseResult &part) {
+	auto clause = MgmtCall::Optional(part);
+	return clause ? call.NameValue(clause->Cast<ListParseResult>().GetChild(2), "a resource group name") : string();
+}
+
+//! `AclComment <- 'COMMENT' AclQuotedValue` where an optional clause stands, '' when absent
+string ClusterComment(MgmtCall &call, ParseResult &part) {
+	auto clause = MgmtCall::Optional(part);
+	return clause ? call.Quoted(clause->Cast<ListParseResult>().GetChild(1), "comment") : string();
+}
+
+// AclClusterExtension <- 'CLUSTER' AclClusterExtensionVerb 'EXTENSION' AclNameValue AclClusterExtensionClause*
+//                        AclClusterInGroup? AclComment?
+arena_ptr<TransformResultValue> FinalizeClusterExtension(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	MgmtCall call(transformer, "acl_cluster_extension");
+	auto verb = MgmtCall::Keyword(list.GetChild(1));
+	auto name = call.NameValue(list.GetChild(3), "an extension name");
+	string version, repository;
+	bool has_version = false, has_repository = false;
+	for (auto &entry : MgmtCall::Each(list.GetChild(4))) {
+		auto &clause = MgmtCall::Part(entry.get());
+		auto keyword = MgmtCall::Keyword(clause);
+		if (keyword == "sha256") {
+			// spec 103: refused, never ignored - a script that still pins a hash must not believe it does
+			throw BinderException("acl admin: SHA256 is no longer part of the cluster profile (spec 103) - DuckDB "
+			                      "verifies the repository's signature at every INSTALL and LOAD; name the VERSION and "
+			                      "the repository");
 		}
-		return string();
+		if (verb == "remove") {
+			throw BinderException("acl admin: CLUSTER REMOVE EXTENSION names the extension only - %s is an install's "
+			                      "or an update's",
+			                      StringUtil::Upper(keyword));
+		}
+		auto &parts = clause.Cast<ListParseResult>();
+		if (keyword == "version") {
+			if (has_version) {
+				throw BinderException("acl admin: VERSION is written once");
+			}
+			has_version = true;
+			version = call.Quoted(parts.GetChild(1), "version");
+		} else {
+			if (has_repository) {
+				throw BinderException("acl admin: FROM is written once");
+			}
+			has_repository = true; // spec 019: an update may move the item
+			repository = call.NameValue(parts.GetChild(1), "a repository name");
+		}
+	}
+	auto scope = ClusterGroup(call, list.GetChild(5));
+	auto note = ClusterComment(call, list.GetChild(6));
+	for (auto &value : {verb, scope, name, version, repository, note}) {
+		call.Arg(Value(value));
+	}
+	return call.Result();
+}
+
+// AclClusterAttach <- 'CLUSTER' 'ATTACH' AclQuotedValue 'AS' AclNameValue AclClusterOptions? AclClusterLineage?
+//                     AclClusterDepends? AclClusterInGroup? AclComment?
+arena_ptr<TransformResultValue> FinalizeClusterAttach(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	MgmtCall call(transformer, "acl_cluster_attach");
+	auto path = call.Quoted(list.GetChild(2), "the source's path");
+	auto alias = call.NameValue(list.GetChild(4), "the source's alias");
+	string type, secret;
+	vector<std::pair<string, string>> options;
+	if (auto parens = MgmtCall::Optional(list.GetChild(5))) {
+		// AclClusterOptions <- '(' AclClusterOption AclClusterOptionMore* ','? ')'
+		auto &items = parens->Cast<ListParseResult>();
+		vector<reference<ParseResult>> each {items.GetChild(1)};
+		for (auto &more : MgmtCall::Each(items.GetChild(2))) {
+			each.push_back(MgmtCall::Part(more.get()).Cast<ListParseResult>().GetChild(1)); // ',' AclClusterOption
+		}
+		case_insensitive_set_t named;
+		for (auto &entry : each) {
+			// AclClusterOption <- AclWordToken AclValue? - a key alone is true
+			auto &option = MgmtCall::Part(entry.get()).Cast<ListParseResult>();
+			auto key = MgmtCall::Word(option.GetChild(0));
+			auto given = MgmtCall::Optional(option.GetChild(1));
+			auto value = given ? call.Text(*given, "an option's value") : string("true");
+			if (!named.insert(key).second) {
+				throw BinderException("acl admin: option %s is written once", StringUtil::Upper(key));
+			}
+			if (StringUtil::CIEquals(key, "type")) {
+				type = StringUtil::Lower(value);
+			} else if (StringUtil::CIEquals(key, "secret")) {
+				secret = value;
+			} else {
+				options.emplace_back(StringUtil::Upper(key), value);
+			}
+		}
+	}
+	string lineage; // spec 112 §9: the name the source is known by, declared where it is attached
+	if (auto clause = MgmtCall::Optional(list.GetChild(6))) {
+		lineage = call.Quoted(clause->Cast<ListParseResult>().GetChild(1), "the source's lineage identity");
+	}
+	string deps;
+	if (auto clause = MgmtCall::Optional(list.GetChild(7))) {
+		// AclClusterDepends <- 'DEPENDS' 'ON' '(' AclNameValue AclClusterDependsMore* ','? ')'
+		auto &parts = clause->Cast<ListParseResult>();
+		vector<string> names {call.NameValue(parts.GetChild(3), "a source it depends on")};
+		for (auto &more : MgmtCall::Each(parts.GetChild(4))) {
+			names.push_back(call.NameValue(MgmtCall::Part(more.get()).Cast<ListParseResult>().GetChild(1),
+			                               "a source it depends on"));
+		}
+		deps = StringUtil::Join(names, ",");
+	}
+	auto scope = ClusterGroup(call, list.GetChild(8));
+	auto note = ClusterComment(call, list.GetChild(9));
+	vector<string> json;
+	for (auto &option : options) {
+		json.push_back(JsonQuote(option.first) + ": " + JsonQuote(option.second));
+	}
+	for (auto &value :
+	     {scope, alias, path, type, secret, "{" + StringUtil::Join(json, ", ") + "}", deps, note, lineage}) {
+		call.Arg(Value(value));
+	}
+	return call.Result();
+}
+
+// AclClusterDetach <- 'CLUSTER' 'DETACH' AclNameValue AclClusterDetachFlag* AclClusterInGroup?
+arena_ptr<TransformResultValue> FinalizeClusterDetach(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	MgmtCall call(transformer, "acl_cluster_detach");
+	auto alias = call.NameValue(list.GetChild(2), "the source's alias");
+	bool cascade = false, force = false;
+	for (auto &flag : MgmtCall::Each(list.GetChild(3))) {
+		auto keyword = MgmtCall::Keyword(flag.get());
+		cascade = cascade || keyword == "cascade";
+		force = force || keyword == "force";
+	}
+	auto scope = ClusterGroup(call, list.GetChild(4));
+	for (auto &value : {scope, alias, string(cascade ? "true" : "false"), string(force ? "true" : "false")}) {
+		call.Arg(Value(value));
+	}
+	return call.Result();
+}
+
+// AclClusterSet <- 'CLUSTER' 'SET' AclWordToken AclClusterAssign AclValue AclClusterInGroup?
+// AclClusterReset <- 'CLUSTER' 'RESET' AclWordToken AclClusterInGroup?
+arena_ptr<TransformResultValue> FinalizeClusterSetting(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	MgmtCall call(transformer, "acl_cluster_setting");
+	auto verb = MgmtCall::Keyword(list.GetChild(1));
+	auto name = MgmtCall::Word(list.GetChild(2));
+	string value;
+	idx_t group_at = 3;
+	if (verb == "set") {
+		value = call.Text(list.GetChild(4), "a value");
+		group_at = 5;
+	}
+	auto scope = ClusterGroup(call, list.GetChild(group_at));
+	for (auto &part : {verb, scope, name, value}) {
+		call.Arg(Value(part));
+	}
+	return call.Result();
+}
+
+void RegisterClusterRules() {
+	vector<GrammarChange> rules;
+	auto rule = [&](const char *definition) {
+		rules.push_back(GrammarChange::AddRule(definition));
 	};
-	auto comment = [&]() -> string {
-		return s.Accept("comment") ? s.Quoted("comment") : string();
-	};
-	auto verb = StringUtil::Lower(s.Word("INSTALL, UPDATE, REMOVE, ATTACH, DETACH, SET or RESET"));
-	if (verb == "install" || verb == "update" || verb == "remove") {
-		s.Expect("extension");
-		auto name = s.NameValue("an extension name");
-		string version, repository;
-		for (;;) {
-			if (verb != "remove" && s.Accept("version")) {
-				version = s.Quoted("version");
-			} else if (verb != "remove" && s.Accept("from")) { // spec 019: an update may move the item
-				repository = s.NameValue("a repository name");
-			} else if (verb != "remove" && s.Accept("sha256")) {
-				// spec 103: refused, never ignored - a script that still pins a hash must not believe it does
-				throw BinderException("acl admin: SHA256 is no longer part of the cluster profile (spec 103) - "
-				                      "DuckDB verifies the repository's signature at every INSTALL and LOAD; name "
-				                      "the VERSION and the repository");
-			} else {
-				break;
-			}
-		}
-		auto scope = group();
-		auto note = comment();
-		return MakeAdminCall("acl_cluster_extension",
-		                     {Value(verb), Value(scope), Value(name), Value(version), Value(repository), Value(note)});
-	}
-	if (verb == "attach") {
-		auto path = s.Quoted("the source's path");
-		s.Expect("as");
-		auto alias = s.NameValue("the source's alias");
-		string type, secret;
-		vector<std::pair<string, string>> options;
-		if (s.AtParen()) {
-			for (auto &item : SplitTopLevel(s.Parens(), ',')) {
-				auto text = item;
-				StringUtil::Trim(text);
-				if (text.empty()) {
-					continue;
-				}
-				auto space = text.find_first_of(" \t");
-				auto key = space == string::npos ? text : text.substr(0, space);
-				auto value = space == string::npos ? string("true") : Unquoted(text.substr(space + 1));
-				if (StringUtil::CIEquals(key, "type")) {
-					type = StringUtil::Lower(value);
-				} else if (StringUtil::CIEquals(key, "secret")) {
-					secret = value;
-				} else {
-					options.emplace_back(StringUtil::Upper(key), value);
-				}
-			}
-		}
-		string lineage; // spec 112 §9: the name the source is known by, declared where it is attached
-		if (s.Accept("lineage")) {
-			lineage = s.Quoted("the source's lineage identity");
-		}
-		string deps;
-		if (s.Accept("depends")) {
-			s.Expect("on");
-			vector<string> names;
-			for (auto &item : SplitTopLevel(s.Parens(), ',')) {
-				auto name = Unquoted(item);
-				if (!name.empty()) {
-					names.push_back(name);
-				}
-			}
-			deps = StringUtil::Join(names, ",");
-		}
-		auto scope = group();
-		auto note = comment();
-		vector<string> json;
-		for (auto &option : options) {
-			json.push_back(JsonQuote(option.first) + ": " + JsonQuote(option.second));
-		}
-		return MakeAdminCall("acl_cluster_attach", {Value(scope), Value(alias), Value(path), Value(type), Value(secret),
-		                                            Value("{" + StringUtil::Join(json, ", ") + "}"), Value(deps),
-		                                            Value(note), Value(lineage)});
-	}
-	if (verb == "detach") {
-		auto alias = s.NameValue("the source's alias");
-		bool cascade = false, force = false;
-		for (;;) {
-			if (s.Accept("cascade")) {
-				cascade = true;
-			} else if (s.Accept("force")) {
-				force = true;
-			} else {
-				break;
-			}
-		}
-		auto scope = group();
-		return MakeAdminCall("acl_cluster_detach", {Value(scope), Value(alias), Value(cascade ? "true" : "false"),
-		                                            Value(force ? "true" : "false")});
-	}
-	if (verb == "set" || verb == "reset") {
-		auto name = s.Word("a setting name");
-		string value;
-		if (verb == "set") {
-			s.Skip();
-			if (s.pos < s.text.size() && s.text[s.pos] == '=') {
-				s.pos++;
-			} else {
-				s.Expect("to");
-			}
-			s.Skip();
-			value = s.pos < s.text.size() && (s.text[s.pos] == '\'' || s.text[s.pos] == '"') ? s.Quoted("a value")
-			                                                                                 : s.Word("a value");
-		}
-		auto scope = group();
-		return MakeAdminCall("acl_cluster_setting", {Value(verb), Value(scope), Value(name), Value(value)});
-	}
-	throw BinderException("acl admin: ACL CLUSTER expects INSTALL, UPDATE or REMOVE EXTENSION, ATTACH, DETACH, SET "
-	                      "or RESET, not \"%s\"",
-	                      verb);
+	rule("AclClusterInGroup <- 'IN' 'GROUP' AclNameValue");
+	rule("AclClusterExtensionVerb <- 'INSTALL' / 'UPDATE' / 'REMOVE'");
+	rule("AclClusterVersion <- 'VERSION' AclQuotedValue");
+	rule("AclClusterRepository <- 'FROM' AclNameValue");
+	rule("AclClusterSha256 <- 'SHA256' AclValue?");
+	rule("AclClusterExtensionClause <- AclClusterVersion / AclClusterRepository / AclClusterSha256");
+	rules.push_back(GrammarChange::AddRule("AclClusterExtension <- 'CLUSTER' AclClusterExtensionVerb 'EXTENSION' "
+	                                       "AclNameValue AclClusterExtensionClause* AclClusterInGroup? AclComment?",
+	                                       MgmtStart<FinalizeClusterExtension>));
+	rule("AclClusterOption <- AclWordToken AclValue?");
+	rule("AclClusterOptionMore <- ',' AclClusterOption");
+	rule("AclClusterOptions <- '(' AclClusterOption AclClusterOptionMore* ','? ')'");
+	rule("AclClusterLineage <- 'LINEAGE' AclQuotedValue");
+	rule("AclClusterDependsMore <- ',' AclNameValue");
+	rule("AclClusterDepends <- 'DEPENDS' 'ON' '(' AclNameValue AclClusterDependsMore* ','? ')'");
+	rules.push_back(GrammarChange::AddRule(
+	    "AclClusterAttach <- 'CLUSTER' 'ATTACH' AclQuotedValue 'AS' AclNameValue AclClusterOptions? AclClusterLineage? "
+	    "AclClusterDepends? AclClusterInGroup? AclComment?",
+	    MgmtStart<FinalizeClusterAttach>));
+	rule("AclClusterDetachFlag <- 'CASCADE' / 'FORCE'");
+	rules.push_back(GrammarChange::AddRule(
+	    "AclClusterDetach <- 'CLUSTER' 'DETACH' AclNameValue AclClusterDetachFlag* AclClusterInGroup?",
+	    MgmtStart<FinalizeClusterDetach>));
+	rule("AclClusterAssign <- '=' / 'TO'");
+	rules.push_back(GrammarChange::AddRule(
+	    "AclClusterSet <- 'CLUSTER' 'SET' AclWordToken AclClusterAssign AclValue AclClusterInGroup?",
+	    MgmtStart<FinalizeClusterSetting>));
+	rules.push_back(GrammarChange::AddRule("AclClusterReset <- 'CLUSTER' 'RESET' AclWordToken AclClusterInGroup?",
+	                                       MgmtStart<FinalizeClusterSetting>));
+	const char *group = "[IN GROUP <group>]";
+	vector<MgmtStatementForm> forms {
+	    {"AclClusterExtension",
+	     {"install", "update", "remove"},
+	     StringUtil::Format("write CLUSTER INSTALL | UPDATE EXTENSION <name> [VERSION '<version>'] [FROM <repository>] "
+	                        "%s [COMMENT '<text>'], or CLUSTER REMOVE EXTENSION <name> %s",
+	                        group, group)},
+	    {"AclClusterAttach",
+	     {"attach"},
+	     StringUtil::Format(
+	         "write CLUSTER ATTACH '<path>' AS <alias> [(TYPE <type>, SECRET <secret>, <option> "
+	         "[<value>], ...)] [LINEAGE '<identity>'] [DEPENDS ON (<source>, ...)] %s [COMMENT '<text>']",
+	         group)},
+	    {"AclClusterDetach",
+	     {"detach"},
+	     StringUtil::Format("write CLUSTER DETACH <alias> [CASCADE] [FORCE] %s", group)},
+	    {"AclClusterSet", {"set"}, StringUtil::Format("write CLUSTER SET <setting> = | TO <value> %s", group)},
+	    {"AclClusterReset", {"reset"}, StringUtil::Format("write CLUSTER RESET <setting> %s", group)}};
+	RegisterMgmtRules("cluster", std::move(forms), std::move(rules),
+	                  "ACL CLUSTER expects INSTALL, UPDATE or REMOVE EXTENSION, ATTACH, DETACH, SET or RESET");
 }
 
 //! spec 126: the cluster's part of the `platform` catalog - its views and functions, registered at load; the ONE
@@ -1725,7 +1819,7 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	drift.function_info = info;
 	loader.RegisterFunction(drift);
 	RegisterClusterPlatform();
-	RegisterMgmtGrammar("cluster", ParseCluster);
+	RegisterClusterRules();
 	RegisterAdminScope(AdminScope::CLUSTER);
 
 	// spec 126: the node's group is the platform part's setting and trait

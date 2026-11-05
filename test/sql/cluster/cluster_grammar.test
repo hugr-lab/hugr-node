@@ -1,0 +1,118 @@
+# name: test/sql/cluster/cluster_grammar.test
+# description: spec 020 - ACL CLUSTER is read by rules on duckdb's tokens (duckdb-acl spec 150 3g-3:
+#   RegisterMgmtRules): a comment anywhere, lists read item by item, a form the rules do not read refused with
+#   the usage of its verb, a value written as anything but one plain literal refused
+# group: [sql]
+
+require hugr_node
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+# --- read on duckdb's tokens -----------------------------------------------------------------------
+
+# a comment anywhere, an option with no value (true), a trailing comma in a list
+statement ok
+ACL ADMIN CLUSTER /* the mart */ ATTACH ':memory:' AS g1 -- its options
+(TYPE duckdb, READ_WRITE,) COMMENT 'one';
+
+query II
+SELECT spec LIKE '%"READ_WRITE": "true"%', comment FROM acl_cluster_items() WHERE name = 'g1';
+----
+true	one
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP general (max_sessions 10);
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS g2 (TYPE duckdb) DEPENDS ON (g1,) IN GROUP general;
+
+query TT
+SELECT scope, depends_on FROM acl_cluster_items() WHERE name = 'g2';
+----
+general	[g1]
+
+statement ok
+ACL ADMIN CLUSTER DETACH g2 IN GROUP general;
+
+# --- refused in the form's own words -------------------------------------------------------------
+
+statement error
+ACL ADMIN CLUSTER INSTALL EXTENSION spatial VERSION 'v1' SHA256 'abc';
+----
+<REGEX>:.*SHA256 is no longer part of the cluster profile \(spec 103\).*
+
+statement error
+ACL ADMIN CLUSTER REMOVE EXTENSION spatial VERSION 'v1';
+----
+<REGEX>:.*CLUSTER REMOVE EXTENSION names the extension only - VERSION is an install's or an update's.*
+
+statement error
+ACL ADMIN CLUSTER INSTALL EXTENSION spatial VERSION 'v1' VERSION 'v2';
+----
+<REGEX>:.*VERSION is written once.*
+
+statement error
+ACL ADMIN CLUSTER ATTACH ':memory:' AS g3 (TYPE duckdb, TYPE sqlite);
+----
+<REGEX>:.*option TYPE is written once.*
+
+# a form its rules do not read: the usage of its verb, else the keyword's
+statement error
+ACL ADMIN CLUSTER ATTACH ':memory:' AS g3 (TYPE duckdb, , READ_WRITE);
+----
+<REGEX>:.*write CLUSTER ATTACH '<path>' AS <alias>.*
+
+statement error
+ACL ADMIN CLUSTER ATTACH ':memory:' AS g3 DEPENDS ON (g1 g2);
+----
+<REGEX>:.*write CLUSTER ATTACH '<path>' AS <alias>.*
+
+# a path written bare is no quoted value
+statement error
+ACL ADMIN CLUSTER ATTACH memory AS g3;
+----
+<REGEX>:.*expected the source's path, quoted.*as one plain literal.*
+
+statement error
+ACL ADMIN CLUSTER INSTALL spatial;
+----
+<REGEX>:.*write CLUSTER INSTALL \| UPDATE EXTENSION <name>.*
+
+statement error
+ACL ADMIN CLUSTER SET threads;
+----
+<REGEX>:.*write CLUSTER SET <setting> = \| TO <value>.*
+
+statement error
+ACL ADMIN CLUSTER DETACH g1 IN GROUP;
+----
+<REGEX>:.*write CLUSTER DETACH <alias>.*
+
+statement error
+ACL ADMIN CLUSTER FOO;
+----
+<REGEX>:.*ACL CLUSTER expects INSTALL, UPDATE or REMOVE EXTENSION, ATTACH, DETACH, SET or RESET.*
+
+# a value is one plain literal: an escape string, a string joined across a line break
+statement error
+ACL ADMIN CLUSTER ATTACH E':memory:' AS g3;
+----
+<REGEX>:.*expected the source's path, quoted.*as one plain literal.*
+
+statement error
+ACL ADMIN CLUSTER ATTACH ':mem'
+'ory:' AS g3;
+----
+<REGEX>:.*expected the source's path, quoted.*as one plain literal.*
+
+query I
+SELECT count(*) FROM acl_cluster_items() WHERE name = 'g3';
+----
+0

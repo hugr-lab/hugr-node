@@ -32,9 +32,15 @@ CLUSTER REMOVE  EXTENSION <name> [IN GROUP <group>]
 CLUSTER ATTACH '<path>' AS <alias> (TYPE <type> [, SECRET <secret>] [, <option> [<value>]] …)
         [LINEAGE '<identity>'] [DEPENDS ON (<alias>, …)] [IN GROUP <group>] [COMMENT '<text>']
 CLUSTER DETACH <alias> [CASCADE] [FORCE] [IN GROUP <group>]
-CLUSTER SET <setting> = <value> [IN GROUP <group>]
+CLUSTER SET <setting> = | TO <value> [IN GROUP <group>]
 CLUSTER RESET <setting> [IN GROUP <group>]
 ```
+
+The statements are read on duckdb's tokens (spec 020), like acl's own management statements: a comment may stand
+anywhere; a quoted value is one plain literal (`'…'` or `"…"`, never `E'…'` or a string continued on the next line);
+a list is read item by item - a trailing comma is allowed, an empty item is not; each clause and each option is
+written once; a value is a word (`4GB`, `v1.0`), a quoted value or a number (`-1`). A statement that does not read is
+told how its form is written.
 
 **A cluster node's** (spec 118): every hugr_node node is a cluster node, whatever the number of nodes - a cluster
 may be one (hugr-node spec 002: there is no single-node mode and no setting to choose one). One node and many differ
