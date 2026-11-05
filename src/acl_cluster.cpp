@@ -95,15 +95,15 @@ const case_insensitive_set_t CLUSTER_WIDE_SETTINGS = {
 const case_insensitive_set_t TYPES_NEEDING_SECRET = {"postgres", "postgres_scanner", "mysql", "mysql_scanner", "mssql",
                                                      "hugr"};
 
-//! A source's type: its TYPE, else the one its path names - `postgres:dbname=…`, duckdb's own reading of a path's
-//! prefix ('' for neither: a file, `:memory:`)
+//! A source's type: its TYPE, else the one its path names - `postgres:dbname=…`, as duckdb reads a path's prefix
+//! (ExtractExtensionPrefixFromPath: a scheme's `://` names a filesystem, no type) - '' for neither: a file, `:memory:`
 string SourceTypeOf(const string &type, const string &path) {
 	if (!type.empty()) {
 		return type;
 	}
 	auto colon = path.find(':');
-	if (colon == string::npos || colon < 2) {
-		return string(); // `:memory:`, a drive letter
+	if (colon == string::npos || colon < 2 || path.compare(colon, 3, "://") == 0) {
+		return string(); // `:memory:`, a drive letter, a URL
 	}
 	for (idx_t i = 0; i < colon; i++) {
 		auto c = path[i];
@@ -658,6 +658,18 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 	for (auto &option : options) {
 		RequireIdentifier(option.first, "an ATTACH option");
 		LintKey(option.first, "the source's options");
+		if (StringUtil::CIEquals(option.first, "type") || StringUtil::CIEquals(option.first, "secret")) {
+			// the call's own arguments: written among the options they would skip the SECRET requirement
+			throw BinderException("acl cluster: %s is the attach's own argument, never one of its options",
+			                      StringUtil::Upper(option.first));
+		}
+	}
+	case_insensitive_set_t depended;
+	for (auto &dep : depends_on) {
+		if (dep.empty() || !depended.insert(dep).second) {
+			throw BinderException("acl cluster: DEPENDS ON names each source once - \"%s\" %s", dep,
+			                      dep.empty() ? "names none" : "twice");
+		}
 	}
 	if (!lineage.empty() && (lineage.find("://") == string::npos || !LineageIdentityClean(lineage))) {
 		throw BinderException("acl cluster: LINEAGE names the source as others know it, "
@@ -1333,11 +1345,12 @@ void ClusterExtensionFunc(DataChunk &args, ExpressionState &state, Vector &resul
 void ClusterAttachFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	EachRow(args, result, [&](idx_t row) {
 		vector<string> deps;
-		for (auto &dep : StringUtil::Split(Arg(args, 6, row), ',')) {
-			auto d = dep;
-			StringUtil::Trim(d);
-			if (!d.empty()) {
-				deps.push_back(d);
+		auto csv = Arg(args, 6, row);
+		if (!csv.empty()) {
+			for (auto &dep : StringUtil::Split(csv, ',')) {
+				auto d = dep;
+				StringUtil::Trim(d);
+				deps.push_back(d); // an empty one is refused where the sources are judged
 			}
 		}
 		return StoreOf(state).ClusterAttach(Arg(args, 0, row), Arg(args, 1, row), Arg(args, 2, row), Arg(args, 3, row),

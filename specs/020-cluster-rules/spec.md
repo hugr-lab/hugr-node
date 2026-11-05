@@ -37,7 +37,10 @@ rules for its statements instead (`RegisterMgmtRules` / `MgmtCall`, `acl_mgmt_ru
 - Found by the review and fixed with it (both older than the rules): `ENCRYPTION_KEY` was no credential key - an
   option holding a database's key was stored in the profile; a source whose path names its type (`'postgres:…'`, no
   `TYPE`) skipped the SECRET requirement and did not keep its extension in the profile (`SourceTypeOf`: the TYPE, else
-  the path's prefix).
+  the path's prefix as duckdb reads it - a URL's `scheme://` names a filesystem, no type); `TYPE` / `SECRET` among
+  the options JSON of `acl_cluster_attach` (the function and `platform.cluster_attach` route) skipped the requirement
+  too - refused, they are the call's own arguments; a `depends_on` CSV with an empty or a repeated name is refused
+  there as in the grammar.
 - Messages of acl's own forms moved with the re-pin (resource groups are rules since acl 3f): the tests'
   expectations follow, and the schema window test's versions are acl's v23.
 
@@ -53,3 +56,11 @@ negative value, the refusals and each form's usage; `acl_cluster_profile.test`: 
 
 - Keeping the scanner until stage 4: the old seam is what 3g-3c removes from acl; hugr-node moving first keeps both
   repositories building at every step.
+
+## Follow-ups
+
+- The profile's "never a credential" rests on keys: option VALUES are not linted (`(METADATA_PATH 'dbname=x
+  password=p')`, `(DATA_PATH 's3://b/p?s3_secret_access_key=…')`), DuckLake's `META_<option>` forwards a key one
+  prefix away (`META_ENCRYPTION_KEY`), settings carrying one are not refused (`azure_storage_connection_string`,
+  `azure_proxy_password`), `motherduck_token` is no key, and `ExtensionOfType` ignores duckdb's extension aliases
+  (`https://…` / `s3://…` vs httpfs). Found by this spec's reviews, all older than it - spec 021.
