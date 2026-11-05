@@ -6,7 +6,6 @@
 
 #include "acl_cluster.hpp"
 
-#include "acl_admin_sql.hpp"
 #include "acl_mgmt_rules.hpp"
 
 #include "acl_door_common.hpp"
@@ -17,6 +16,7 @@
 #include "acl_sql_text.hpp"
 
 #include "duckdb/main/config.hpp"
+#include "duckdb/parser/peg/passthrough_dialect.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension_helper.hpp"
@@ -60,7 +60,8 @@ const case_insensitive_set_t CREDENTIAL_KEYS = {"password",
                                                 "s3_secret_access_key",
                                                 "s3_access_key_id",
                                                 "s3_session_token",
-                                                "http_proxy_password"};
+                                                "http_proxy_password",
+                                                "encryption_key"};
 
 //! The node's hardening, fixed by its bootstrap - never a profile item
 const case_insensitive_set_t HARDENING_SETTINGS = {
@@ -93,6 +94,25 @@ const case_insensitive_set_t CLUSTER_WIDE_SETTINGS = {
 //! Source types whose connection needs a credential: written without SECRET, refused
 const case_insensitive_set_t TYPES_NEEDING_SECRET = {"postgres", "postgres_scanner", "mysql", "mysql_scanner", "mssql",
                                                      "hugr"};
+
+//! A source's type: its TYPE, else the one its path names - `postgres:dbname=…`, duckdb's own reading of a path's
+//! prefix ('' for neither: a file, `:memory:`)
+string SourceTypeOf(const string &type, const string &path) {
+	if (!type.empty()) {
+		return type;
+	}
+	auto colon = path.find(':');
+	if (colon == string::npos || colon < 2) {
+		return string(); // `:memory:`, a drive letter
+	}
+	for (idx_t i = 0; i < colon; i++) {
+		auto c = path[i];
+		if (!StringUtil::CharacterIsAlpha(c) && !StringUtil::CharacterIsDigit(c) && c != '_') {
+			return string();
+		}
+	}
+	return StringUtil::Lower(path.substr(0, colon));
+}
 
 //! The extension a source type needs loaded ('' = a core type)
 string ExtensionOfType(const string &type) {
@@ -558,7 +578,8 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, con
 			                        " WHERE \"kind\" = 'source'");
 			    ResultRows rows(*sources);
 			    for (idx_t i = 0; i < rows.Count(); i++) {
-				    auto type = JsonField(rows.GetValue(1, i).ToString(), "type");
+				    auto spec = rows.GetValue(1, i).ToString();
+				    auto type = SourceTypeOf(JsonField(spec, "type"), JsonField(spec, "path"));
 				    if (StringUtil::CIEquals(ExtensionOfType(type), name)) {
 					    throw BinderException("acl cluster: source \"%s\" needs extension \"%s\" - DETACH it first",
 					                          rows.GetValue(0, i).ToString(), name);
@@ -642,10 +663,12 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 		throw BinderException("acl cluster: LINEAGE names the source as others know it, "
 		                      "<scheme>://<host:port>[/<database>] - never a credential (no user:password@)");
 	}
-	if (secret.empty() && TYPES_NEEDING_SECRET.count(type)) {
+	// a source whose path names its type (`postgres:dbname=…`, no TYPE) needs a secret as one with TYPE does
+	auto source_type = SourceTypeOf(type, path);
+	if (secret.empty() && TYPES_NEEDING_SECRET.count(source_type)) {
 		throw BinderException("acl cluster: a %s source connects with a credential - name the secret that holds it: "
 		                      "(TYPE %s, SECRET <name>)",
-		                      type, type);
+		                      source_type, source_type);
 	}
 	auto spec = "{" + JsonQuote("type") + ": " + JsonQuote(type) + ", " + JsonQuote("path") + ": " + JsonQuote(path) +
 	            ", " + JsonQuote("secret") + ": " + JsonQuote(secret) + ", " + JsonQuote("options") + ": " +
@@ -1486,9 +1509,9 @@ void ClusterAppliedFunc(DataChunk &args, ExpressionState &state, Vector &result)
 
 namespace {
 
-//! `ACL CLUSTER …` (spec 093): the cluster profile, as rules on duckdb's tokens (duckdb-acl spec 150 3g-3:
-//! RegisterMgmtRules) - each form compiled to its acl_cluster_* call; the authorization (the cluster bundle - it
-//! changes the cluster's infrastructure) is the one authorizer's.
+// --- `ACL CLUSTER …` (spec 093): the cluster profile, as rules on duckdb's tokens (spec 020, duckdb-acl spec 150 3g-3:
+// RegisterMgmtRules) - each form compiled to its acl_cluster_* call; the authorization (the cluster bundle - it
+// changes the cluster's infrastructure) is the one authorizer's ------------------------------------------------------
 
 //! `AclClusterInGroup <- 'IN' 'GROUP' AclNameValue` where an optional clause stands, '' when absent
 string ClusterGroup(MgmtCall &call, ParseResult &part) {
@@ -1542,6 +1565,10 @@ arena_ptr<TransformResultValue> FinalizeClusterExtension(PEGTransformer &transfo
 	}
 	auto scope = ClusterGroup(call, list.GetChild(5));
 	auto note = ClusterComment(call, list.GetChild(6));
+	if (verb == "remove" && MgmtCall::Optional(list.GetChild(6))) {
+		throw BinderException("acl admin: CLUSTER REMOVE EXTENSION names the extension only - COMMENT is an install's "
+		                      "or an update's");
+	}
 	for (auto &value : {verb, scope, name, version, repository, note}) {
 		call.Arg(Value(value));
 	}
@@ -1591,10 +1618,21 @@ arena_ptr<TransformResultValue> FinalizeClusterAttach(PEGTransformer &transforme
 	if (auto clause = MgmtCall::Optional(list.GetChild(7))) {
 		// AclClusterDepends <- 'DEPENDS' 'ON' '(' AclNameValue AclClusterDependsMore* ','? ')'
 		auto &parts = clause->Cast<ListParseResult>();
-		vector<string> names {call.NameValue(parts.GetChild(3), "a source it depends on")};
+		vector<reference<ParseResult>> items {parts.GetChild(3)};
 		for (auto &more : MgmtCall::Each(parts.GetChild(4))) {
-			names.push_back(call.NameValue(MgmtCall::Part(more.get()).Cast<ListParseResult>().GetChild(1),
-			                               "a source it depends on"));
+			items.push_back(MgmtCall::Part(more.get()).Cast<ListParseResult>().GetChild(1)); // ',' AclNameValue
+		}
+		vector<string> names;
+		case_insensitive_set_t seen;
+		for (auto &item : items) {
+			auto name = call.NameValue(item.get(), "a source it depends on");
+			if (name.empty()) {
+				throw BinderException("acl admin: DEPENDS ON names a source - '' names none");
+			}
+			if (!seen.insert(name).second) {
+				throw BinderException("acl admin: DEPENDS ON names %s twice", name);
+			}
+			names.push_back(name);
 		}
 		deps = StringUtil::Join(names, ",");
 	}
@@ -1619,8 +1657,11 @@ arena_ptr<TransformResultValue> FinalizeClusterDetach(PEGTransformer &transforme
 	bool cascade = false, force = false;
 	for (auto &flag : MgmtCall::Each(list.GetChild(3))) {
 		auto keyword = MgmtCall::Keyword(flag.get());
-		cascade = cascade || keyword == "cascade";
-		force = force || keyword == "force";
+		auto &written = keyword == "cascade" ? cascade : force;
+		if (written) {
+			throw BinderException("acl admin: %s is written once", StringUtil::Upper(keyword));
+		}
+		written = true;
 	}
 	auto scope = ClusterGroup(call, list.GetChild(4));
 	for (auto &value : {scope, alias, string(cascade ? "true" : "false"), string(force ? "true" : "false")}) {
@@ -1658,7 +1699,12 @@ void RegisterClusterRules() {
 	rule("AclClusterExtensionVerb <- 'INSTALL' / 'UPDATE' / 'REMOVE'");
 	rule("AclClusterVersion <- 'VERSION' AclQuotedValue");
 	rule("AclClusterRepository <- 'FROM' AclNameValue");
-	rule("AclClusterSha256 <- 'SHA256' AclValue?");
+	// spec 103's refusal whatever follows the word: its tokens up to the statement's end
+	rule("AclClusterSha256Token <- Identifier");
+	rules.push_back(GrammarChange::AddTerminalRuleOverride(
+	    "AclClusterSha256Token",
+	    [](const PEGKeywordHelper &) -> unique_ptr<Matcher> { return make_uniq<PassthroughTokenMatcher>(); }));
+	rule("AclClusterSha256 <- 'SHA256' AclClusterSha256Token*");
 	rule("AclClusterExtensionClause <- AclClusterVersion / AclClusterRepository / AclClusterSha256");
 	rules.push_back(GrammarChange::AddRule("AclClusterExtension <- 'CLUSTER' AclClusterExtensionVerb 'EXTENSION' "
 	                                       "AclNameValue AclClusterExtensionClause* AclClusterInGroup? AclComment?",

@@ -41,12 +41,63 @@ general	[g1]
 statement ok
 ACL ADMIN CLUSTER DETACH g2 IN GROUP general;
 
+# a value is a word, a quoted value or a signed number; SET takes = or TO
+statement ok
+ACL ADMIN CLUSTER SET threads TO 2;
+
+query T
+SELECT spec FROM acl_cluster_items() WHERE name = 'threads';
+----
+{"value": "2"}
+
+statement ok
+ACL ADMIN CLUSTER SET threads = -1;
+
+query T
+SELECT spec FROM acl_cluster_items() WHERE name = 'threads';
+----
+{"value": "-1"}
+
+statement ok
+ACL ADMIN CLUSTER RESET threads;
+
 # --- refused in the form's own words -------------------------------------------------------------
 
 statement error
 ACL ADMIN CLUSTER INSTALL EXTENSION spatial VERSION 'v1' SHA256 'abc';
 ----
 <REGEX>:.*SHA256 is no longer part of the cluster profile \(spec 103\).*
+
+# ... whatever follows the word
+statement error
+ACL ADMIN CLUSTER INSTALL EXTENSION spatial SHA256 = 'abc' ('x');
+----
+<REGEX>:.*SHA256 is no longer part of the cluster profile \(spec 103\).*
+
+statement error
+ACL ADMIN CLUSTER REMOVE EXTENSION spatial COMMENT 'gone';
+----
+<REGEX>:.*CLUSTER REMOVE EXTENSION names the extension only - COMMENT is an install's or an update's.*
+
+statement error
+ACL ADMIN CLUSTER DETACH g1 CASCADE CASCADE;
+----
+<REGEX>:.*CASCADE is written once.*
+
+statement error
+ACL ADMIN CLUSTER ATTACH ':memory:' AS g3 (TYPE duckdb) DEPENDS ON (g1, G1);
+----
+<REGEX>:.*DEPENDS ON names G1 twice.*
+
+statement error
+ACL ADMIN CLUSTER ATTACH ':memory:' AS g3 (TYPE duckdb) DEPENDS ON ('');
+----
+<REGEX>:.*DEPENDS ON names a source - '' names none.*
+
+statement error
+ACL ADMIN CLUSTER ATTACH ':memory:' AS g3 (TYPE duckdb, STORAGE_VERSION E'v1');
+----
+<REGEX>:.*expected an option's value, quoted.*as one plain literal.*
 
 statement error
 ACL ADMIN CLUSTER REMOVE EXTENSION spatial VERSION 'v1';
@@ -94,6 +145,16 @@ statement error
 ACL ADMIN CLUSTER DETACH g1 IN GROUP;
 ----
 <REGEX>:.*write CLUSTER DETACH <alias>.*
+
+statement error
+ACL ADMIN CLUSTER RESET;
+----
+<REGEX>:.*write CLUSTER RESET <setting>.*
+
+statement error
+ACL ADMIN CLUSTER REMOVE spatial;
+----
+<REGEX>:.*write CLUSTER INSTALL \| UPDATE EXTENSION <name>.*
 
 statement error
 ACL ADMIN CLUSTER FOO;

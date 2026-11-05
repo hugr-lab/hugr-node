@@ -38,8 +38,8 @@ CLUSTER RESET <setting> [IN GROUP <group>]
 
 The statements are read on duckdb's tokens (spec 020), like acl's own management statements: a comment may stand
 anywhere; a quoted value is one plain literal (`'…'` or `"…"`, never `E'…'` or a string continued on the next line);
-a list is read item by item - a trailing comma is allowed, an empty item is not; each clause and each option is
-written once; a value is a word (`4GB`, `v1.0`), a quoted value or a number (`-1`). A statement that does not read is
+a list is read item by item - a trailing comma is allowed, an empty item or an empty list is not; each clause,
+each option, each flag and each source a source depends on is written once; a value is a word (`4GB`, `v1.0`), a quoted value or a number (`-1`). A statement that does not read is
 told how its form is written.
 
 **A cluster node's** (spec 118): every hugr_node node is a cluster node, whatever the number of nodes - a cluster
@@ -91,8 +91,9 @@ in its heartbeat; the orchestrator rolls the nodes (hugr-node spec 010, hugr-pla
 
 - **No credentials, anywhere.** A path with a credential key is refused. That covers a conninfo
   `password=`, a URI's `user:password@`, a SAS `sig=` and the like, and so does an option with such a
-  key. A postgres, mysql, mssql or hugr ([another platform](federation.md)) source must name a `SECRET`, and the
-  node resolves it from its secrets service. The refusal names the key, never its value.
+  key (`ENCRYPTION_KEY` too). A postgres, mysql, mssql or hugr ([another platform](federation.md)) source - by its
+  `TYPE`, or by its path's prefix without one (`'postgres:dbname=…'`) - must name a `SECRET`, and the node resolves
+  it from its secrets service. The refusal names the key, never its value.
 - **The node's hardening is not a profile item.** `allow_unsigned_extensions`, `lock_configuration`,
   `allow_persistent_secrets`, `allow_extension_repositories`, the extension and secret directories
   and the like are refused - and (spec 118) the node's trust: `acl_allow_anonymous_admin`, the quack door's
