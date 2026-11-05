@@ -14,8 +14,8 @@ rules for its statements instead (`RegisterMgmtRules` / `MgmtCall`, `acl_mgmt_ru
 
 ## Design
 
-- duckdb-acl re-pinned to 8d8bb59 (its spec 150 3g-3a; 25 commits from 8b938d1, the same duckdb, ext-common and
-  quack pins).
+- duckdb-acl re-pinned to f2f520f (its spec 150 3g-3a - the seam - and 3g-3c - every management statement a rule,
+  the old seam gone; 27 commits from 8b938d1, the same duckdb, ext-common and quack pins).
 - `RegisterClusterRules` (src/acl_cluster.cpp) registers five forms under the keyword `cluster`, each a rule headed by
   `'CLUSTER'` with its transform and its usage: `AclClusterExtension` (install / update / remove),
   `AclClusterAttach`, `AclClusterDetach`, `AclClusterSet`, `AclClusterReset`; helper rules `AclCluster…` (the option
