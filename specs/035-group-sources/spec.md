@@ -1,6 +1,6 @@
 # Spec 035: a resource group's sources, and sources attached on demand
 
-- **Status**: draft (for the owner's review)
+- **Status**: accepted (the owner, 2026-11-16)
 - **Date**: 2026-11-16
 - **Author**: Claude, from the owner's decisions of 2026-11-16
 - **Follows**: duckdb-acl spec 093 (the cluster profile: `ACL CLUSTER ATTACH … [IN GROUP g]`), spec 096 (a resource
