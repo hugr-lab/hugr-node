@@ -22,15 +22,15 @@ statement ok
 ACL ADMIN CLUSTER SET threads = 2;
 
 statement ok
-UPDATE store.acl.meta SET "value" = '26' WHERE "key" = 'schema_version';
+UPDATE store.acl.meta SET "value" = '27' WHERE "key" = 'schema_version';
 
 statement ok
-UPDATE store.acl.meta SET "value" = '25' WHERE "key" = 'min_reader_version';
+UPDATE store.acl.meta SET "value" = '26' WHERE "key" = 'min_reader_version';
 
 statement error
 ACL ADMIN CLUSTER SET threads = 3;
 ----
-<REGEX>:.*this node's build writes 25.*
+<REGEX>:.*this node's build writes 26.*
 
 # the profile reads still serve
 query I
