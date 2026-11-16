@@ -118,10 +118,15 @@ ATTACH item's spec, `sources` a new kind with its list. No schema step: the item
 
 ## Open questions
 
-1. `IDLE` default when absent: never detach (proposed) or a node-wide default.
-2. Whether the front routes a partial node's refused management statement to the default group by itself (proposed
-   as a follow-up of hugr-platform spec 002).
-3. Whether `hugr_node_group_sources` should also suggest the lazy marks (sources few roles read).
+1. Whether the front should send an administrator's session to a node with every source by itself (hugr-platform spec
+   002). The front does not read statements, so it could only place a whole session; proposed: no - an
+   administrator's role belongs to a group whose nodes attach every source, and the refusal says so.
+2. Whether `hugr_node_group_sources` should also suggest the lazy marks (sources few roles read).
+
+## Decisions (owner, 2026-11-16)
+
+- The source set is declared, never derived by itself; the checks against the sources never run on a partial node.
+- Lazy only for sources marked so; `LAZY` without `IDLE` is never detached.
 
 ## Alternatives considered
 
