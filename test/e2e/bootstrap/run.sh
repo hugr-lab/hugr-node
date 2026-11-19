@@ -26,7 +26,8 @@
 #  12. a restart-class item (SET ... IN GROUP) is reported by both as needs_restart, with the item pending; withdrawn
 #      before it ran it waits no more, while a setting the nodes took at their bootstrap and the profile dropped does;
 #  13. a dropped resource group drains both by themselves, and recreating it resumes them;
-#  14. the heartbeat's node_id is the document's label, and the load report carries it as acl_node_label.
+#  14. the heartbeat's node_id is the document's label, and the load report carries it as acl_node_label;
+#  14b. the orchestrator's scale-down (its heartbeat answer) drains one node, and its end resumes it (spec 045).
 # Then the first policy (spec 015), on a catalog schema nobody wrote yet:
 #  15. the first node writes it (an issuer, the console's client, platform_admin, the resource groups) and serves;
 #  16. the second node finds it and writes nothing;
@@ -443,6 +444,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         beat = json.loads(body)
         if beat.get("node_id") != label: return self.answer(409)   # a node speaks only for itself
         with open(beats, "a") as f: f.write(json.dumps(beat) + "\n")
+        try:   # spec 045: the labels the orchestrator scales down, one per line - the others hear nothing
+            down = open(overlay + ".scale-down").read().split()
+        except FileNotFoundError:
+            down = []
+        if label in down: return self.answer(200, json.dumps({"drain": "scale-down"}).encode())
         self.answer(204)
     def log_message(self, *args): pass
 server = http.server.ThreadingHTTPServer(("127.0.0.1", int(port)), Handler)
@@ -616,6 +622,18 @@ for node in a b; do
 	wait_for 20 resumed || fail "node $node did not resume when its resource group came back"
 done
 echo "ok: a dropped resource group drained both nodes by themselves, and recreating it resumed them"
+
+# spec 045: the orchestrator's scale-down - its heartbeat answer drains node a (and only a), its end resumes it
+echo hugr-node-e2e-a >"$TMP/doc-overlay.json.scale-down"
+scaled_down() { grep -q "tick: the orchestrator scales the group down - draining" "$TMP/node-a.log" &&
+	[ "$(beat hugr-node-e2e-a 'b["load"]["draining"]')" = True ]; }
+wait_for 20 scaled_down || fail "node a did not drain for the orchestrator's scale-down"
+[ "$(beat hugr-node-e2e-b 'b["load"]["draining"]')" = False ] || fail "node b drained for node a's scale-down"
+rm -f "$TMP/doc-overlay.json.scale-down"
+scaled_up() { grep -q "tick: the orchestrator no longer scales the group down - resumed" "$TMP/node-a.log" &&
+	[ "$(beat hugr-node-e2e-a 'b["load"]["draining"]')" = False ]; }
+wait_for 20 scaled_up || fail "node a did not resume when the scale-down ended"
+echo "ok: the orchestrator's scale-down drained node a alone, and its end resumed it"
 
 for node in a b; do
 	pid_var="NODE_$(echo "$node" | tr a-z A-Z)_PID"
