@@ -489,9 +489,10 @@ bool ClusterBundleMaySet(const string &name) {
 	    "enable_object_cache", "http_timeout", "http_retries", "http_retry_wait_ms", "http_retry_backoff",
 	    "http_keep_alive", "timezone", "calendar", "arrow_large_buffer_size",
 	    // acl: limits, windows, timeouts, exposure and lineage naming
-	    "acl_alias_types", "acl_enum_types", "acl_flight_stream_idle", "acl_flight_ingest_idle", "acl_lineage_namespace",
-	    "acl_lineage_level", "acl_lineage_max_edges", "acl_lineage_buffer", "acl_max_result_rows", "acl_max_ingest_rows",
-	    "acl_max_sessions", "acl_node_admit_memory", "acl_node_stream_budget", "acl_profile_level", "acl_quack_cache_max_rows", "acl_quack_client_depth",
+	    "acl_alias_types", "acl_enum_types", "acl_flight_stream_idle", "acl_flight_ingest_idle",
+	    "acl_lineage_namespace", "acl_lineage_level", "acl_lineage_max_edges", "acl_lineage_buffer",
+	    "acl_max_result_rows", "acl_max_ingest_rows", "acl_max_sessions", "acl_node_admit_memory",
+	    "acl_node_stream_budget", "acl_profile_level", "acl_quack_cache_max_rows", "acl_quack_client_depth",
 	    "acl_quack_fetch_producer_buffer_bytes", "acl_quack_fetch_window", "acl_quack_fetch_window_max",
 	    "acl_quack_prepare_inline_rows", "acl_quack_rebalance_buffer_bytes", "acl_quack_result_ttl",
 	    "acl_quack_server_keep_alive_timeout", "acl_quack_server_max_connections", "acl_quack_stream_reserve_bytes",
