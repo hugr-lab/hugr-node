@@ -582,6 +582,10 @@ vector<PlanStep> HardeningSteps(const AgentEnvironment &env) {
 	add("SET GLOBAL tresor_http_client = 'duckdb'");
 	// spec 010: whichever HTTP client serves a request, it verifies the server (httplib's own default does not)
 	add("SET GLOBAL enable_server_cert_verification = true");
+	// spec 043: the load report over the Flight Handshake `node-load` (and /metrics on the quack listener) - only to a
+	// bearer holding `observe` (acl_observe_unauthenticated stays off, and the lock keeps it so); the console reads a
+	// node's report there, which opens no session, so looking at a node never moves its idle_since
+	add("SET GLOBAL acl_metrics_endpoint = true");
 	if (!env.ca_file.empty()) {
 		add("SET GLOBAL ca_cert_file = " + Quoted(env.ca_file));
 	}

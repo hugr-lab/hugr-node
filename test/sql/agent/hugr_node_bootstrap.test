@@ -23,6 +23,7 @@ SELECT step, sql FROM hugr_node_bootstrap_plan('{"version": 1, "node_group": "an
 1 hardening	SET GLOBAL allow_persistent_secrets = false
 1 hardening	SET GLOBAL tresor_http_client = 'duckdb'
 1 hardening	SET GLOBAL enable_server_cert_verification = true
+1 hardening	SET GLOBAL acl_metrics_endpoint = true
 1 hardening	SET GLOBAL ca_cert_file = '/etc/hugr/ca.pem'
 2 tresor	CREATE SECRET hugr_node_identity (TYPE tresor, SCOPE 'tresor:secrets.example', FLOW 'federated', ISSUER 'https://idp.example/realms/r', CLIENT_ID 'hugr-node', ASSERTION_FILE '/var/run/secrets/hugr/token')
 2 tresor	ATTACH 'tresor:secrets.example' AS hugr_tresor (SECRET hugr_node_identity, ACT_FOR_SESSIONS true)
@@ -160,6 +161,7 @@ SELECT step, sql FROM hugr_node_bootstrap_plan('{"version": 2, "node_group": "et
 1 hardening	SET GLOBAL allow_persistent_secrets = false
 1 hardening	SET GLOBAL tresor_http_client = 'duckdb'
 1 hardening	SET GLOBAL enable_server_cert_verification = true
+1 hardening	SET GLOBAL acl_metrics_endpoint = true
 1 hardening	SET GLOBAL temp_directory = '/var/lib/hugr-node/tmp'
 2 bootstrap document	-- GET https://hugr-platform.hugr.svc:8443/v1/bootstrap with Authorization: Bearer <the content of /var/run/secrets/hugr/orchestrator/token>
 3 tresor	CREATE SECRET hugr_node_identity (TYPE tresor, SCOPE 'tresor:tresor.example:443', FLOW 'federated', ISSUER 'https://login.example/t/v2.0', CLIENT_ID 'etl-app', ASSERTION_FILE '/var/run/secrets/hugr/idp/token', OAUTH_SCOPE 'api://tresor/.default')

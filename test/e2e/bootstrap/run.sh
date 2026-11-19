@@ -346,6 +346,30 @@ grep -q 'step 6 profile: setting threads: ok' "$TMP/node.log" && grep -q 'step 6
 echo "ok: the node applied the cluster profile (a setting, a source) at version $VERSION"
 port_open || fail "the Flight port is not open"
 echo "ok: the node serves Flight on localhost:$FLIGHT_PORT"
+# spec 043: the load report is served over the Handshake, and only to a bearer holding observe - a Handshake without
+# one is refused for the token, not answered "off"
+if python3 -c 'import pyarrow.flight' 2>/dev/null; then
+	got="$(python3 - "$FLIGHT_PORT" <<'PY' 2>&1
+import sys
+import pyarrow.flight as fl
+class NodeLoad(fl.ClientAuthHandler):
+    def authenticate(self, outgoing, incoming):
+        outgoing.write(b"node-load")
+        incoming.read()
+    def get_token(self):
+        return b""
+try:
+    fl.FlightClient("grpc://localhost:" + sys.argv[1]).authenticate(NodeLoad())
+    print("answered without a token")
+except Exception as e:
+    print(type(e).__name__, e)
+PY
+)"
+	case "$got" in *Unauthenticated*"needs a valid bearer token"*) ;; *) fail "the load report is not served behind a token: $got";; esac
+	echo "ok: the node serves its load report over the Handshake, only to a bearer"
+else
+	echo "note: pyarrow is not installed - the load report's Handshake is not checked"
+fi
 kill -TERM "$NODE_PID"
 status=0
 wait "$NODE_PID" || status=$?
