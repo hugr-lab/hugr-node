@@ -410,6 +410,13 @@ ACL ROLE "ops_cluster" CLUSTER SET threads = 2;
 statement ok
 ACL ROLE "ops_cluster" CLUSTER SET acl_max_sessions = 500;
 
+# spec 044: duckdb-acl 174's limit on a silent ingest and 175's critical memory level are tuning too
+statement ok
+ACL ROLE "ops_cluster" CLUSTER SET acl_flight_ingest_idle = 600;
+
+statement ok
+ACL ROLE "ops_cluster" CLUSTER SET acl_node_admit_memory = 0.9;
+
 
 statement error
 ACL ROLE "ops_cluster" CLUSTER SET http_proxy = 'x';

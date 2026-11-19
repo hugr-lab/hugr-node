@@ -130,6 +130,7 @@ in its heartbeat; the orchestrator rolls the nodes (hugr-node spec 010, hugr-pla
   allowlist: `threads`, `memory_limit`, `max_temp_directory_size`, `preserve_insertion_order`, checkpoint and
   ordering defaults, the http client's timeouts and retries, `TimeZone` / `Calendar`, and acl's limits,
   windows and timeouts (`acl_max_sessions`, `acl_max_result_rows`, `acl_quack_*` sizes, `acl_*_timeout`,
+  `acl_flight_stream_idle` / `acl_flight_ingest_idle`, the load report's critical level `acl_node_admit_memory`,
   `acl_alias_types` / `acl_enum_types`, `acl_lineage_namespace` / `_level`, `acl_profile_level`, ...).
   Anything else - a data path (`http_proxy*`, an endpoint, a log or audit sink), a key
   location, the audit, a repository - is `passthrough`'s. `acl_node_group` is the deployment's, never an item.
