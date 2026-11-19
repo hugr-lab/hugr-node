@@ -32,6 +32,10 @@ has.
   load report. The front seats elsewhere. Established sessions keep working, and the node never times them out
   itself.
 
+Known: a `DRAIN NODE` an operator issues while the node is already drained for the scale-down cannot be told apart
+from the tick's own drain, so the tick resumes it when the scale-down ends. An operator who wants the node drained
+for good drains it when it is not scaled down, or switches its group to manual.
+
 ## Security
 
 The order comes only in the answer to the node's own heartbeat. That is the orchestrator's TLS endpoint, which the
