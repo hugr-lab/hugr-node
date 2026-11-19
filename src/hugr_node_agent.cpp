@@ -1209,6 +1209,10 @@ struct TickState {
 	int64_t applied = -1;
 	TickTaken taken; // what this node took from the profile, with the spec it applied
 	bool self_drained = false;
+	//! the orchestrator's last heartbeat answer: drain for a scale-down (hugr-platform spec 011), and whether this
+	//! node's own drain was for it (the log when it resumes)
+	bool scale_down = false;
+	bool drained_for_scale_down = false;
 	std::vector<TickPending> pending;
 	bool needs_restart = false;
 	std::map<string, int64_t> drift_counts;
@@ -1351,19 +1355,38 @@ void Converge(DatabaseInstance &db, acl::PolicyStore &store, const AgentEnvironm
 }
 
 //! spec 010: a node whose resource group the policy lacks refuses new sessions already (duckdb-acl spec 096); the tick
-//! says so by draining it - and resumes only a drain it made itself, never one an operator ordered (DecideGroup)
+//! says so by draining it - and resumes only a drain it made itself, never one an operator ordered (DecideGroup).
+//! spec 045: the orchestrator's scale-down drains it the same way, and its end resumes it
 void WatchGroup(DatabaseInstance &db, acl::PolicyStore &store, TickState &state) {
 	auto has_group = !store.NodeGroup().empty();
-	auto decision = DecideGroup(has_group, has_group && store.NodeGroupKnown(), store.Draining(), state.self_drained);
+	auto known = has_group && store.NodeGroupKnown();
+	auto decision = DecideGroup(has_group, known, store.Draining(), state.self_drained, state.scale_down);
 	if (decision.drain) {
 		TickQuery(db, "SELECT acl_drain()");
-		Log("tick: the node's resource group is not in the policy - draining");
+		state.drained_for_scale_down = !(has_group && !known);
+		Log(state.drained_for_scale_down
+		        ? "tick: the orchestrator scales the group down - draining until this node's sessions end"
+		        : "tick: the node's resource group is not in the policy - draining");
 	}
 	if (decision.resume) {
 		TickQuery(db, "SELECT acl_resume()");
-		Log("tick: the node's resource group is back - resumed");
+		Log(state.drained_for_scale_down ? "tick: the orchestrator no longer scales the group down - resumed"
+		                                 : "tick: the node's resource group is back - resumed");
 	}
 	state.self_drained = decision.self_drained;
+}
+
+//! spec 045: the heartbeat's answer - 204 says nothing (no drain), a JSON object may say {"drain": "scale-down"}
+bool ScaleDownOf(const OrchestratorAnswer &answer) {
+	if (answer.status != 200 || answer.body.empty()) {
+		return false;
+	}
+	try {
+		JsonDoc doc(answer.body, "the heartbeat's answer");
+		return StrField(doc.Root(), "drain") == "scale-down";
+	} catch (std::exception &) {
+		return false; // an answer we do not read is no order
+	}
 }
 
 //! spec 017: the catalog as this build judges it (acl_catalog_schema(), its fields by name - `catalog` is reported as
@@ -1449,6 +1472,9 @@ void Tick(DatabaseInstance &db, acl::PolicyStore &store, const AgentEnvironment 
 		if (answer.status < 200 || answer.status > 299) {
 			// the status is the orchestrator's own (a 409: another pod beats as this node), never a value of ours
 			Log("tick: the heartbeat was answered " + std::to_string(answer.status) + " - the next tick sends again");
+		} else {
+			// what the orchestrator says now; a heartbeat it did not answer keeps the last word
+			state.scale_down = ScaleDownOf(answer);
 		}
 	} catch (std::exception &ex) {
 		Log("tick: the heartbeat failed (" + ErrorClassOf(ex) + ") - the next tick sends again");

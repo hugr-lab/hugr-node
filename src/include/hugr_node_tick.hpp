@@ -152,25 +152,25 @@ inline TickDecision DecideTick(const std::vector<TickItem> &items, const std::ve
 	return out;
 }
 
-//! What the tick does about the node's resource group (duckdb-acl spec 096: a node whose group the policy lacks
-//! refuses new sessions already): drain the node while its group is gone, and resume only a drain it made itself -
-//! never one an operator ordered
+//! What the tick does about the node's own drain: two reasons drain it - its resource group the policy lacks
+//! (duckdb-acl spec 096: such a node refuses new sessions already) and the orchestrator's scale-down (hugr-platform
+//! spec 011: a group whose load fits in fewer nodes drains one, which then stops once its sessions have ended) - and
+//! the tick resumes only a drain it made itself, once neither holds, never one an operator ordered
 struct GroupDecision {
 	bool drain = false;
 	bool resume = false;
 	bool self_drained = false; //! the memory for the next tick
 };
 
-inline GroupDecision DecideGroup(bool has_group, bool known, bool draining, bool self_drained) {
+inline GroupDecision DecideGroup(bool has_group, bool known, bool draining, bool self_drained,
+                                 bool scale_down = false) {
 	GroupDecision out;
 	out.self_drained = self_drained;
-	if (!has_group) {
-		return out;
-	}
-	if (!known && !draining && !self_drained) {
+	bool wanted = (has_group && !known) || scale_down;
+	if (wanted && !draining && !self_drained) {
 		out.drain = true;
 		out.self_drained = true;
-	} else if (known && self_drained) {
+	} else if (!wanted && self_drained) {
 		out.resume = draining;
 		out.self_drained = false;
 	}

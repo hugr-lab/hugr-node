@@ -140,5 +140,24 @@ int main(int argc, char *argv[]) {
 			Check(!resumed_by_hand.resume && !resumed_by_hand.self_drained,
 			      "an operator resumed it first: nothing to resume, the memory cleared");
 		});
+
+		Scenario("spec 045: the orchestrator's scale-down drains the node, its end resumes it", [&] {
+			auto down = DecideGroup(true, true, false, false, true);
+			Check(down.drain && down.self_drained, "a scale-down: the node drains itself and remembers it");
+			auto still = DecideGroup(true, true, true, true, true);
+			Check(!still.drain && !still.resume, "still scaled down: nothing more");
+			auto up = DecideGroup(true, true, true, true, false);
+			Check(up.resume && !up.self_drained, "the load came back: the node resumes its own drain");
+			auto ungrouped = DecideGroup(false, false, false, false, true);
+			Check(ungrouped.drain, "a node in no group is scaled down all the same");
+			auto ordered = DecideGroup(true, true, true, false, true);
+			Check(!ordered.drain && !ordered.self_drained, "an operator's drain is not taken over by a scale-down");
+			auto ordered_end = DecideGroup(true, true, true, false, false);
+			Check(!ordered_end.resume, "...and is never resumed when the scale-down ends");
+			auto both = DecideGroup(true, false, true, true, false);
+			Check(!both.resume && both.self_drained, "the scale-down ends while the group is gone: still drained");
+			auto group_back = DecideGroup(true, true, true, true, true);
+			Check(!group_back.resume, "the group back while scaled down: still drained");
+		});
 	});
 }
