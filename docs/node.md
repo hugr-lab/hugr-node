@@ -104,7 +104,9 @@ tresor whose SCOPE is the control plane's URL. The control plane answers with po
 ## What the node does, in order
 
 1. **Hardening.** Extension repositories allowed; autoinstall, autoload and persistent secrets off. tresor's requests
-   go through duckdb's HTTP client, so they trust `HUGR_CA_FILE`.
+   go through duckdb's HTTP client, so they trust `HUGR_CA_FILE`. The load report is served
+   (`acl_metrics_endpoint`): the Flight Handshake `node-load` and the quack listener's `/metrics` answer only a bearer
+   whose roles hold `observe`. The console reads a node's report there, and that opens no session.
 2. **tresor.** It logs in with the node's identity and attaches the service, acting for sessions.
 3. **The bootstrap document** from the control plane.
 4. **The repository.** `CREATE OR REPLACE EXTENSION REPOSITORY`: the signing keys come from the repository's
