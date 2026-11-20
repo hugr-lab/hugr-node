@@ -251,7 +251,7 @@ ACL ROLE "plain" SET GLOBAL acl_node_group = 'etl';
 
 # an item of another group is written, never applied on this node
 query II
-SELECT r.applied_here, r.note FROM (SELECT acl_cluster_attach('etl', 'etl_src', ':memory:', 'duckdb', '', '{}', '', '') AS r);
+SELECT r.applied_here, r.message FROM (SELECT acl_cluster_attach('etl', 'etl_src', ':memory:', 'duckdb', '', '{}', '', '') AS r);
 ----
 false	item of resource group etl - this node is in group interactive; the group's nodes roll it out
 
@@ -311,7 +311,7 @@ ACL ROLE "plain" SELECT acl_cluster_applied(0);
 
 # the setting written for another group is not applied here either, and says so
 query II
-SELECT r.applied_here, r.note FROM (SELECT acl_cluster_setting('set', 'etl', 'threads', '6') AS r);
+SELECT r.applied_here, r.message FROM (SELECT acl_cluster_setting('set', 'etl', 'threads', '6') AS r);
 ----
 false	item of resource group etl - this node is in group interactive; the group's nodes roll it out
 
@@ -341,14 +341,14 @@ SELECT acl_cluster_attach('etl', 'src3', ':memory:', 'duckdb', '', '{}', 'src1',
 
 # interactive's own src1, on a node where the cluster's is attached: a re-point, the agent's
 query III
-SELECT r.applied_here, r."class", r.note FROM (SELECT acl_cluster_attach('interactive', 'src1', ':memory:', 'duckdb', '', '{}', '', '') AS r);
+SELECT r.applied_here, r."class", r.message FROM (SELECT acl_cluster_attach('interactive', 'src1', ':memory:', 'duckdb', '', '{}', '', '') AS r);
 ----
 false	drain	drain class - it overrides the cluster's source of that name on this group's nodes; re-pointing an attached source is DETACH + ATTACH under the same name; each node reports it pending for a drain
 
 # removing the override: nothing depends on IT (the cluster's src2 depends on the cluster's src1), and
 # the cluster's src1 is in effect again - re-pointed, never detached
 query III
-SELECT r.applied_here, r."class", r.note FROM (SELECT acl_cluster_detach('interactive', 'src1', 'false', 'false') AS r);
+SELECT r.applied_here, r."class", r.message FROM (SELECT acl_cluster_detach('interactive', 'src1', 'false', 'false') AS r);
 ----
 false	drain	the cluster's source of that name is in effect again on this node: src1 - the node reports it pending for a drain
 
@@ -370,7 +370,7 @@ SELECT acl_cluster_detach('', 'src1', 'false', 'false');
 # the cluster's src1 with what depends on it - its own src2 and etl's src3; on this node interactive's
 # src1 stays, the cluster's src2 goes
 query II
-SELECT r.applied_here, r.note FROM (SELECT acl_cluster_detach('', 'src1', 'true', 'false') AS r);
+SELECT r.applied_here, r.message FROM (SELECT acl_cluster_detach('', 'src1', 'true', 'false') AS r);
 ----
 false	cluster item overridden by resource group interactive's own on this node - not applied here; detached with it: src2, src3 (group etl)
 
@@ -439,7 +439,7 @@ statement ok
 SELECT acl_cluster_attach('interactive', 'src4', ':memory:', 'duckdb', '', '{}', 'src1', '');
 
 query II
-SELECT r.applied_here, r.note FROM (SELECT acl_cluster_detach('', 'src1', 'false', 'false') AS r);
+SELECT r.applied_here, r.message FROM (SELECT acl_cluster_detach('', 'src1', 'false', 'false') AS r);
 ----
 false	cluster item overridden by resource group interactive's own on this node - not applied here
 
@@ -461,7 +461,7 @@ SELECT acl_cluster_detach('interactive', 'src5', 'false', 'false');
 <REGEX>:.*source "src6" of group interactive DEPENDS ON "src5" - detach it first, or DETACH src5 CASCADE.*
 
 query II
-SELECT r.applied_here, r.note FROM (SELECT acl_cluster_detach('interactive', 'src5', 'true', 'false') AS r);
+SELECT r.applied_here, r.message FROM (SELECT acl_cluster_detach('interactive', 'src5', 'true', 'false') AS r);
 ----
 true	detached with it: src6 (group interactive)
 
@@ -485,7 +485,7 @@ statement ok
 SELECT acl_cluster_attach('etl', 'c', ':memory:', 'duckdb', '', '{}', 'a', '');
 
 query II
-SELECT r.applied_here, r.note LIKE '%c (group etl)%' FROM (SELECT acl_cluster_detach('', 'x', 'true', 'false') AS r);
+SELECT r.applied_here, r.message LIKE '%c (group etl)%' FROM (SELECT acl_cluster_detach('', 'x', 'true', 'false') AS r);
 ----
 true	true
 

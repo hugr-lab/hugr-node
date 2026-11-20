@@ -40,6 +40,24 @@ std::string One(Connection &con, const std::string &sql) {
 	return result->RowCount() ? result->Collection().GetValue(0, 0).ToString() : "";
 }
 
+//! A CLUSTER statement's answer (duckdb-acl spec 179: `ok, message`, then the item's fields) as `{'name': value, …}`
+std::string Answer(Connection &con, const std::string &sql) {
+	auto result = con.Query(sql);
+	if (result->HasError()) {
+		return "ERROR: " + result->GetError();
+	}
+	if (!result->RowCount()) {
+		return "";
+	}
+	std::string out = "{";
+	for (idx_t c = 0; c < result->ColumnCount(); c++) {
+		auto value = result->Collection().GetValue(c, 0);
+		out += (c ? ", '" : "'") + result->ColumnName(c).GetIdentifierName() +
+		       "': " + (value.IsNull() ? std::string("NULL") : value.ToString());
+	}
+	return out + "}";
+}
+
 bool Refused(Connection &con, const std::string &sql, const std::string &why) {
 	auto result = con.Query(sql);
 	return Check(result->HasError() && result->GetError().find(why) != std::string::npos,
@@ -93,7 +111,7 @@ int main() {
 
 		Scenario("the install loads the extension and writes a version and a repository", [&] {
 			auto answer =
-			    One(con, "ACL ADMIN CLUSTER INSTALL EXTENSION postgres_scanner VERSION 'v9.9.9' FROM trusted");
+			    Answer(con, "ACL ADMIN CLUSTER INSTALL EXTENSION postgres_scanner VERSION 'v9.9.9' FROM trusted");
 			Check(answer.find("'applied_here': true") != std::string::npos, "applied on this node: " + answer);
 			Check(One(con, "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'postgres_query'") != "0",
 			      "loaded: its functions are registered");
@@ -115,7 +133,7 @@ int main() {
 			// a second trusted repository: an update naming none keeps the item's, never refused for the choice
 			Exec(con, "CREATE EXTENSION REPOSITORY other WITH PREFIX '" + base + "/repo' USING PUBLIC KEY '" +
 			              PUBLIC_KEY + "'");
-			auto answer = One(con, "ACL ADMIN CLUSTER UPDATE EXTENSION postgres_scanner VERSION 'v9.9.10'");
+			auto answer = Answer(con, "ACL ADMIN CLUSTER UPDATE EXTENSION postgres_scanner VERSION 'v9.9.10'");
 			Check(answer.find("'class': restart") != std::string::npos, "an update with two repositories: " + answer);
 			auto spec = One(con, "SELECT spec FROM acl_cluster_items() WHERE name = 'postgres_scanner'");
 			Check(spec.find("\"repository\": \"trusted\"") != std::string::npos &&
@@ -146,11 +164,11 @@ int main() {
 		});
 
 		Scenario("an update or a removal is restart class: described, not applied live", [&] {
-			auto answer = One(con, "ACL ADMIN CLUSTER UPDATE EXTENSION postgres_scanner VERSION 'v9.9.10'");
+			auto answer = Answer(con, "ACL ADMIN CLUSTER UPDATE EXTENSION postgres_scanner VERSION 'v9.9.10'");
 			Check(answer.find("'class': restart") != std::string::npos &&
 			          answer.find("'applied_here': false") != std::string::npos,
 			      "update: " + answer);
-			answer = One(con, "ACL ADMIN CLUSTER REMOVE EXTENSION postgres_scanner");
+			answer = Answer(con, "ACL ADMIN CLUSTER REMOVE EXTENSION postgres_scanner");
 			Check(answer.find("'class': restart") != std::string::npos, "remove: " + answer);
 			Check(One(con, "SELECT count(*) FROM acl_cluster_items()") == "0", "the item left the profile");
 		});

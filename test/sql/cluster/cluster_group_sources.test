@@ -110,7 +110,7 @@ ACL ADMIN CLUSTER SET threads = 2 IN GROUP etl;
 # the operator's own SQL on this node is its own (never refused) - a source the set leaves out is written for the
 # cluster, never attached here
 query II
-SELECT (r).applied_here, (r).note LIKE '%not attached by the nodes of group(s) etl%'
+SELECT (r).applied_here, (r).message LIKE '%not attached by the nodes of group(s) etl%'
 FROM (SELECT acl_cluster_attach('', 'elsewhere', ':memory:', 'duckdb', '', '{}', '', '') AS r);
 ----
 false	true
@@ -160,7 +160,7 @@ SELECT spec FROM acl_cluster_items() WHERE kind = 'sources';
 
 # a source the set leaves out is attached by every group but etl, and the answer says so
 query I
-SELECT (acl_cluster_attach('', 'later', ':memory:', 'duckdb', '', '{}', '', '')).note LIKE
+SELECT (acl_cluster_attach('', 'later', ':memory:', 'duckdb', '', '{}', '', '')).message LIKE
     '%not attached by the nodes of group(s) etl - their source set does not list it%';
 ----
 true
@@ -187,7 +187,7 @@ statement ok
 SELECT acl_cluster_attach('etl', 'etl_only', ':memory:', 'duckdb', '', '{}', '', '');
 
 query I
-SELECT (acl_cluster_attach('etl', 'etl_only', ':memory:', 'duckdb', '', '{}', '', '')).note;
+SELECT (acl_cluster_attach('etl', 'etl_only', ':memory:', 'duckdb', '', '{}', '', '')).message;
 ----
 not attached by the nodes of group(s) etl - their source set does not list it (CLUSTER SET SOURCES names what they attach)
 
