@@ -109,6 +109,28 @@ them every source again.
   - `ALL` is written only with `LAZY`: every source attached at once is what `RESET SOURCES` gives.
   - A node of an `ALL` group is not partial, so it writes the policy: its probes attach the lazy sources first.
 
+- **What a group's roles reach.** `platform.group_sources(['<group>'])` (the cluster bundle's, in FROM; unprefixed
+  `acl_cluster_group_sources`) answers one row per source that the group's roles reach or that its set lists. Its
+  columns are `group`, `source`, `roles`, `listed` and `repair`.
+  - `roles` are the group's roles that reach the source: a grant, a relation, a live alias, or a view, an RLS, a
+    mask, a computed column or a template that names it, as `platform.exposures` reads them. The default group's
+    roles are every role bound to no group, a token's role without a `CREATE ROLE` included.
+  - `listed` says whether the set lists the source; it is NULL when the group has no list.
+  - `repair` is the statement that lists a source the set leaves out: the set as written, the missing source, and
+    whatever it `DEPENDS ON`, with the set's lazy marks. Paste it after your prefix.
+  - Another group's own source that the roles reach is shown with `listed = false`. Its repair names the
+    `CLUSTER ATTACH … IN GROUP <group>` to write first.
+  - Without an argument it answers every group whose set is a list. That is the check: a row with `listed = false`
+    is a source the group's roles reach but its nodes do not attach, and every read of it by them is refused.
+  - Nothing is applied by itself: a new grant leaves the set as it is.
+  - **Its limits.**
+    - A principal that holds a role bound to the group and a role bound to none reads with both on the group's nodes.
+      The unbound role's reach is shown only for the default group.
+    - The reach of a physical function the gate admits, of a `GRANT SOURCE` and of a physical view reading another
+      source is not counted.
+    - Run it on a node that attaches every source: a two-part name in an old body is read against the attached
+      databases.
+
 ### A lazy source
 
 `CLUSTER ATTACH … LAZY` marks a source that a node attaches only when a statement reads it (spec 035 stage 2), and
