@@ -141,6 +141,36 @@ SELECT count(*) FROM duckdb_databases() WHERE database_name = 'later';
 ----
 0
 
+# a dependent written while what it loads through is lazily detached here: the tick attaches both, in their order
+statement ok
+DETACH base;
+
+query TT
+SELECT (r).applied_here, (r).note FROM (SELECT acl_cluster_attach('', 'lean2', ':memory:', 'duckdb', '', '{}', 'base',
+    '') AS r);
+----
+false	attached on this node by its next tick, after "base" it depends on
+
+# a set that states no IDLE keeps a source's own
+statement ok
+SELECT acl_cluster_attach('', 'own2h', ':memory:', 'duckdb', '', '{}', '', '', '', 'true', '2 hours');
+
+statement ok
+ACL ADMIN CLUSTER SET SOURCES ALL LAZY IN GROUP etl;
+
+query T
+SELECT spec LIKE '%7200%' FROM acl_cluster_effective() WHERE name = 'own2h';
+----
+true
+
+statement ok
+ACL ADMIN CLUSTER SET SOURCES ALL LAZY IDLE '30 min' IN GROUP etl;
+
+query T
+SELECT spec LIKE '%1800%' FROM acl_cluster_effective() WHERE name = 'own2h';
+----
+true
+
 # --- a listed set, lazy: only those, each on demand; the node is partial again ----------------------
 
 statement ok
@@ -172,4 +202,6 @@ SELECT name, spec LIKE '%"lazy"%' FROM acl_cluster_effective() WHERE kind = 'sou
 archive	false
 base	false
 later	false
+lean2	false
 leaning	false
+own2h	true

@@ -444,6 +444,11 @@ void RequireListedDependencies(const std::function<unique_ptr<QueryResult>(const
 	}
 }
 
+//! the node's secrets service (tresor): attached at the bootstrap, never lazy
+bool IsSecretsServiceSource(const string &type, const string &path) {
+	return StringUtil::CIEquals(SourceTypeOf(type, path), "tresor");
+}
+
 //! spec 035 stage 2b: whether `group`'s source set attaches its sources on demand
 bool GroupSetLazy(CatalogBackend &catalog, const string &group) {
 	if (group.empty() || catalog.FunctionMode()) {
@@ -1014,7 +1019,7 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 		throw BinderException(
 		    "acl cluster: a lazy source attaches alone - LAZY and DEPENDS ON are not written together");
 	}
-	if (lazy && StringUtil::CIEquals(SourceTypeOf(type, path), "tresor")) {
+	if (lazy && IsSecretsServiceSource(type, path)) {
 		throw BinderException("acl cluster: the secrets service is attached at the bootstrap, never LAZY");
 	}
 	auto idle_seconds = IdleSecondsOf(*db, lazy, idle);
@@ -1160,14 +1165,28 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 			    }
 			    return;
 		    }
-		    // spec 035 stage 2b: this node's group attaches its sources on demand (but a DEPENDS ON chain's)
-		    if (!lazy && depends_on.empty() && GroupSetLazy(*catalog, NodeGroupOf(*db)) &&
-		        catalog->Query("SELECT 1 FROM " + catalog->Tbl("cluster_deps") +
-		                       " WHERE lower(\"depends_on\") = lower(" + Lit(alias) + ")")
-		                ->RowCount() == 0) {
-			    answer.note = "lazy on this node - its group's source set attaches each source when a statement "
-			                  "first reads it";
-			    return;
+		    // spec 035 stage 2b: this node's group attaches its sources on demand - but a DEPENDS ON chain's and the
+		    // secrets service, as its effective profile says (ClusterEffective's rule, on what is committed)
+		    if (!lazy && GroupSetLazy(*catalog, NodeGroupOf(*db))) {
+			    auto effective = ClusterEffective();
+			    bool depended = false;
+			    for (auto &item : effective) {
+				    for (auto &dep : item.depends_on) {
+					    depended = depended || (item.kind == "source" && StringUtil::CIEquals(dep, alias));
+				    }
+			    }
+			    if (depends_on.empty() && !depended && !IsSecretsServiceSource(type, path)) {
+				    answer.note = "lazy on this node - its group's source set attaches each source when a statement "
+				                  "first reads it";
+				    return;
+			    }
+			    for (auto &dep : depends_on) {
+				    if (!NodeHasDatabase(*db, dep)) {
+					    // what it loads through is lazily detached here: the tick attaches both, in their order
+					    answer.note = "attached on this node by its next tick, after \"" + dep + "\" it depends on";
+					    return;
+				    }
+			    }
 		    }
 		    if (lazy) {
 			    answer.note = "lazy - attached on this node by the first statement that reads it" +
@@ -1826,7 +1845,8 @@ vector<PolicyStore::ClusterItem> PolicyStore::ClusterEffective() {
 	}
 	out = std::move(kept);
 	if (lazy_set) {
-		// a source in a DEPENDS ON chain is attached at once: what loads through another needs it attached first
+		// a source in a DEPENDS ON chain is attached at once: what loads through another needs it attached first; so is
+		// the secrets service, which no statement reads (a SECRET of another source does)
 		case_insensitive_set_t chained;
 		for (auto &item : out) {
 			if (item.kind == "source" && !item.depends_on.empty()) {
@@ -1835,9 +1855,14 @@ vector<PolicyStore::ClusterItem> PolicyStore::ClusterEffective() {
 			}
 		}
 		for (auto &item : out) {
-			if (item.kind == "source" && !chained.count(item.name)) {
-				item.spec = WithLazyMarks(item.spec, true, lazy_idle);
+			if (item.kind != "source" || chained.count(item.name) ||
+			    IsSecretsServiceSource(JsonField(item.spec, "type"), JsonField(item.spec, "path"))) {
+				continue;
 			}
+			// a set that states no IDLE keeps the source's own
+			int64_t own_idle = 0;
+			ClusterSourceLazy(item, own_idle);
+			item.spec = WithLazyMarks(item.spec, true, lazy_idle > 0 ? lazy_idle : own_idle);
 		}
 	}
 	// the profile's order - settings, extensions, sources - whichever scope each came from: a group's own

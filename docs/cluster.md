@@ -102,7 +102,10 @@ them every source again.
   role of the group works at its first statement. On the group's nodes the set's marks replace a source's own
   (`acl_cluster_effective()` shows them), and everything below about a lazy source applies.
   - A source in a `DEPENDS ON` chain (one that loads through another, or one another loads through) is attached at
-    once all the same.
+    once all the same, and so is the secrets service.
+  - A set's `IDLE` replaces a source's own; a set that states none keeps it.
+  - Write `ALL LAZY` with an `IDLE`: a policy write on such a node attaches every lazy source for its probes, and
+    without an idle time they then stay attached.
   - `ALL` is written only with `LAZY`: every source attached at once is what `RESET SOURCES` gives.
   - A node of an `ALL` group is not partial, so it writes the policy: its probes attach the lazy sources first.
 

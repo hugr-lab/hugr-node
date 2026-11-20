@@ -127,6 +127,17 @@ inline TickDecision DecideTick(const std::vector<TickItem> &items, const std::ve
 			}
 		}
 	}
+	// spec 035 stage 2b: a source attached here on demand that the profile dropped before the node took it (a set
+	// switched) - its note is all that says it is the node's
+	for (auto &key : applied_here) {
+		if (key.first != "source" || in_profile.count(key) || taken.count(key)) {
+			continue;
+		}
+		auto found = state_of.find(key);
+		if (found != state_of.end() && found->second == "node_only") {
+			out.detach.push_back(key.second);
+		}
+	}
 	// what the node took and the profile dropped: a source goes now (if it is still here), the rest at a restart
 	for (auto &took : taken) {
 		if (in_profile.count(took.first)) {

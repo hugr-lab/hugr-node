@@ -214,12 +214,16 @@ ATTACH item's spec, `sources` a new kind with its list. No schema step: the item
   - Refused: `ALL` without `LAZY` (that is `RESET SOURCES`), `RESET` with `LAZY`, an interval under a minute or
     `IDLE ''`.
 - **The effective profile.** `ClusterEffective` on the group's nodes puts the set's marks in place of each source's
-  own (`WithLazyMarks`). A source that depends on another or that another depends on keeps its own marks and is
-  attached at once.
+  own (`WithLazyMarks`; a set without `IDLE` keeps the source's own idle time). A source that depends on another or
+  that another depends on keeps its own marks and is attached at once, and so is the secrets service (`TYPE tresor`:
+  no statement reads it, a SECRET of another source does).
 - **Not partial.** An `ALL` set lists nothing, so the node is not partial (`GroupDeclaresSources` is false) and writes
   the policy.
-- **The writing node.** An ATTACH written on a node whose group's set is lazy is not attached there; its answer says
-  so.
+- **The writing node.** An ATTACH written on a node whose group's set is lazy is not attached there, by the same rule
+  read from the committed profile; its answer says so. A dependent whose dependency is lazily detached there is left
+  to the tick, which attaches both in their order.
+- **The tick.** A source attached on demand that the profile drops (a set switched) before the tick took it is
+  detached by its applied-here note.
 - **Not automatic** (the owner): the set never changes by itself when a role of the group gets a grant that reaches
   another source. The grant's answer will name the group and the statement to paste, and the check's
   `group_source_missing` will name it too, with its repair (stage 3). `ALL LAZY` is the group with no list to keep.
