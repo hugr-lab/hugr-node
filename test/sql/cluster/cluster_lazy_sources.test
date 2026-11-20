@@ -1,0 +1,188 @@
+# name: test/sql/cluster/cluster_lazy_sources.test
+# description: spec 035 stage 2 - a lazy source (CLUSTER ATTACH … LAZY [IDLE '<interval>']): never attached by the
+#   profile, attached by the first statement that reads it (duckdb-acl spec 177), shown `lazy` by the drift
+# group: [sql]
+
+require hugr_node
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+# the source's data, then let go: the profile attaches it
+statement ok
+ATTACH '{TEST_DIR}/lazy_archive.duckdb' AS seed;
+
+statement ok
+CREATE OR REPLACE TABLE seed.main.t AS SELECT 1 AS a;
+
+statement ok
+DETACH seed;
+
+# --- refused where written -------------------------------------------------------------------------
+
+statement error
+ACL ADMIN CLUSTER ATTACH '{TEST_DIR}/lazy_archive.duckdb' AS archive (TYPE duckdb) LAZY IDLE 'soon';
+----
+<REGEX>:.*IDLE 'soon' is not an interval duckdb reads.*
+
+statement error
+ACL ADMIN CLUSTER ATTACH '{TEST_DIR}/lazy_archive.duckdb' AS archive (TYPE duckdb) LAZY IDLE '30 seconds';
+----
+<REGEX>:.*IDLE '30 seconds' is under a minute.*
+
+statement error
+SELECT acl_cluster_attach('', 'archive', ':memory:', 'duckdb', '', '{}', '', '', '', '', '30 min');
+----
+<REGEX>:.*IDLE is a lazy source's - write LAZY IDLE.*
+
+statement error
+ACL ADMIN CLUSTER ATTACH '{TEST_DIR}/lazy_archive.duckdb' AS archive (TYPE duckdb) IDLE '30 min';
+----
+
+statement error
+ACL ADMIN CLUSTER ATTACH '{TEST_DIR}/lazy_archive.duckdb' AS archive (TYPE duckdb) LAZY IDLE '';
+----
+<REGEX>:.*IDLE names an interval.*
+
+statement error
+SELECT acl_cluster_attach('', 'archive', ':memory:', 'duckdb', '', '{}', '', '', '', 'yes', '');
+----
+<REGEX>:.*lazy is 'true' or 'false'.*
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS base (TYPE duckdb);
+
+statement error
+ACL ADMIN CLUSTER ATTACH ':memory:' AS over_base (TYPE duckdb) LAZY DEPENDS ON (base);
+----
+<REGEX>:.*a lazy source attaches alone - LAZY and DEPENDS ON are not written together.*
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS leaning (TYPE duckdb) DEPENDS ON (base);
+
+statement error
+ACL ADMIN CLUSTER ATTACH ':memory:' AS base (TYPE duckdb) LAZY;
+----
+<REGEX>:.*"base" is what leaning loads through - a source others depend on is never LAZY.*
+
+statement ok
+ACL ADMIN CLUSTER DETACH base CASCADE;
+
+# --- written, never attached by the profile --------------------------------------------------------
+
+query TT
+SELECT (r).applied_here, (r).note FROM (SELECT acl_cluster_attach('', 'archive',
+    '{TEST_DIR}/lazy_archive.duckdb', 'duckdb', '', '{}', '', '', '', 'true', '30 min') AS r);
+----
+false	lazy - attached on this node by the first statement that reads it, detached after it idles
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'archive';
+----
+0
+
+query TT
+SELECT spec LIKE '%"lazy": "true"%', spec LIKE '%"idle_seconds": "1800"%' FROM acl_cluster_items()
+WHERE name = 'archive';
+----
+true	true
+
+query TT
+SELECT name, state FROM acl_platform_drift() WHERE kind = 'database' AND name = 'archive';
+----
+archive	lazy
+
+statement error
+ACL ADMIN CLUSTER ATTACH ':memory:' AS on_lazy (TYPE duckdb) DEPENDS ON (archive);
+----
+<REGEX>:.*DEPENDS ON "archive" - a lazy source; nothing loads through one.*
+
+# the grammar's form: LAZY alone is never detached by itself
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS scratch (TYPE duckdb) LAZY;
+
+query TT
+SELECT spec LIKE '%"lazy": "true"%', spec LIKE '%idle_seconds%' FROM acl_cluster_items() WHERE name = 'scratch';
+----
+true	false
+
+# --- the policy over it: the write's probes attach it (spec 177), a principal's read attaches it again ---
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS archive.main.t;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'archive';
+----
+1
+
+# as if it went idle
+statement ok
+DETACH archive;
+
+query I
+ACL ROLE 'analyst' SELECT a FROM t;
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'archive';
+----
+1
+
+query TT
+SELECT name, state FROM acl_platform_drift() WHERE kind = 'database' AND name = 'archive';
+----
+archive	same
+
+# a listing never wakes it
+statement ok
+DETACH archive;
+
+statement ok
+ACL ROLE 'analyst' SELECT * FROM information_schema.tables;
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'archive';
+----
+0
+
+# --- the marks alone change: no re-point ---------------------------------------------------------
+
+query TT
+SELECT (r).class, (r).applied_here FROM (SELECT acl_cluster_attach('', 'archive',
+    '{TEST_DIR}/lazy_archive.duckdb', 'duckdb', '', '{}', '', '', '', 'true', '2 hours') AS r);
+----
+hot	false
+
+query T
+SELECT spec LIKE '%"idle_seconds": "7200"%' FROM acl_cluster_items() WHERE name = 'archive';
+----
+true
+
+# no longer lazy: attached at once, as any source
+query TT
+SELECT (r).class, (r).applied_here FROM (SELECT acl_cluster_attach('', 'archive',
+    '{TEST_DIR}/lazy_archive.duckdb', 'duckdb', '', '{}', '', '') AS r);
+----
+hot	true
+
+query T
+SELECT spec LIKE '%"lazy"%' FROM acl_cluster_items() WHERE name = 'archive';
+----
+false

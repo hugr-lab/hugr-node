@@ -934,6 +934,10 @@ string SettingValueOf(const acl::PolicyStore::ClusterItem &item) {
 //! spec 010: one effective item's statements, an engine setting cut to the pod's ceiling (`cut` says whether it was)
 vector<string> ProfileItemStatements(const acl::PolicyStore::ClusterItem &item, const PodResources &pod, bool &cut) {
 	cut = false;
+	int64_t idle_seconds = 0;
+	if (acl::ClusterSourceLazy(item, idle_seconds)) {
+		return {}; // spec 035 stage 2: attached on demand, never at the bootstrap
+	}
 	auto statements = acl::ClusterItemApplyStatements(item);
 	if (item.kind != "setting") {
 		return statements;
@@ -1221,7 +1225,8 @@ struct TickState {
 //! an item as the tick reads it: an extension by its canonical name (`postgres` is loaded as `postgres_scanner`)
 TickItem TickItemOf(const acl::PolicyStore::ClusterItem &item) {
 	auto name = item.kind == "extension" ? ExtensionHelper::ApplyExtensionAlias(item.name) : item.name;
-	return {item.kind, name, item.spec};
+	// spec 035 stage 2: a source as where it is - a change of its lazy marks alone re-points nothing
+	return {item.kind, name, item.kind == "source" ? acl::ClusterSourceIdentity(item.spec) : item.spec};
 }
 
 TickKey TickKeyOf(const TickItem &item) {
@@ -1297,15 +1302,18 @@ string ApplyHot(DatabaseInstance &db, const acl::PolicyStore::ClusterItem &item,
 void Converge(DatabaseInstance &db, acl::PolicyStore &store, const AgentEnvironment &env, TickState &state) {
 	auto version = store.ClusterVersion();
 	auto items = store.ClusterEffective();
-	auto drift = TickDriftOf(store.ClusterDrift(), env.pod);
-	vector<TickItem> tick_items;
-	for (auto &item : items) {
-		tick_items.push_back(TickItemOf(item));
-	}
+	acl::RefreshLazySources(db, items);
+	// the notes before the drift: what is applied after this read is seen by the next tick, never lost between the two
+	// (an attach on demand leaves its note once)
 	std::set<TickKey> applied_here;
 	for (auto &note : acl::TakeAppliedHere(db)) {
 		auto name = note.first == "extension" ? ExtensionHelper::ApplyExtensionAlias(note.second) : note.second;
 		applied_here.insert({note.first, TickLower(name)});
+	}
+	auto drift = TickDriftOf(store.ClusterDrift(), env.pod);
+	vector<TickItem> tick_items;
+	for (auto &item : items) {
+		tick_items.push_back(TickItemOf(item));
 	}
 	auto decision = DecideTick(tick_items, drift, state.taken, applied_here);
 	for (auto index : decision.adopt) {
@@ -1338,6 +1346,17 @@ void Converge(DatabaseInstance &db, acl::PolicyStore &store, const AgentEnvironm
 			state.taken.erase({"source", TickLower(alias)});
 			Log("tick: source " + alias + " detached (profile version " + std::to_string(version) + ")");
 		}
+	}
+	// spec 035 stage 2: a lazy source nobody read for its idle time goes; the next statement that reads it attaches it
+	std::set<string> taken_sources;
+	for (auto &took : state.taken) {
+		if (took.first.first == "source") {
+			taken_sources.insert(took.first.second);
+		}
+	}
+	for (auto &alias : acl::DetachIdleLazySources(db, taken_sources)) {
+		state.taken.erase({"source", TickLower(alias)}); // the next attach on demand is taken again
+		Log("tick: lazy source " + alias + " detached (idle)");
 	}
 	if (!hot_failed && version != state.applied) {
 		TickQuery(db, "SELECT acl_cluster_applied(" + std::to_string(version) + ")");
@@ -1586,13 +1605,20 @@ string RunPragma(ClientContext &context, const FunctionParameters &parameters) {
 	}
 	TickState tick;
 	auto version = store->ClusterVersion();
-	for (auto &item : store->ClusterEffective()) {
+	auto effective = store->ClusterEffective();
+	// spec 035 stage 2: a lazy source is not attached here - the first statement that reads it does
+	acl::RefreshLazySources(db, effective);
+	for (auto &item : effective) {
 		bool cut = false;
 		for (auto &sql : ProfileItemStatements(item, env.pod, cut)) {
 			RunStep(db, "6 profile: " + item.kind + " " + item.name, sql);
 		}
 		if (cut) {
 			Log("step 6 profile: " + item.name + " cut to the pod's ceiling");
+		}
+		int64_t idle_seconds = 0;
+		if (acl::ClusterSourceLazy(item, idle_seconds)) {
+			continue; // not attached here: the node takes it when a statement attaches it (its applied-here note)
 		}
 		auto tick_item = TickItemOf(item);
 		tick.taken[TickKeyOf(tick_item)] = tick_item.spec;

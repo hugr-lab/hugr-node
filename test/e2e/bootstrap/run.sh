@@ -34,6 +34,9 @@
 #  16. the second node finds it and writes nothing;
 #  17. a token of the administrators' claim from the console's client is the platform's administrator (cluster,
 #      policy, passthrough); the same token from another application is refused.
+#  17b. a lazy source (spec 035 stage 2), written on the first node over Flight by the administrator: neither node
+#      attaches it (the second's bootstrap skips it), the first attaches it for a policy write and for a read,
+#      detaches it after its idle minute, and a read attaches it again (needs python's adbc_driver_flightsql).
 # Then an upgrade's catalog migration (spec 017), on the first catalog stamped one schema version back:
 #  18. a node not told to migrate stops at step 5 with acl's "migrate it first", and opens no port;
 #  19. a node told (the document's catalog.migrate) migrates it, serves, and its heartbeat carries its DuckDB release,
@@ -738,6 +741,48 @@ wait_for 90 grep_ready || {
 grep -q 'step 5 first policy: written - issuer platform_idp, 1 client(s), 2 resource group(s)' "$TMP/node-a-first.log" ||
 	fail "the first node did not write the first policy"
 echo "ok: the first node on an empty catalog wrote the first policy and serves"
+
+# spec 035 stage 2: a lazy source, written on node a by the administrator over Flight - before node b starts, so its
+# bootstrap reads it
+LAZY_ADBC=""
+python3 -c 'import adbc_driver_flightsql.dbapi' 2>/dev/null && LAZY_ADBC=1
+cat >"$TMP/flight_sql.py" <<'PY'
+import sys
+import adbc_driver_flightsql.dbapi as flightsql
+port, token = sys.argv[1:3]
+con = flightsql.connect("grpc://localhost:" + port,
+                        db_kwargs={"adbc.flight.sql.authorization_header": "Bearer " + token}, autocommit=True)
+for sql in sys.argv[3:]:
+    cur = con.cursor()
+    try:
+        cur.execute(sql)
+        for row in cur.fetchall():
+            print("|".join("" if v is None else str(v) for v in row))
+    except Exception as e:
+        print("ERROR", type(e).__name__, str(e).splitlines()[0])
+    finally:
+        cur.close()
+con.close()
+PY
+admin_sql() { # <flight port> <sql>...: each statement's rows, or its error's first line
+	local port="$1" token
+	shift
+	token="$(python3 "$TMP/mint.py" "$TMP/idp-key.pem" "$IDP" api://hugr hugr-console '["hugr-admins"]')"
+	python3 "$TMP/flight_sql.py" "$port" "$token" "$@" 2>&1 | redact
+}
+if [ -n "$LAZY_ADBC" ]; then
+	"$DUCKDB" -no-agent "$TMP/lazy.duckdb" -c "CREATE TABLE t AS SELECT 7 AS v" >/dev/null
+	got="$(admin_sql "$FLIGHT_A_PORT" \
+		"CLUSTER ATTACH '$TMP/lazy.duckdb' AS e2e_lazy (TYPE duckdb, READ_ONLY) LAZY IDLE '1 min'" \
+		"SELECT state FROM platform.drift WHERE name = 'e2e_lazy'")"
+	[[ "$got" == *"attached on this node by the first statement that reads it"* && "$got" == *$'\n'lazy* ]] ||
+		fail "the lazy source was not written as lazy on node a: $got"
+	got="$(admin_sql "$FLIGHT_A_PORT" "CREATE VIRTUAL CATALOG lz" "CREATE VIRTUAL TABLE lz.t AS e2e_lazy.main.t" \
+		"GRANT CATALOG lz TO ROLE platform_admin WITH (select) MAIN" \
+		"SELECT state FROM platform.drift WHERE name = 'e2e_lazy'")"
+	[[ "$got" != *ERROR* && "$got" == *same ]] ||
+		fail "a policy write over the lazy source did not have it attached on node a: $got"
+fi
 start_orchestrated_node b "$FLIGHT_B_PORT" "$TMP/node-b-first.log"
 grep_ready() { grep -q 'hugr_node: ready' "$TMP/node-b-first.log"; }
 wait_for 90 grep_ready || {
@@ -773,6 +818,22 @@ grep -q 'token rejected: no client of issuer "platform_idp" accepts this token' 
 	fail "a token of another application was not refused"
 }
 echo "ok: the administrators' token from the console's client holds cluster, policy and passthrough; from another application it is refused"
+
+if [ -n "$LAZY_ADBC" ]; then
+	! grep -q "e2e_lazy" "$TMP/node-b-first.log" || fail "node b attached the lazy source (bootstrap or tick)"
+	got="$(admin_sql "$FLIGHT_A_PORT" "SELECT v FROM t" "SELECT state FROM platform.drift WHERE name = 'e2e_lazy'")"
+	[ "$got" = $'7\nsame' ] || fail "a read of the lazy source on node a: $got"
+	# the read is the last use: the idle detach that counts is one after it
+	idle_before="$(grep -c "tick: lazy source e2e_lazy detached (idle)" "$TMP/node-a-first.log" || true)"
+	idled() { [ "$(grep -c "tick: lazy source e2e_lazy detached (idle)" "$TMP/node-a-first.log")" -gt "$idle_before" ]; }
+	wait_for 120 idled || fail "node a did not detach the lazy source after its idle minute"
+	got="$(admin_sql "$FLIGHT_A_PORT" "SELECT state FROM platform.drift WHERE name = 'e2e_lazy'" "SELECT v FROM t" \
+		"SELECT state FROM platform.drift WHERE name = 'e2e_lazy'")"
+	[ "$got" = $'lazy\n7\nsame' ] || fail "the lazy source after its idle detach, then read again: $got"
+	echo "ok: a lazy source - node b's bootstrap skips it, node a attaches it for a policy write and a read, detaches it idle, a read attaches it again"
+else
+	echo "note: python's adbc_driver_flightsql is not installed - the lazy source is not checked"
+fi
 
 for node in a b; do
 	pid_var="NODE_$(echo "$node" | tr a-z A-Z)_PID"

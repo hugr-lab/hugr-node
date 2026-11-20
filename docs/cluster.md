@@ -30,7 +30,8 @@ CLUSTER INSTALL EXTENSION <name> VERSION '<v>' [FROM <repository>] [IN GROUP <gr
 CLUSTER UPDATE  EXTENSION <name> VERSION '<v>' [FROM <repository>] [IN GROUP <group>] [COMMENT '<text>']
 CLUSTER REMOVE  EXTENSION <name> [IN GROUP <group>]
 CLUSTER ATTACH '<path>' AS <alias> (TYPE <type> [, SECRET <secret>] [, <option> [<value>]] …)
-        [LINEAGE '<identity>'] [DEPENDS ON (<alias>, …)] [IN GROUP <group>] [COMMENT '<text>']
+        [LAZY [IDLE '<interval>']] [LINEAGE '<identity>'] [DEPENDS ON (<alias>, …)] [IN GROUP <group>]
+        [COMMENT '<text>']
 CLUSTER DETACH <alias> [CASCADE] [FORCE] [IN GROUP <group>]
 CLUSTER SET <setting> = | TO <value> [IN GROUP <group>]
 CLUSTER RESET <setting> [IN GROUP <group>]
@@ -94,6 +95,43 @@ them every source again.
   (its record names an object in a source the node holds) all run there. `ACL NATIVE` and the operator's own SQL
   are unchanged.
 - A listing names a source outside the set as `not attached` (duckdb-acl spec 136).
+
+### A lazy source
+
+`CLUSTER ATTACH … LAZY` marks a source that a node attaches only when a statement reads it (spec 035 stage 2), and
+`LAZY IDLE '30 min'` also detaches it after that long without a read. It suits a big source that few statements read
+(an archive): nodes start without it, and its memory goes back once nobody reads it. It is meant for the nodes of a
+group that runs known statements (an application's queries, an ETL job), not one that serves analysts or other
+interactive users: their tools browse the catalog first, and a lazy source shows them its objects without columns
+until a statement reads it. For those, give their roles a resource group whose source set lists only the sources
+those roles can see (`CLUSTER SET SOURCES … IN GROUP`, above).
+
+- **Never attached by the profile.** Neither the bootstrap nor the tick attach it. The drift shows it `lazy` while it
+  is not attached (and `same` once it is), and the node reports the profile applied all the same.
+- **Attached on demand** (duckdb-acl spec 177). A principal's statement that reads the source attaches it before the
+  statement binds, under a lock per source, so concurrent statements make one attach. The source can be read
+  through a relation's physical name, a live alias, an operator's view, an RLS's subquery or a template.
+  - A statement wakes only what the policy names, because a principal's own names are virtual.
+  - A source that does not attach refuses the statement with `acl: a source this statement reads could not be
+    attached (<class>)`. Only the error's class is shown, never its text, and the principal is not told the source's
+    name. The node's log names it: `hugr_node: lazy source <alias> could not be attached (<class>)`.
+  - A statement decided earlier (a prepared one, a later statement of its batch) attaches it again before it runs.
+  - A policy write and `platform.check_catalog` / `check_grant` attach every lazy source first: their probes read
+    the sources.
+  - A listing never wakes a source: it is listed `not attached`. Until a statement reads the source, an object read
+    live from it (no declared column list) is listed without columns. A client that loads the catalog whole (a
+    quack client) sees it that way, so declare the columns of the objects such a source holds.
+- **Detached when idle.** With `IDLE`, the tick detaches the source once no statement has read it for that long and
+  no transaction uses it. A running statement or an open transaction keeps it attached, and the next tick tries
+  again. Without `IDLE` it stays attached until the node stops. Only what the node took is detached: a source it
+  attached on demand or from the profile, never one attached by hand under the alias (`ACL NATIVE`: drift).
+- **A lazy source attaches alone.** `LAZY` with `DEPENDS ON` is refused, so is a source that depends on a lazy one,
+  and so is marking lazy a source others depend on. The secrets service (`TYPE tresor`) is never lazy.
+- **The interval is duckdb's** (`CAST('<interval>' AS INTERVAL)`), at least a minute. `IDLE` without `LAZY` does not
+  read, nor does `IDLE ''`. The item's spec carries `lazy` and `idle_seconds`. Writing the source again with other marks (or none)
+  re-points nothing: an attached source stays, and one no longer lazy is attached as any source.
+- `ACL NATIVE` and the operator's own SQL are not rewritten, so they never attach a lazy source themselves; they may
+  `ATTACH` it by hand.
 
 ### What a statement does
 
