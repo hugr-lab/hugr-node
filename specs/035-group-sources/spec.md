@@ -252,6 +252,9 @@ ATTACH item's spec, `sources` a new kind with its list. No schema step: the item
     marks. It is a statement without a prefix, as acl's check writes its repairs, and names are quoted only when
     duckdb needs it (`SQLIdentifier`).
 - **Never applied by itself** (the owner): a grant leaves the set as it is.
+- **The platform part's never set** (duckdb-acl spec 178): `RegisterAclCluster` registers the prefix `hugr_node_`, so
+  `hugr_node_profile_statements`, `hugr_node_bootstrap_plan` and the like (the operator's) are never opened by a grant
+  by name. The review found that a `policy` admin could grant them before.
 - **The grant's own hint** goes to the console, which calls the check after a grant. Every management statement's
   answer becoming `(ok, message)` is a duckdb-acl spec of its own, next (the owner, 2026-11-20).
 - **Limits** (the review):

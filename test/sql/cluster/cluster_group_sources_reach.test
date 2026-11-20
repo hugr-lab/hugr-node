@@ -204,7 +204,7 @@ ACL ADMIN CREATE VIRTUAL TABLE ops.x AS only_other.main.x;
 query TTT
 SELECT source, listed, repair FROM acl_cluster_group_sources('etl') WHERE source = 'only_other';
 ----
-only_other	false	CLUSTER ATTACH '<path>' AS only_other (TYPE <type>, ...) IN GROUP etl
+only_other	false	CLUSTER ATTACH ':memory:' AS "only_other" (TYPE duckdb) IN GROUP etl
 
 # --- a principal: never through a grant by name, the cluster bundle through platform.group_sources ------
 
@@ -216,6 +216,7 @@ ACL ADMIN GRANT FUNCTION acl_cluster_group_sources TABLE TO ROLE loader;
 statement error
 ACL ROLE 'loader' SELECT * FROM acl_cluster_group_sources();
 ----
+<REGEX>:.*acl_cluster_group_sources.*
 
 statement ok
 ACL ADMIN CREATE ROLE fleet;
@@ -231,3 +232,41 @@ ACL ROLE 'fleet' SELECT count(*) FROM platform.group_sources('etl') WHERE source
 statement error
 ACL ROLE 'loader' SELECT * FROM platform.group_sources('etl');
 ----
+<REGEX>:.*the principal has no ACL administration scope.*
+
+# the policy bundle is not the cluster's
+statement ok
+ACL ADMIN CREATE ROLE keeper;
+
+statement ok
+SELECT acl_grant_admin('keeper', 'policy');
+
+statement error
+ACL ROLE 'keeper' SELECT * FROM platform.group_sources('etl');
+----
+<REGEX>:.*requires the cluster bundle.*
+
+statement error
+ACL ROLE 'keeper' SELECT count(*) FROM platform.group_sources('etl');
+----
+<REGEX>:.*no access to table function "platform.group_sources".*
+
+# the top-level form of the platform read (compiled to the table function, audited by its name - duckdb-acl spec 178)
+query TTTTT
+ACL ROLE 'fleet' SELECT * FROM platform.group_sources('etl') WHERE source = 'lake';
+----
+etl	lake	[loader]	true	NULL
+
+statement ok
+ACL ROLE 'fleet' SELECT * FROM platform.group_sources('etl');
+
+# duckdb-acl spec 178: the platform part's own functions are in the never set - a grant by name is refused
+statement error
+ACL ADMIN GRANT FUNCTION hugr_node_profile_statements TABLE TO ROLE loader;
+----
+<REGEX>:.*never callable under a principal.*
+
+statement error
+ACL ADMIN GRANT FUNCTION hugr_node_bootstrap_plan TABLE TO ROLE loader;
+----
+<REGEX>:.*never callable under a principal.*

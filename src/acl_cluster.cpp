@@ -9,6 +9,7 @@
 #include "acl_mgmt_rules.hpp"
 
 #include "acl_door_common.hpp"
+#include "acl_function_categories.hpp"
 #include "acl_platform.hpp"
 #include "acl_lineage.hpp"
 #include "acl_policy_catalog.hpp"
@@ -2189,6 +2190,21 @@ vector<GroupSourceRow> GroupSources(PolicyStore &store, const string &only_group
 		}
 		return deps;
 	};
+	auto OtherGroupAttach = [&](const string &source, const string &group) {
+		auto spec =
+		    rows_of("SELECT \"spec\" FROM " + catalog.Tbl("cluster_items") + " WHERE \"kind\" = 'source' AND " +
+		            "\"scope\" <> '' AND lower(\"name\") = lower(" + Lit(source) + ") ORDER BY \"scope\" LIMIT 1");
+		if (spec.empty()) {
+			return string();
+		}
+		// the ATTACH a node runs for it (path, type, secret's name, options, lineage), as the profile writes it
+		PolicyStore::ClusterItem item;
+		item.kind = "source";
+		item.name = source;
+		item.spec = spec[0][0].ToString();
+		auto statements = ClusterItemApplyStatements(item);
+		return statements.empty() ? string() : "CLUSTER " + statements[0] + " IN GROUP " + QuotedIfNeeded(group);
+	};
 	vector<GroupSourceRow> out;
 	for (auto &group : groups) {
 		std::set<string> members;
@@ -2249,9 +2265,9 @@ vector<GroupSourceRow> GroupSources(PolicyStore &store, const string &only_group
 			if (row.roles.empty()) {
 				continue;
 			}
-			// another group's own: no source set lists it here - it is attached IN GROUP this group first
-			row.repair = "CLUSTER ATTACH '<path>' AS " + QuotedIfNeeded(source) + " (TYPE <type>, ...) IN GROUP " +
-			             QuotedIfNeeded(group.first);
+			// another group's own: no source set lists it here - attached IN GROUP this group first, as the other
+			// group's item writes it (its spec holds no credential: a secret's name, never its value)
+			row.repair = OtherGroupAttach(source, group.first);
 			rows.push_back(std::move(row));
 		}
 		if (!missing.empty()) {
@@ -2836,6 +2852,9 @@ void RegisterClusterPlatform() {
 } // namespace
 
 void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &store) {
+	// duckdb-acl spec 178: the platform part's own table functions (the agent's plan, the profile's statements) are the
+	// operator's - in the never set, so no grant by name opens one to a principal
+	RegisterNeverCallablePrefix("hugr_node_");
 	const LogicalType &v = LogicalType::VARCHAR;
 	auto scalar = [&](const char *name, vector<LogicalType> arguments, const scalar_function_t &fn,
 	                  const LogicalType &returns) {
