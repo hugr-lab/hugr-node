@@ -1340,8 +1340,10 @@ void Converge(DatabaseInstance &db, acl::PolicyStore &store, const AgentEnvironm
 		Connection con(db);
 		auto result = con.Query("DETACH " + Ident(alias));
 		if (result->HasError()) {
-			// in use: it goes with a drain, like a re-pointed source
+			// in use: it goes with a drain, like a re-pointed source; the node's still, so a later tick tries again
+			// (one it never took - spec 035 stage 2b's applied-here source - is taken now)
 			decision.pending.push_back({"source", alias, "drain", ErrorClassOf(*result)});
+			state.taken.emplace(TickKey {"source", TickLower(alias)}, string());
 		} else {
 			state.taken.erase({"source", TickLower(alias)});
 			Log("tick: source " + alias + " detached (profile version " + std::to_string(version) + ")");

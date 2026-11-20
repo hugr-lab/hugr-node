@@ -419,6 +419,13 @@ case_insensitive_set_t SourceSetNames(const string &spec) {
 	return names;
 }
 
+string JsonField(const string &json, const char *field);
+
+//! spec 035 stage 2b: a set that names no list - every source, attached on demand (`SET SOURCES ALL LAZY`)
+bool SourceSetAll(const string &spec) {
+	return JsonField(spec, "all") == "true";
+}
+
 //! hugr-node spec 035: group's set lists `name`, whose item - from `owner` ('' the cluster, else the group) - must have
 //! every source it depends on listed too
 void RequireListedDependencies(const std::function<unique_ptr<QueryResult>(const string &)> &read,
@@ -437,14 +444,30 @@ void RequireListedDependencies(const std::function<unique_ptr<QueryResult>(const
 	}
 }
 
+//! the node's secrets service (tresor): attached at the bootstrap, never lazy
+bool IsSecretsServiceSource(const string &type, const string &path) {
+	return StringUtil::CIEquals(SourceTypeOf(type, path), "tresor");
+}
+
+//! spec 035 stage 2b: whether `group`'s source set attaches its sources on demand
+bool GroupSetLazy(CatalogBackend &catalog, const string &group) {
+	if (group.empty() || catalog.FunctionMode()) {
+		return false;
+	}
+	auto result = catalog.Query("SELECT \"spec\" FROM " + catalog.Tbl("cluster_items") +
+	                            " WHERE \"scope\" = " + Lit(group) + " AND \"kind\" = 'sources'");
+	return result->RowCount() > 0 && JsonField(result->Collection().GetValue(0, 0).ToString(), "lazy") == "true";
+}
+
 //! hugr-node spec 035: whether `group` declares its sources (its nodes attach only those)
 bool GroupDeclaresSources(CatalogBackend &catalog, const string &group) {
 	if (group.empty() || catalog.FunctionMode()) {
 		return false;
 	}
-	auto result = catalog.Query("SELECT 1 FROM " + catalog.Tbl("cluster_items") + " WHERE \"scope\" = " + Lit(group) +
-	                            " AND \"kind\" = 'sources'");
-	return result->RowCount() > 0;
+	auto result = catalog.Query("SELECT \"spec\" FROM " + catalog.Tbl("cluster_items") +
+	                            " WHERE \"scope\" = " + Lit(group) + " AND \"kind\" = 'sources'");
+	// spec 035 stage 2b: ALL LAZY may attach every source - the node is not partial
+	return result->RowCount() > 0 && !SourceSetAll(result->Collection().GetValue(0, 0).ToString());
 }
 
 string JsonField(const string &json, const char *field) {
@@ -634,6 +657,48 @@ void RefreshLazySourcesAfterWrite(PolicyStore &store, DatabaseInstance &db) {
 		RefreshLazySources(db, store.ClusterEffective());
 	} catch (std::exception &) { // NOLINT: the next tick refreshes them
 	}
+}
+
+//! spec 035 stage 2: an idle time in seconds, read by duckdb's own INTERVAL (never a reader of ours) - '' = none
+int64_t IdleSecondsOf(DatabaseInstance &db, bool lazy, const string &idle) {
+	if (idle.empty()) {
+		return 0;
+	}
+	if (!lazy) {
+		throw BinderException("acl cluster: IDLE is a lazy source's - write LAZY IDLE '<interval>'");
+	}
+	Connection con(db);
+	auto read = con.Query("SELECT CAST(epoch(CAST(" + Quoted(idle) + " AS INTERVAL)) AS BIGINT)");
+	if (read->HasError() || read->RowCount() == 0 || read->Collection().GetValue(0, 0).IsNull()) {
+		throw BinderException("acl cluster: IDLE '%s' is not an interval duckdb reads ('30 min', '2 hours')", idle);
+	}
+	auto seconds = read->Collection().GetValue(0, 0).GetValue<int64_t>();
+	if (seconds < 60) {
+		throw BinderException("acl cluster: IDLE '%s' is under a minute - a lazy source idles a minute at least", idle);
+	}
+	return seconds;
+}
+
+//! the lazy marks of a spec as JSON members, '' when not lazy
+string LazyMarks(bool lazy, int64_t idle_seconds) {
+	if (!lazy) {
+		return string();
+	}
+	return ", " + JsonQuote("lazy") + ": " + JsonQuote("true") +
+	       (idle_seconds > 0 ? ", " + JsonQuote("idle_seconds") + ": " + JsonQuote(std::to_string(idle_seconds))
+	                         : string());
+}
+
+string ClusterSourceIdentity(const string &spec);
+
+//! spec 035 stage 2b: a source item with its group set's lazy marks in place of its own
+string WithLazyMarks(const string &spec, bool lazy, int64_t idle_seconds) {
+	auto identity = ClusterSourceIdentity(spec);
+	auto close = identity.rfind('}');
+	if (close == string::npos) {
+		return spec;
+	}
+	return identity.substr(0, close) + LazyMarks(lazy, idle_seconds) + identity.substr(close);
 }
 
 string ClusterSourceIdentity(const string &spec) {
@@ -954,34 +1019,15 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 		throw BinderException(
 		    "acl cluster: a lazy source attaches alone - LAZY and DEPENDS ON are not written together");
 	}
-	if (lazy && StringUtil::CIEquals(SourceTypeOf(type, path), "tresor")) {
+	if (lazy && IsSecretsServiceSource(type, path)) {
 		throw BinderException("acl cluster: the secrets service is attached at the bootstrap, never LAZY");
 	}
-	// a lazy source's idle time, read by duckdb's own INTERVAL (never a reader of ours)
-	int64_t idle_seconds = 0;
-	if (!idle.empty()) {
-		if (!lazy) {
-			throw BinderException("acl cluster: IDLE is a lazy source's - write LAZY IDLE '<interval>'");
-		}
-		Connection con(*db);
-		auto read = con.Query("SELECT CAST(epoch(CAST(" + Quoted(idle) + " AS INTERVAL)) AS BIGINT)");
-		if (read->HasError() || read->RowCount() == 0 || read->Collection().GetValue(0, 0).IsNull()) {
-			throw BinderException("acl cluster: IDLE '%s' is not an interval duckdb reads ('30 min', '2 hours')", idle);
-		}
-		idle_seconds = read->Collection().GetValue(0, 0).GetValue<int64_t>();
-		if (idle_seconds < 60) {
-			throw BinderException("acl cluster: IDLE '%s' is under a minute - a lazy source idles a minute at least",
-			                      idle);
-		}
-	}
+	auto idle_seconds = IdleSecondsOf(*db, lazy, idle);
 	auto spec = "{" + JsonQuote("type") + ": " + JsonQuote(type) + ", " + JsonQuote("path") + ": " + JsonQuote(path) +
 	            ", " + JsonQuote("secret") + ": " + JsonQuote(secret) + ", " + JsonQuote("options") + ": " +
 	            JsonObjectOf(options) +
 	            (lineage.empty() ? string() : ", " + JsonQuote("lineage") + ": " + JsonQuote(lineage)) +
-	            (lazy ? ", " + JsonQuote("lazy") + ": " + JsonQuote("true") : string()) +
-	            (idle_seconds > 0 ? ", " + JsonQuote("idle_seconds") + ": " + JsonQuote(std::to_string(idle_seconds))
-	                              : string()) +
-	            "}";
+	            LazyMarks(lazy, idle_seconds) + "}";
 	ClusterAnswer answer;
 	bool repoint = false;
 	bool exists = false;
@@ -1065,7 +1111,11 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 			    if (scope.empty() && !CurrentSpec(read, *catalog, group, "source", alias).empty()) {
 				    continue; // the group reads its own item of that name, not this one
 			    }
-			    auto listed = SourceSetNames(set_rows.GetValue(1, r).ToString());
+			    auto set_spec = set_rows.GetValue(1, r).ToString();
+			    if (SourceSetAll(set_spec)) {
+				    continue; // every source - attached on demand there
+			    }
+			    auto listed = SourceSetNames(set_spec);
 			    if (!listed.count(alias)) {
 				    left_out.push_back(group);
 				    continue;
@@ -1114,6 +1164,29 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 				    answer.note += "; its lineage identity is declared";
 			    }
 			    return;
+		    }
+		    // spec 035 stage 2b: this node's group attaches its sources on demand - but a DEPENDS ON chain's and the
+		    // secrets service, as its effective profile says (ClusterEffective's rule, on what is committed)
+		    if (!lazy && GroupSetLazy(*catalog, NodeGroupOf(*db))) {
+			    auto effective = ClusterEffective();
+			    bool depended = false;
+			    for (auto &item : effective) {
+				    for (auto &dep : item.depends_on) {
+					    depended = depended || (item.kind == "source" && StringUtil::CIEquals(dep, alias));
+				    }
+			    }
+			    if (depends_on.empty() && !depended && !IsSecretsServiceSource(type, path)) {
+				    answer.note = "lazy on this node - its group's source set attaches each source when a statement "
+				                  "first reads it";
+				    return;
+			    }
+			    for (auto &dep : depends_on) {
+				    if (!NodeHasDatabase(*db, dep)) {
+					    // what it loads through is lazily detached here: the tick attaches both, in their order
+					    answer.note = "attached on this node by its next tick, after \"" + dep + "\" it depends on";
+					    return;
+				    }
+			    }
 		    }
 		    if (lazy) {
 			    answer.note = "lazy - attached on this node by the first statement that reads it" +
@@ -1166,7 +1239,7 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const
 		    // what it depends on listed too
 		    if (!scope.empty() && !CurrentSpec(read, *catalog, "", "source", alias).empty()) {
 			    auto set = CurrentSpec(read, *catalog, scope, "sources", "sources");
-			    if (!set.empty()) {
+			    if (!set.empty() && !SourceSetAll(set)) {
 				    auto listed = SourceSetNames(set);
 				    if (listed.count(alias)) {
 					    RequireListedDependencies(read, *catalog, scope, "", alias, listed);
@@ -1358,7 +1431,7 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const
 //! cluster attaches every source. Its nodes converge at their next tick: what left is detached (a source in use waits
 //! for a drain), what is listed and missing is attached.
 static PolicyStore::ClusterAnswer ClusterSources(PolicyStore &store, const string &verb, const string &scope,
-                                                 const string &names_json) {
+                                                 const string &names_json, bool lazy, const string &idle) {
 	RequireClusterCatalog(store.catalog, "acl_cluster_sources");
 	auto &catalog = *store.catalog;
 	auto v = StringUtil::Lower(verb);
@@ -1369,8 +1442,22 @@ static PolicyStore::ClusterAnswer ClusterSources(PolicyStore &store, const strin
 		throw BinderException("acl cluster: a source set is a group's - write it IN GROUP <group>: the cluster "
 		                      "attaches every source");
 	}
+	auto db = store.instance.lock();
+	if (!db) {
+		throw BinderException("acl cluster: the instance is gone");
+	}
+	// spec 035 stage 2b: ALL names every source - only with LAZY (without it, it is RESET SOURCES)
+	bool all = v == "set" && StringUtil::CIEquals(names_json, "all");
+	if (all && !lazy) {
+		throw BinderException("acl cluster: SOURCES ALL is written with LAZY - every source attached at once is what "
+		                      "RESET SOURCES gives the group");
+	}
+	if (v == "reset" && (lazy || !idle.empty())) {
+		throw BinderException("acl cluster: RESET SOURCES takes no LAZY - it gives the group every source again");
+	}
+	auto idle_seconds = IdleSecondsOf(*db, lazy, idle);
 	vector<string> names;
-	if (v == "set") {
+	if (v == "set" && !all) {
 		using namespace duckdb_yyjson; // NOLINT
 		auto doc = yyjson_read(names_json.c_str(), names_json.size(), 0);
 		auto root = doc ? yyjson_doc_get_root(doc) : nullptr;
@@ -1411,6 +1498,13 @@ static PolicyStore::ClusterAnswer ClusterSources(PolicyStore &store, const strin
 			    statements.push_back(DeleteItem(catalog, scope, "sources", "sources"));
 			    return;
 		    }
+		    if (all) {
+			    statements.push_back(UpsertItem(catalog, scope, "sources", "sources",
+			                                    "{" + acl::JsonQuote("all") + ": " + acl::JsonQuote("true") +
+			                                        LazyMarks(true, idle_seconds) + "}",
+			                                    answer.item_class, "", !current.empty()));
+			    return;
+		    }
 		    vector<string> json;
 		    for (auto &name : names) {
 			    // a source of the cluster or of this group, by its alias as written there
@@ -1430,14 +1524,26 @@ static PolicyStore::ClusterAnswer ClusterSources(PolicyStore &store, const strin
 			    auto owner = CurrentSpec(read, catalog, scope, "source", name).empty() ? string() : scope;
 			    RequireListedDependencies(read, catalog, scope, owner, name, listed);
 		    }
-		    statements.push_back(UpsertItem(catalog, scope, "sources", "sources",
-		                                    "{\"names\": [" + StringUtil::Join(json, ", ") + "]}", answer.item_class,
-		                                    "", !current.empty()));
+		    statements.push_back(
+		        UpsertItem(catalog, scope, "sources", "sources",
+		                   "{\"names\": [" + StringUtil::Join(json, ", ") + "]" + LazyMarks(lazy, idle_seconds) + "}",
+		                   answer.item_class, "", !current.empty()));
 	    },
 	    "config_version", [](int64_t) {});
-	answer.note = v == "set" ? "the group's nodes attach only these sources from their next tick - what left is "
-	                           "detached (a source in use waits for a drain)"
-	                         : "the group's nodes attach every source again from their next tick";
+	if (v == "reset") {
+		answer.note = "the group's nodes attach every source again from their next tick";
+	} else if (lazy) {
+		answer.note = string(all ? "the group's nodes attach every source"
+		                         : "the group's nodes attach only these "
+		                           "sources") +
+		              ", each when a statement first reads it" +
+		              (idle_seconds > 0 ? ", detached after it idles" : ", never detached by itself") +
+		              " - a source in a DEPENDS ON chain is attached at once";
+	} else {
+		answer.note = "the group's nodes attach only these sources from their next tick - what left is detached (a "
+		              "source in use waits for a drain)";
+	}
+	RefreshLazySourcesAfterWrite(store, *db);
 	return answer;
 }
 
@@ -1716,10 +1822,18 @@ vector<PolicyStore::ClusterItem> PolicyStore::ClusterEffective() {
 	// apply, the filter it is
 	case_insensitive_set_t declared;
 	bool partial = false;
+	bool lazy_set = false; // spec 035 stage 2b: the set's sources are attached on demand
+	int64_t lazy_idle = 0;
 	for (auto &item : out) {
 		if (item.kind == "sources" && !item.scope.empty()) {
-			declared = SourceSetNames(item.spec);
-			partial = true;
+			partial = !SourceSetAll(item.spec);
+			if (partial) {
+				declared = SourceSetNames(item.spec);
+			}
+			lazy_set = JsonField(item.spec, "lazy") == "true";
+			auto idle = JsonField(item.spec, "idle_seconds");
+			int64_t seconds = 0;
+			lazy_idle = !idle.empty() && TryCast::Operation<string_t, int64_t>(string_t(idle), seconds) ? seconds : 0;
 		}
 	}
 	vector<ClusterItem> kept;
@@ -1730,6 +1844,27 @@ vector<PolicyStore::ClusterItem> PolicyStore::ClusterEffective() {
 		kept.push_back(std::move(item));
 	}
 	out = std::move(kept);
+	if (lazy_set) {
+		// a source in a DEPENDS ON chain is attached at once: what loads through another needs it attached first; so is
+		// the secrets service, which no statement reads (a SECRET of another source does)
+		case_insensitive_set_t chained;
+		for (auto &item : out) {
+			if (item.kind == "source" && !item.depends_on.empty()) {
+				chained.insert(item.name);
+				chained.insert(item.depends_on.begin(), item.depends_on.end());
+			}
+		}
+		for (auto &item : out) {
+			if (item.kind != "source" || chained.count(item.name) ||
+			    IsSecretsServiceSource(JsonField(item.spec, "type"), JsonField(item.spec, "path"))) {
+				continue;
+			}
+			// a set that states no IDLE keeps the source's own
+			int64_t own_idle = 0;
+			ClusterSourceLazy(item, own_idle);
+			item.spec = WithLazyMarks(item.spec, true, lazy_idle > 0 ? lazy_idle : own_idle);
+		}
+	}
 	// the profile's order - settings, extensions, sources - whichever scope each came from: a group's own
 	// extension must come before the cluster's source that loads through it
 	auto rank = [](const string &kind) {
@@ -1871,10 +2006,12 @@ void ClusterSettingFunc(DataChunk &args, ExpressionState &state, Vector &result)
 	});
 }
 
-//! acl_cluster_sources(verb, scope, names_json)
+//! acl_cluster_sources(verb, scope, names_json[, lazy[, idle]]) - names_json 'ALL' (with lazy 'true') every source
 void ClusterSourcesFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	EachRow(args, result, [&](idx_t row) {
-		return ClusterSources(StoreOf(state), Arg(args, 0, row), Arg(args, 1, row), Arg(args, 2, row));
+		return ClusterSources(StoreOf(state), Arg(args, 0, row), Arg(args, 1, row), Arg(args, 2, row),
+		                      args.ColumnCount() > 3 && LazyFlag(Arg(args, 3, row)),
+		                      args.ColumnCount() > 4 ? Arg(args, 4, row) : string());
 	});
 }
 
@@ -2209,17 +2346,37 @@ arena_ptr<TransformResultValue> FinalizeClusterSetting(PEGTransformer &transform
 	if (what.Name() == "AclClusterSources" || (verb == "reset" && MgmtCall::Keyword(what) == "sources")) {
 		MgmtCall call(transformer, "acl_cluster_sources");
 		vector<string> json;
+		string names = "[]", lazy, idle;
 		if (verb == "set") {
-			// 'SOURCES' '(' AclNameValue AclClusterSourcesMore* ','? ')'
+			// 'SOURCES' AclClusterSourcesWhich AclClusterLazy?
 			auto &parts = what.Cast<ListParseResult>();
-			json.push_back(acl::JsonQuote(call.NameValue(parts.GetChild(2), "a source's alias")));
-			for (auto &more : MgmtCall::Each(parts.GetChild(3))) {
-				json.push_back(acl::JsonQuote(call.NameValue(
-				    MgmtCall::Part(more.get()).Cast<ListParseResult>().GetChild(1), "a source's alias")));
+			auto &which = MgmtCall::Part(parts.GetChild(1));
+			if (which.Name() == "AclClusterSourcesList") {
+				// '(' AclNameValue AclClusterSourcesMore* ','? ')'
+				auto &items = which.Cast<ListParseResult>();
+				json.push_back(acl::JsonQuote(call.NameValue(items.GetChild(1), "a source's alias")));
+				for (auto &more : MgmtCall::Each(items.GetChild(2))) {
+					json.push_back(acl::JsonQuote(call.NameValue(
+					    MgmtCall::Part(more.get()).Cast<ListParseResult>().GetChild(1), "a source's alias")));
+				}
+				names = "[" + StringUtil::Join(json, ", ") + "]";
+			} else {
+				names = "ALL"; // a one-keyword rule: what holds the keyword itself
+			}
+			// spec 035 stage 2b: AclClusterLazy <- 'LAZY' AclClusterIdle?
+			if (auto clause = MgmtCall::Optional(parts.GetChild(2))) {
+				lazy = "true";
+				if (auto given = MgmtCall::Optional(clause->Cast<ListParseResult>().GetChild(1))) {
+					idle = call.Quoted(given->Cast<ListParseResult>().GetChild(1), "the sources' idle time");
+					if (idle.empty()) {
+						throw BinderException("acl admin: IDLE names an interval ('30 min') - LAZY alone is never "
+						                      "detached");
+					}
+				}
 			}
 		}
 		auto scope = ClusterGroup(call, list.GetChild(3));
-		for (auto &part : {verb, scope, "[" + StringUtil::Join(json, ", ") + "]"}) {
+		for (auto &part : {verb, scope, names, lazy, idle}) {
 			call.Arg(Value(part));
 		}
 		return call.Result();
@@ -2278,7 +2435,10 @@ void RegisterClusterRules() {
 	rule("AclClusterAssign <- '=' / 'TO'");
 	rule("AclClusterSetting <- AclWordToken AclClusterAssign AclValue");
 	rule("AclClusterSourcesMore <- ',' AclNameValue");
-	rule("AclClusterSources <- 'SOURCES' '(' AclNameValue AclClusterSourcesMore* ','? ')'");
+	rule("AclClusterSourcesList <- '(' AclNameValue AclClusterSourcesMore* ','? ')'");
+	rule("AclClusterSourcesAll <- 'ALL'");
+	rule("AclClusterSourcesWhich <- AclClusterSourcesList / AclClusterSourcesAll");
+	rule("AclClusterSources <- 'SOURCES' AclClusterSourcesWhich AclClusterLazy?");
 	rule("AclClusterSetWhat <- AclClusterSources / AclClusterSetting");
 	rule("AclClusterResetSources <- 'SOURCES'");
 	rule("AclClusterResetWhat <- AclClusterResetSources / AclWordToken");
@@ -2306,8 +2466,8 @@ void RegisterClusterRules() {
 	     StringUtil::Format("write CLUSTER DETACH <alias> [CASCADE] [FORCE] %s", group)},
 	    {"AclClusterSet",
 	     {"set"},
-	     StringUtil::Format("write CLUSTER SET <setting> = | TO <value> %s, or CLUSTER SET SOURCES (<source>, ...) "
-	                        "IN GROUP <group>",
+	     StringUtil::Format("write CLUSTER SET <setting> = | TO <value> %s, or CLUSTER SET SOURCES (<source>, ...) | "
+	                        "ALL [LAZY [IDLE '<interval>']] IN GROUP <group>",
 	                        group)},
 	    {"AclClusterReset",
 	     {"reset"},
@@ -2396,8 +2556,8 @@ void RegisterClusterPlatform() {
 	RegisterPlatformFunction(std::move(setting));
 	RegisterPlatformFunction({"cluster_sources",
 	                          "acl_cluster_sources",
-	                          {A("verb"), A("scope"), P("names")},
-	                          {3},
+	                          {A("verb"), A("scope"), P("names"), P("lazy"), P("idle")},
+	                          {3, 4, 5},
 	                          -1,
 	                          PlatformRight::INFRASTRUCTURE,
 	                          false,
@@ -2423,6 +2583,8 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	scalar("acl_cluster_detach", {v, v, v, v}, ClusterDetachFunc, AnswerType());
 	scalar("acl_cluster_setting", {v, v, v, v}, ClusterSettingFunc, AnswerType());
 	scalar("acl_cluster_sources", {v, v, v}, ClusterSourcesFunc, AnswerType());
+	scalar("acl_cluster_sources", {v, v, v, v}, ClusterSourcesFunc, AnswerType());
+	scalar("acl_cluster_sources", {v, v, v, v, v}, ClusterSourcesFunc, AnswerType());
 	scalar("acl_cluster_version", {}, ClusterVersionFunc, LogicalType::BIGINT);
 
 	auto info = make_shared_ptr<ClusterInfo>(store);

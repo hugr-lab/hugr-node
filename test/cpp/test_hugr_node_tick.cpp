@@ -179,6 +179,12 @@ int main(int argc, char *argv[]) {
 			auto repointed = DecideTick({{"source", "archive", SALES_V2}}, {{"database", "archive", "same"}}, taken);
 			Check(Has(repointed.pending, "source", "archive", "drain"),
 			      "re-pointed while attached on demand: pending a drain, as any source");
+			auto switched = DecideTick({}, {{"database", "archive", "node_only"}}, {}, {{"source", "archive"}});
+			Check(switched.detach.size() == 1 && switched.detach[0] == "archive",
+			      "attached on demand, dropped (a set switched) before the node took it: its note makes it the "
+			      "node's - detached");
+			auto hand = DecideTick({}, {{"database", "archive", "node_only"}}, {});
+			Check(hand.detach.empty(), "the same without a note (attached by hand): left alone");
 			auto dropped_asleep = DecideTick({}, {}, taken);
 			Check(dropped_asleep.detach.empty() && dropped_asleep.forget.size() == 1,
 			      "dropped while not attached: forgotten");
