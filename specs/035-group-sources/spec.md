@@ -1,7 +1,7 @@
 # Spec 035: a resource group's sources, and sources attached on demand
 
 - **Status**: accepted (the owner, 2026-11-16); stage 1 (the source set and the partial node) and stage 2 (the lazy
-  sources, 2b: a set attached lazily) implemented 2026-11-20
+  sources, 2b: a set attached lazily, 3: what a group's roles reach) implemented 2026-11-20
 - **Date**: 2026-11-16
 - **Author**: Claude, from the owner's decisions of 2026-11-16
 - **Follows**: duckdb-acl spec 093 (the cluster profile: `ACL CLUSTER ATTACH … [IN GROUP g]`), spec 096 (a resource
@@ -228,3 +228,24 @@ ATTACH item's spec, `sources` a new kind with its list. No schema step: the item
   another source. The grant's answer will name the group and the statement to paste, and the check's
   `group_source_missing` will name it too, with its repair (stage 3). `ALL LAZY` is the group with no list to keep.
 - Test `test/sql/cluster/cluster_group_lazy.test`.
+
+## Stage 3 as built (2026-11-20)
+
+- `hugr_node_group_sources([group])` is a table function with columns `group`, `source`, `roles`, `listed` and
+  `repair`.
+  - **Which groups.** With a group, that group: an unknown one is refused. Without one, every group whose set is a
+    list. That form is the check (`listed = false`), standing in for `acl_check_catalog`'s `group_source_missing`:
+    the check is acl's and knows no group.
+  - **The group's roles.** Those bound to it (`role_resource_groups`), plus, for the default group, the roles bound
+    to none.
+  - **What they reach.** For each source of the profile (the cluster's and the group's own), the roles that reach
+    it are `acl_exposures(<alias>)`'s rows that hold a capability. These cover a grant's object, a relation's
+    physical name, a live alias, and a view, a template, an RLS or a mask that names it.
+  - **The rows.** A row is a source the group's roles reach or the set lists. A listed source nobody reads keeps its
+    row, with no roles.
+  - **The repair.** It is the set as written plus the sources it leaves out, with its lazy marks, as a statement
+    without a prefix. acl's check writes its repairs the same way.
+- **Never applied by itself** (the owner): a grant leaves the set as it is.
+- **The grant's own hint** (its answer naming the group) is not built. The management calls answer a boolean, so the
+  hint belongs where a grant is written: the console, which can call the check.
+- Test `test/sql/cluster/cluster_group_sources_reach.test`.

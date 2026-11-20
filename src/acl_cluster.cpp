@@ -23,6 +23,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/storage/object_cache.hpp"
@@ -2097,6 +2098,202 @@ unique_ptr<GlobalTableFunctionState> EffectiveInit(ClientContext &, TableFunctio
 	return std::move(state);
 }
 
+//! spec 035 stage 3: hugr_node_group_sources([group]) - per resource group, the sources of the profile its roles reach
+//! (a grant, a relation, an alias, a body - acl_exposures, as the source gate reads them), whether its source set lists
+//! each (NULL: no list - every source), and for a reached source the list leaves out the statement that lists it.
+//! Never applied by itself (the owner, 2026-11-16 and 2026-11-20): the operator writes it
+struct GroupSourceRow {
+	string group, source;
+	vector<string> roles;
+	int listed = -1; // -1 = no list
+	string repair;
+};
+
+vector<GroupSourceRow> GroupSources(PolicyStore &store, const string &only_group) {
+	RequireClusterCatalog(store.catalog, "hugr_node_group_sources");
+	auto &catalog = *store.catalog;
+	auto db = store.instance.lock();
+	if (!db) {
+		throw BinderException("hugr_node_group_sources: the instance is gone");
+	}
+	auto rows_of = [&](const string &sql) {
+		auto result = catalog.Query(sql);
+		vector<vector<Value>> out;
+		ResultRows rows(*result);
+		for (idx_t r = 0; r < rows.Count(); r++) {
+			vector<Value> row;
+			for (idx_t c = 0; c < result->ColumnCount(); c++) {
+				row.push_back(rows.GetValue(c, r));
+			}
+			out.push_back(std::move(row));
+		}
+		return out;
+	};
+	// the groups: the one asked, else every group whose set is a list (where a reached source can be left out)
+	vector<std::pair<string, bool>> groups; // name, is_default
+	for (auto &row : rows_of("SELECT g.\"group\", coalesce(g.\"is_default\", false) FROM " +
+	                         catalog.Tbl("resource_groups") + " g ORDER BY g.\"group\"")) {
+		auto name = row[0].ToString();
+		if (!only_group.empty() ? name == only_group : GroupDeclaresSources(catalog, name)) {
+			groups.emplace_back(name, row[1].GetValue<bool>());
+		}
+	}
+	if (!only_group.empty() && groups.empty()) {
+		throw BinderException("hugr_node_group_sources: no resource group \"%s\"", only_group);
+	}
+	// who reaches each source - asked once per source, whatever the groups
+	case_insensitive_map_t<vector<string>> readers;
+	auto readers_of = [&](const string &source) -> const vector<string> & {
+		auto found = readers.find(source);
+		if (found != readers.end()) {
+			return found->second;
+		}
+		vector<string> roles;
+		Connection con(*db);
+		auto result = con.Query("SELECT DISTINCT \"role\" FROM acl_exposures(" + Quoted(source) +
+		                        ") WHERE \"role\" IS NOT NULL AND len(\"caps\") > 0 ORDER BY \"role\"");
+		if (result->HasError()) {
+			result->ThrowError("hugr_node_group_sources: ");
+		}
+		ResultRows rows(*result);
+		for (idx_t r = 0; r < rows.Count(); r++) {
+			roles.push_back(rows.GetValue(0, r).ToString());
+		}
+		return readers[source] = std::move(roles);
+	};
+	vector<GroupSourceRow> out;
+	for (auto &group : groups) {
+		std::set<string> members;
+		for (auto &row : rows_of("SELECT \"role\" FROM " + catalog.Tbl("role_resource_groups") +
+		                         " WHERE \"group\" = " + Lit(group.first))) {
+			members.insert(row[0].ToString());
+		}
+		if (group.second) {
+			// the default group serves the roles bound to none (duckdb-acl spec 096)
+			for (auto &row :
+			     rows_of("SELECT \"role\" FROM " + catalog.Tbl("roles") + " WHERE \"role\" NOT IN (SELECT " +
+			             "\"role\" FROM " + catalog.Tbl("role_resource_groups") + ")")) {
+				members.insert(row[0].ToString());
+			}
+		}
+		auto set = rows_of("SELECT \"spec\" FROM " + catalog.Tbl("cluster_items") +
+		                   " WHERE \"scope\" = " + Lit(group.first) + " AND \"kind\" = 'sources'");
+		bool has_list = !set.empty() && !SourceSetAll(set[0][0].ToString());
+		auto set_spec = set.empty() ? string() : set[0][0].ToString();
+		auto listed = has_list ? SourceSetNames(set_spec) : case_insensitive_set_t();
+		// the sources the group's nodes may attach: the cluster's and its own, in the profile's order
+		vector<string> sources;
+		case_insensitive_set_t seen;
+		for (auto &row :
+		     rows_of("SELECT \"name\" FROM " + catalog.Tbl("cluster_items") +
+		             " WHERE \"kind\" = 'source' AND \"scope\" IN ('', " + Lit(group.first) + ") ORDER BY \"pos\"")) {
+			auto name = row[0].ToString();
+			if (seen.insert(name).second) {
+				sources.push_back(name);
+			}
+		}
+		vector<GroupSourceRow> rows;
+		vector<string> missing;
+		for (auto &source : sources) {
+			GroupSourceRow row;
+			row.group = group.first;
+			row.source = source;
+			for (auto &role : readers_of(source)) {
+				if (members.count(role)) {
+					row.roles.push_back(role);
+				}
+			}
+			row.listed = has_list ? (listed.count(source) ? 1 : 0) : -1;
+			if (row.roles.empty() && row.listed != 1) {
+				continue; // neither reached nor listed: nothing to say
+			}
+			if (row.listed == 0) {
+				missing.push_back(source);
+			}
+			rows.push_back(std::move(row));
+		}
+		if (!missing.empty()) {
+			// the set as it is, then what is missing - its lazy marks kept
+			vector<string> names;
+			for (auto &source : sources) {
+				if (listed.count(source)) {
+					names.push_back(KeywordHelper::WriteOptionallyQuoted(source));
+				}
+			}
+			for (auto &source : missing) {
+				names.push_back(KeywordHelper::WriteOptionallyQuoted(source));
+			}
+			string marks;
+			if (JsonField(set_spec, "lazy") == "true") {
+				auto idle = JsonField(set_spec, "idle_seconds");
+				marks = " LAZY" + (idle.empty() ? string() : " IDLE '" + idle + " seconds'");
+			}
+			auto repair = "CLUSTER SET SOURCES (" + StringUtil::Join(names, ", ") + ")" + marks + " IN GROUP " +
+			              KeywordHelper::WriteOptionallyQuoted(group.first);
+			for (auto &row : rows) {
+				if (row.listed == 0) {
+					row.repair = repair;
+				}
+			}
+		}
+		for (auto &row : rows) {
+			out.push_back(std::move(row));
+		}
+	}
+	return out;
+}
+
+struct GroupSourcesBind : public TableFunctionData {
+	shared_ptr<PolicyStore> store;
+	string group;
+};
+
+struct GroupSourcesState : public GlobalTableFunctionState {
+	vector<GroupSourceRow> rows;
+	idx_t next = 0;
+};
+
+unique_ptr<FunctionData> GroupSourcesBindFn(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
+                                            vector<Identifier> &names) {
+	for (auto name : {"group", "source", "roles", "listed", "repair"}) {
+		names.push_back(Identifier(name));
+	}
+	types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR), LogicalType::BOOLEAN,
+	         LogicalType::VARCHAR};
+	auto bind = make_uniq<GroupSourcesBind>();
+	bind->store = input.info->Cast<ClusterInfo>().store;
+	if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
+		bind->group = input.inputs[0].ToString();
+	}
+	return std::move(bind);
+}
+
+unique_ptr<GlobalTableFunctionState> GroupSourcesInit(ClientContext &, TableFunctionInitInput &input) {
+	auto &bind = input.bind_data->Cast<GroupSourcesBind>();
+	auto state = make_uniq<GroupSourcesState>();
+	state->rows = GroupSources(*bind.store, bind.group);
+	return std::move(state);
+}
+
+void GroupSourcesScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<GroupSourcesState>();
+	idx_t count = 0;
+	while (state.next < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &row = state.rows[state.next++];
+		output.data[0].SetValue(count, Value(row.group));
+		output.data[1].SetValue(count, Value(row.source));
+		vector<Value> roles;
+		for (auto &role : row.roles) {
+			roles.emplace_back(role);
+		}
+		output.data[2].SetValue(count, Value::LIST(LogicalType::VARCHAR, std::move(roles)));
+		output.data[3].SetValue(count, row.listed < 0 ? Value(LogicalType::BOOLEAN) : Value::BOOLEAN(row.listed == 1));
+		output.data[4].SetValue(count, row.repair.empty() ? Value(LogicalType::VARCHAR) : Value(row.repair));
+		count++;
+	}
+	output.SetChildCardinality(count);
+}
+
 //! acl_platform_drift() (spec 118): platform.drift's body - this cluster node against its profile
 struct DriftState : public GlobalTableFunctionState {
 	vector<PolicyStore::DriftRow> rows;
@@ -2596,6 +2793,15 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	}
 	loader.RegisterFunction(items);
 	// spec 096: what applies to THIS node, and the version its agent reports applied
+	// spec 035 stage 3: what each group's roles reach against its source set, with the statement that lists it
+	TableFunctionSet group_sources(Identifier("hugr_node_group_sources"));
+	for (auto &arguments : {vector<LogicalType> {}, vector<LogicalType> {v}}) {
+		TableFunction function(Identifier("hugr_node_group_sources"), arguments, GroupSourcesScan, GroupSourcesBindFn,
+		                       GroupSourcesInit);
+		function.function_info = info;
+		group_sources.AddFunction(function);
+	}
+	loader.RegisterFunction(group_sources);
 	TableFunction effective(Identifier("acl_cluster_effective"), {}, ItemsScan, EffectiveBindFn, EffectiveInit);
 	effective.function_info = info;
 	loader.RegisterFunction(effective);

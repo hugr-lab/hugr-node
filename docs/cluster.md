@@ -109,6 +109,15 @@ them every source again.
   - `ALL` is written only with `LAZY`: every source attached at once is what `RESET SOURCES` gives.
   - A node of an `ALL` group is not partial, so it writes the policy: its probes attach the lazy sources first.
 
+- **What a group's roles reach.** `hugr_node_group_sources('<group>')` answers one row per source of the profile
+  that the group's roles reach or that its set lists: `group`, `source`, `roles` (the group's roles that reach it:
+  a grant, a relation, a live alias or a body reading it, as `platform.exposures` reads them), `listed` (whether the
+  set lists it; NULL when the group has no list) and `repair`. The default group's roles include those bound to no
+  group. Without an argument it answers every group whose set is a list: that is the check, and a row with
+  `listed = false` is a source the group's roles reach but its nodes do not attach. Every read of it by them is
+  refused. `repair` is the statement that lists it, keeping the set's lazy marks; paste it after your prefix.
+  Nothing is applied by itself: a new grant leaves the set as it is.
+
 ### A lazy source
 
 `CLUSTER ATTACH … LAZY` marks a source that a node attaches only when a statement reads it (spec 035 stage 2), and

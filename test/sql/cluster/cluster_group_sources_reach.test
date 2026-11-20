@@ -1,0 +1,144 @@
+# name: test/sql/cluster/cluster_group_sources_reach.test
+# description: spec 035 stage 3 - hugr_node_group_sources([group]): the sources a group's roles reach against its
+#   source set, with the statement that lists a reached source the set leaves out (never applied by itself)
+# group: [sql]
+
+require hugr_node
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS sales (TYPE duckdb);
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS crm (TYPE duckdb);
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS archive (TYPE duckdb);
+
+statement ok
+CREATE TABLE sales.main.orders AS SELECT 1 AS id;
+
+statement ok
+CREATE TABLE crm.main.clients AS SELECT 1 AS id;
+
+statement ok
+CREATE TABLE archive.main.old AS SELECT 1 AS id;
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP etl (max_sessions 10);
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP bi (max_sessions 10) DEFAULT;
+
+statement ok
+ACL ADMIN CREATE ROLE loader;
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN GRANT RESOURCE GROUP etl TO ROLE loader;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG ops;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE ops.orders AS sales.main.orders;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE ops.clients AS crm.main.clients;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG hist;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE hist.old AS archive.main.old;
+
+statement ok
+ACL ADMIN GRANT CATALOG ops TO ROLE loader WITH (select) MAIN;
+
+statement ok
+ACL ADMIN GRANT CATALOG hist TO ROLE analyst WITH (select) MAIN;
+
+# --- a group without a list: what its roles reach, nothing left out ----------------------------------
+
+query TTTT
+SELECT "group", source, roles, listed FROM hugr_node_group_sources('etl') ORDER BY source;
+----
+etl	crm	[loader]	NULL
+etl	sales	[loader]	NULL
+
+# the default group serves the roles bound to none
+query TTT
+SELECT source, roles, listed FROM hugr_node_group_sources('bi') ORDER BY source;
+----
+archive	[analyst]	NULL
+
+# no argument: only the groups whose set is a list - none yet
+query I
+SELECT count(*) FROM hugr_node_group_sources();
+----
+0
+
+statement error
+SELECT * FROM hugr_node_group_sources('nowhere');
+----
+<REGEX>:.*no resource group "nowhere".*
+
+# --- a list that leaves a reached source out: the statement that lists it -----------------------------
+
+statement ok
+ACL ADMIN CLUSTER SET SOURCES (sales) LAZY IDLE '30 min' IN GROUP etl;
+
+query TTTT
+SELECT source, roles, listed, repair FROM hugr_node_group_sources() ORDER BY source;
+----
+crm	[loader]	false	CLUSTER SET SOURCES (sales, crm) LAZY IDLE '1800 seconds' IN GROUP etl
+sales	[loader]	true	NULL
+
+# a listed source nobody of the group reads is listed all the same
+statement ok
+ACL ADMIN CLUSTER SET SOURCES (sales, archive) IN GROUP etl;
+
+query TTTT
+SELECT source, roles, listed, repair FROM hugr_node_group_sources('etl') ORDER BY source;
+----
+archive	[]	true	NULL
+crm	[loader]	false	CLUSTER SET SOURCES (sales, archive, crm) IN GROUP etl
+sales	[loader]	true	NULL
+
+# the repair runs as written after the operator's prefix, and nothing is left out after it
+statement ok
+ACL ADMIN CLUSTER SET SOURCES (sales, archive, crm) IN GROUP etl;
+
+query I
+SELECT count(*) FROM hugr_node_group_sources() WHERE NOT listed;
+----
+0
+
+# --- never applied by itself: a new grant leaves the set as it is -------------------------------------
+
+statement ok
+ACL ADMIN CLUSTER SET SOURCES (sales) IN GROUP etl;
+
+statement ok
+ACL ADMIN GRANT CATALOG hist TO ROLE loader WITH (select);
+
+query TT
+SELECT source, listed FROM hugr_node_group_sources('etl') WHERE NOT listed ORDER BY source;
+----
+archive	false
+crm	false
+
+query T
+SELECT spec FROM acl_cluster_items('etl') WHERE kind = 'sources';
+----
+{"names": ["sales"]}
