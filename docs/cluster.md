@@ -103,7 +103,8 @@ them every source again.
 (an archive): nodes start without it, and its memory goes back once nobody reads it. It is meant for the nodes of a
 group that runs known statements (an application's queries, an ETL job), not one that serves analysts or other
 interactive users: their tools browse the catalog first, and a lazy source shows them its objects without columns
-until a statement reads it.
+until a statement reads it. For those, give their roles a resource group whose source set lists only the sources
+those roles can see (`CLUSTER SET SOURCES … IN GROUP`, above).
 
 - **Never attached by the profile.** Neither the bootstrap nor the tick attach it. The drift shows it `lazy` while it
   is not attached (and `same` once it is), and the node reports the profile applied all the same.

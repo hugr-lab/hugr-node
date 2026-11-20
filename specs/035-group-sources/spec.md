@@ -191,7 +191,8 @@ ATTACH item's spec, `sources` a new kind with its list. No schema step: the item
   source others depend on (a lazy source attaches alone), a lazy `tresor`, `IDLE ''`, a `lazy` argument other than
   `'true'` / `'false'`.
 - **Who it is for** (the owner, 2026-11-20): groups whose nodes run known statements (an application, an ETL job),
-  not analysts or interactive users, whose tools browse the catalog first.
+  not analysts or interactive users, whose tools browse the catalog first. Those get a resource group whose source set
+  lists only the sources its roles can see (stage 1; stage 3's `hugr_node_group_sources(g)` suggests that list).
 - **Known limit.** A listing never wakes a source, so an object read live from a lazy source that is not attached is
   listed without columns. A client that loads the catalog whole (quack) sees it so; such a source's objects should
   declare their columns.
