@@ -100,7 +100,10 @@ them every source again.
 
 `CLUSTER ATTACH … LAZY` marks a source that a node attaches only when a statement reads it (spec 035 stage 2), and
 `LAZY IDLE '30 min'` also detaches it after that long without a read. It suits a big source that few statements read
-(an archive): nodes start without it, and its memory goes back once nobody reads it.
+(an archive): nodes start without it, and its memory goes back once nobody reads it. It is meant for the nodes of a
+group that runs known statements (an application's queries, an ETL job), not one that serves analysts or other
+interactive users: their tools browse the catalog first, and a lazy source shows them its objects without columns
+until a statement reads it.
 
 - **Never attached by the profile.** Neither the bootstrap nor the tick attach it. The drift shows it `lazy` while it
   is not attached (and `same` once it is), and the node reports the profile applied all the same.

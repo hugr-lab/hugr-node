@@ -190,6 +190,8 @@ ATTACH item's spec, `sources` a new kind with its list. No schema step: the item
 - **Refused where written** (the review): `LAZY` with `DEPENDS ON`, a source depending on a lazy one, marking lazy a
   source others depend on (a lazy source attaches alone), a lazy `tresor`, `IDLE ''`, a `lazy` argument other than
   `'true'` / `'false'`.
+- **Who it is for** (the owner, 2026-11-20): groups whose nodes run known statements (an application, an ETL job),
+  not analysts or interactive users, whose tools browse the catalog first.
 - **Known limit.** A listing never wakes a source, so an object read live from a lazy source that is not attached is
   listed without columns. A client that loads the catalog whole (quack) sees it so; such a source's objects should
   declare their columns.
