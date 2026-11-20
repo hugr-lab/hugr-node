@@ -255,8 +255,13 @@ ATTACH item's spec, `sources` a new kind with its list. No schema step: the item
 - **The platform part's never set** (duckdb-acl spec 178): `RegisterAclCluster` registers the prefix `hugr_node_`, so
   `hugr_node_profile_statements`, `hugr_node_bootstrap_plan` and the like (the operator's) are never opened by a grant
   by name. The review found that a `policy` admin could grant them before.
-- **The grant's own hint** goes to the console, which calls the check after a grant. Every management statement's
-  answer becoming `(ok, message)` is a duckdb-acl spec of its own, next (the owner, 2026-11-20).
+- **The grant's own hint** is in the grant's answer (duckdb-acl spec 179: every management statement answers `(ok,
+  message)`). The trait `NodeTraits::management_note` (`GrantSourcesNote`) runs after `acl_grant_catalog | _schema |
+  _object | _resource_group` succeeded: for each group whose list leaves out a source the granted role reaches, one
+  sentence per repair statement (a group's list names every source it leaves out at once; another group's own source
+  has its own ATTACH). A note never fails the grant, which is written already: a catalog that cannot answer says
+  nothing. The console still calls the check for the whole picture. The CLUSTER answer's `note` field is now
+  `message`, so the grammar's answer is `(ok, message, version, class, applied_here)`.
 - **Limits** (the review):
   - A principal holding a bound and an unbound role reads with both on the bound group's nodes. The unbound role's
     reach is reported only for the default group: which unbound roles travel with which bound one is not in the
@@ -267,6 +272,8 @@ ATTACH item's spec, `sources` a new kind with its list. No schema step: the item
   - A two-part name in a pre-spec-160 body is read against the attached databases, so run it on a node with every
     source attached.
 - Test `test/sql/cluster/cluster_group_sources_reach.test`:
+  - the grant's answer: a group with no list notes nothing; a list that leaves two sources out names both with one
+    repair;
   - a group with no list, the default group (a role with no CREATE ROLE), the no-argument check, an unknown group;
   - a list leaving a source out, a listed source nobody reads, the lazy marks in the repair;
   - the repair with a dependency, pasted as the function gave it;

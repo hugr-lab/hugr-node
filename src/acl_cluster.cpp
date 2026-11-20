@@ -1925,7 +1925,7 @@ LogicalType AnswerType() {
 	child_list_t<LogicalType> children {{"version", LogicalType::BIGINT},
 	                                    {"class", LogicalType::VARCHAR},
 	                                    {"applied_here", LogicalType::BOOLEAN},
-	                                    {"note", LogicalType::VARCHAR}};
+	                                    {"message", LogicalType::VARCHAR}};
 	return LogicalType::STRUCT(std::move(children));
 }
 
@@ -1933,7 +1933,7 @@ Value AnswerValue(const PolicyStore::ClusterAnswer &answer) {
 	child_list_t<Value> children {{"version", Value::BIGINT(answer.version)},
 	                              {"class", Value(answer.item_class)},
 	                              {"applied_here", Value::BOOLEAN(answer.applied_here)},
-	                              {"note", answer.note.empty() ? Value(LogicalType::VARCHAR) : Value(answer.note)}};
+	                              {"message", answer.note.empty() ? Value(LogicalType::VARCHAR) : Value(answer.note)}};
 	return Value::STRUCT(std::move(children));
 }
 
@@ -2316,6 +2316,49 @@ vector<GroupSourceRow> GroupSources(PolicyStore &store, const string &only_group
 		}
 	}
 	return out;
+}
+
+//! spec 035 (duckdb-acl spec 179): the note on a grant's answer - for each group whose source set is a list that leaves
+//! out a source the granted role reaches, `group g does not list source s, which role r reads - <repair>`. A note never
+//! fails the grant (written already): a catalog that cannot answer says nothing
+string GrantSourcesNote(PolicyStore &store, const string &function, const vector<Value> &args) {
+	if (function != "acl_grant_catalog" && function != "acl_grant_schema" && function != "acl_grant_object" &&
+	    function != "acl_grant_resource_group") {
+		return string();
+	}
+	if (args.empty() || args[0].IsNull() || !store.catalog) {
+		return string();
+	}
+	auto role = args[0].ToString();
+	// the sources one statement lists go in one sentence: a group's list names every source it leaves out, another
+	// group's own source has its own ATTACH
+	vector<std::pair<string, vector<string>>> by_repair; // "<group>\x1f<repair>" -> sources, in the rows' order
+	try {
+		for (auto &row : GroupSources(store, string())) {
+			if (row.listed != 0 || std::find(row.roles.begin(), row.roles.end(), role) == row.roles.end()) {
+				continue;
+			}
+			auto key = row.group + "\x1f" + row.repair;
+			auto at = std::find_if(by_repair.begin(), by_repair.end(),
+			                       [&](const std::pair<string, vector<string>> &e) { return e.first == key; });
+			if (at == by_repair.end()) {
+				by_repair.emplace_back(key, vector<string> {row.source});
+			} else {
+				at->second.push_back(row.source);
+			}
+		}
+	} catch (std::exception &) {
+		return string();
+	}
+	vector<string> notes;
+	for (auto &entry : by_repair) {
+		auto split = entry.first.find('\x1f');
+		auto &sources = entry.second;
+		notes.push_back("group " + entry.first.substr(0, split) + " does not list " +
+		                (sources.size() == 1 ? "source " : "sources ") + StringUtil::Join(sources, ", ") +
+		                ", which role " + role + " reads - " + entry.first.substr(split + 1));
+	}
+	return StringUtil::Join(notes, "; ");
 }
 
 struct GroupSourcesBind : public TableFunctionData {
@@ -2949,6 +2992,11 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	node->node_traits.lazy_sources = [node]() {
 		auto db = node->instance.lock();
 		return db ? LazySourceAliases(*db) : vector<string>();
+	};
+	// spec 035 (duckdb-acl spec 179): a grant that gives a role reach says which resource groups' source sets leave
+	// out a source the role now reads, with the statement that lists it - never applied by itself
+	node->node_traits.management_note = [node](ClientContext &, const string &function, const vector<Value> &args) {
+		return GrantSourcesNote(*node, function, args);
 	};
 	node->node_traits.attach_on_demand = [node](const string &alias) {
 		auto db = node->instance.lock();

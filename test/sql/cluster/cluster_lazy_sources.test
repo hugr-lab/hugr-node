@@ -77,7 +77,7 @@ ACL ADMIN CLUSTER DETACH base CASCADE;
 # --- written, never attached by the profile --------------------------------------------------------
 
 query TT
-SELECT (r).applied_here, (r).note FROM (SELECT acl_cluster_attach('', 'archive',
+SELECT (r).applied_here, (r).message FROM (SELECT acl_cluster_attach('', 'archive',
     '{TEST_DIR}/lazy_archive.duckdb', 'duckdb', '', '{}', '', '', '', 'true', '30 min') AS r);
 ----
 false	lazy - attached on this node by the first statement that reads it, detached after it idles

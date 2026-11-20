@@ -65,8 +65,11 @@ ACL ADMIN CREATE VIRTUAL TABLE hist.old AS archive.main.old;
 statement ok
 ACL ADMIN GRANT CATALOG ops TO ROLE loader WITH (select) MAIN;
 
-statement ok
+# a grant whose groups list nothing (every source) notes nothing
+query IT
 ACL ADMIN GRANT CATALOG hist TO ROLE analyst WITH (select) MAIN;
+----
+true	NULL
 
 # --- a group without a list: what its roles reach, nothing left out ----------------------------------
 
@@ -129,8 +132,11 @@ SELECT count(*) FROM acl_cluster_group_sources() WHERE NOT listed;
 statement ok
 ACL ADMIN CLUSTER SET SOURCES (sales) IN GROUP etl;
 
-statement ok
+# duckdb-acl spec 179: the grant's answer names each source the group's list leaves out, with the statement
+query IT
 ACL ADMIN GRANT CATALOG hist TO ROLE loader WITH (select);
+----
+true	group etl does not list sources crm, archive, which role loader reads - CLUSTER SET SOURCES (sales, crm, archive) IN GROUP etl
 
 query TT
 SELECT source, listed FROM acl_cluster_group_sources('etl') WHERE NOT listed ORDER BY source;

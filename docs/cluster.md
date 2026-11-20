@@ -122,7 +122,10 @@ them every source again.
     `CLUSTER ATTACH … IN GROUP <group>` to write first.
   - Without an argument it answers every group whose set is a list. That is the check: a row with `listed = false`
     is a source the group's roles reach but its nodes do not attach, and every read of it by them is refused.
-  - Nothing is applied by itself: a new grant leaves the set as it is.
+  - Nothing is applied by itself: a new grant leaves the set as it is. Its answer says so instead: the `message` of
+    a `GRANT CATALOG | SCHEMA | TABLE | VIEW | OBJECT` or a `GRANT RESOURCE GROUP` to a role names each group whose
+    list leaves out a source the role now reaches, with the repair (`group etl does not list sources crm, archive,
+    which role loader reads - CLUSTER SET SOURCES (…) IN GROUP etl`).
   - **Its limits.**
     - A principal that holds a role bound to the group and a role bound to none reads with both on the group's nodes.
       The unbound role's reach is shown only for the default group.
@@ -175,7 +178,8 @@ A statement does four things:
 1. It checks the change. A refusal writes nothing.
 2. It writes the item and bumps `config_version`, in one catalog transaction.
 3. It applies the change **on this node** when that can be done live.
-4. It answers `{version, class, applied_here, note}`.
+4. It answers `(ok, message, version, class, applied_here)` - every management statement's `(ok, message)`
+   (duckdb-acl spec 179), then the item's own fields; `message` says how the change reached this node.
 
 If the live apply fails, the write is rolled back. So an item reaches the cluster only once it has
 worked on the node that wrote it.

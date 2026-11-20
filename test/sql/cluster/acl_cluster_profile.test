@@ -31,7 +31,7 @@ SELECT acl_cluster_version();
 # --- ATTACH: written, applied here, versioned ------------------------------------------------------
 
 query IIIT
-SELECT r.version, r.class, r.applied_here, r.note FROM (SELECT acl_cluster_attach('', 'src_a', ':memory:', 'duckdb', '', '{}', '', 'first') AS r);
+SELECT r.version, r.class, r.applied_here, r.message FROM (SELECT acl_cluster_attach('', 'src_a', ':memory:', 'duckdb', '', '{}', '', 'first') AS r);
 ----
 1	hot	true	NULL
 

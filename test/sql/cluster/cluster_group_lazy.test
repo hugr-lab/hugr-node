@@ -68,7 +68,7 @@ SELECT acl_cluster_sources('reset', 'etl', '[]', 'true', '');
 # --- ALL LAZY: every source lazy on the group's nodes, a chain at once; the node is not partial -------
 
 query T
-SELECT (ACL_ANSWER).note FROM (SELECT acl_cluster_sources('set', 'etl', 'ALL', 'true', '30 min') AS ACL_ANSWER);
+SELECT (ACL_ANSWER).message FROM (SELECT acl_cluster_sources('set', 'etl', 'ALL', 'true', '30 min') AS ACL_ANSWER);
 ----
 the group's nodes attach every source, each when a statement first reads it, detached after it idles - a source in a DEPENDS ON chain is attached at once
 
@@ -131,7 +131,7 @@ archive	same
 
 # a source attached later is not attached on this node: the group's set attaches it on demand
 query TT
-SELECT (r).applied_here, (r).note FROM (SELECT acl_cluster_attach('', 'later', ':memory:', 'duckdb', '', '{}', '', '')
+SELECT (r).applied_here, (r).message FROM (SELECT acl_cluster_attach('', 'later', ':memory:', 'duckdb', '', '{}', '', '')
     AS r);
 ----
 false	lazy on this node - its group's source set attaches each source when a statement first reads it
@@ -146,7 +146,7 @@ statement ok
 DETACH base;
 
 query TT
-SELECT (r).applied_here, (r).note FROM (SELECT acl_cluster_attach('', 'lean2', ':memory:', 'duckdb', '', '{}', 'base',
+SELECT (r).applied_here, (r).message FROM (SELECT acl_cluster_attach('', 'lean2', ':memory:', 'duckdb', '', '{}', 'base',
     '') AS r);
 ----
 false	attached on this node by its next tick, after "base" it depends on
