@@ -231,21 +231,43 @@ ATTACH item's spec, `sources` a new kind with its list. No schema step: the item
 
 ## Stage 3 as built (2026-11-20)
 
-- `hugr_node_group_sources([group])` is a table function with columns `group`, `source`, `roles`, `listed` and
-  `repair`.
+- `acl_cluster_group_sources([group])` is a table function: an `acl_*` name, so it is in the never set and no grant by
+  name opens it. Its form is `platform.group_sources([group])`, in FROM, with the INFRASTRUCTURE right: the cluster
+  bundle writes the sets and reads their check. The rows name the roles that reach each source, as the POLICY-class
+  `platform.exposures` does. Its columns are `group`, `source`, `roles`, `listed` and `repair`.
   - **Which groups.** With a group, that group: an unknown one is refused. Without one, every group whose set is a
     list. That form is the check (`listed = false`), standing in for `acl_check_catalog`'s `group_source_missing`:
     the check is acl's and knows no group.
-  - **The group's roles.** Those bound to it (`role_resource_groups`), plus, for the default group, the roles bound
-    to none.
-  - **What they reach.** For each source of the profile (the cluster's and the group's own), the roles that reach
-    it are `acl_exposures(<alias>)`'s rows that hold a capability. These cover a grant's object, a relation's
-    physical name, a live alias, and a view, a template, an RLS or a mask that names it.
-  - **The rows.** A row is a source the group's roles reach or the set lists. A listed source nobody reads keeps its
-    row, with no roles.
-  - **The repair.** It is the set as written plus the sources it leaves out, with its lazy marks, as a statement
-    without a prefix. acl's check writes its repairs the same way.
+  - **The group's roles.** Those bound to it (`role_resource_groups`). For the default group, also every role bound to
+    none, a token's role with no `roles` row included.
+  - **What they reach.** For each source of the profile, the roles that reach it are `acl_exposures(<alias>)`'s rows
+    that hold a capability. These cover a grant's object, a relation's physical name, a live alias, and a view, a
+    template, an RLS or a mask that names it.
+  - **The rows.**
+    - A row is a source the group's roles reach or the set lists; a listed source nobody reads keeps its row.
+    - Another group's own source the roles reach is a row with `listed = false`. Its repair names the `CLUSTER ATTACH
+      … IN GROUP g` to write first.
+  - **The repair.** It is the set as written plus the sources it leaves out, each after what it `DEPENDS ON` (the
+    group's own item's dependencies, else the cluster's, as `RequireListedDependencies` judges), with the set's lazy
+    marks. It is a statement without a prefix, as acl's check writes its repairs, and names are quoted only when
+    duckdb needs it (`SQLIdentifier`).
 - **Never applied by itself** (the owner): a grant leaves the set as it is.
-- **The grant's own hint** (its answer naming the group) is not built. The management calls answer a boolean, so the
-  hint belongs where a grant is written: the console, which can call the check.
-- Test `test/sql/cluster/cluster_group_sources_reach.test`.
+- **The grant's own hint** goes to the console, which calls the check after a grant. Every management statement's
+  answer becoming `(ok, message)` is a duckdb-acl spec of its own, next (the owner, 2026-11-20).
+- **Limits** (the review):
+  - A principal holding a bound and an unbound role reads with both on the bound group's nodes. The unbound role's
+    reach is reported only for the default group: which unbound roles travel with which bound one is not in the
+    policy.
+  - Not counted: a physical function the gate admits, a `GRANT SOURCE`, a physical view reading another source.
+  - One `acl_exposures` pass per source: fine for tens of sources, a single bucketed pass is the follow-up at spec 147
+    scale.
+  - A two-part name in a pre-spec-160 body is read against the attached databases, so run it on a node with every
+    source attached.
+- Test `test/sql/cluster/cluster_group_sources_reach.test`:
+  - a group with no list, the default group (a role with no CREATE ROLE), the no-argument check, an unknown group;
+  - a list leaving a source out, a listed source nobody reads, the lazy marks in the repair;
+  - the repair with a dependency, pasted as the function gave it;
+  - another group's own source;
+  - a new grant left alone;
+  - negatives: GRANT FUNCTION by name refused, a principal's call refused, a principal without the bundle refused on
+    `platform.group_sources`; the cluster bundle reads it.

@@ -23,7 +23,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/extension_helper.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/storage/object_cache.hpp"
@@ -2098,10 +2098,15 @@ unique_ptr<GlobalTableFunctionState> EffectiveInit(ClientContext &, TableFunctio
 	return std::move(state);
 }
 
-//! spec 035 stage 3: hugr_node_group_sources([group]) - per resource group, the sources of the profile its roles reach
-//! (a grant, a relation, an alias, a body - acl_exposures, as the source gate reads them), whether its source set lists
-//! each (NULL: no list - every source), and for a reached source the list leaves out the statement that lists it.
+//! spec 035 stage 3: acl_cluster_group_sources([group]) - per resource group, the sources of the profile its roles
+//! reach (a grant, a relation, an alias, a body - acl_exposures, as the source gate reads them), whether its source set
+//! lists each (NULL: no list - every source), and for a reached source the list leaves out the statement that lists it.
 //! Never applied by itself (the owner, 2026-11-16 and 2026-11-20): the operator writes it
+//! a name as the grammar reads it back: bare when duckdb's identifier rule takes it, else double-quoted
+string QuotedIfNeeded(const string &name) {
+	return SQLIdentifier::ToString(name);
+}
+
 struct GroupSourceRow {
 	string group, source;
 	vector<string> roles;
@@ -2110,11 +2115,11 @@ struct GroupSourceRow {
 };
 
 vector<GroupSourceRow> GroupSources(PolicyStore &store, const string &only_group) {
-	RequireClusterCatalog(store.catalog, "hugr_node_group_sources");
+	RequireClusterCatalog(store.catalog, "acl_cluster_group_sources");
 	auto &catalog = *store.catalog;
 	auto db = store.instance.lock();
 	if (!db) {
-		throw BinderException("hugr_node_group_sources: the instance is gone");
+		throw BinderException("acl_cluster_group_sources: the instance is gone");
 	}
 	auto rows_of = [&](const string &sql) {
 		auto result = catalog.Query(sql);
@@ -2139,7 +2144,7 @@ vector<GroupSourceRow> GroupSources(PolicyStore &store, const string &only_group
 		}
 	}
 	if (!only_group.empty() && groups.empty()) {
-		throw BinderException("hugr_node_group_sources: no resource group \"%s\"", only_group);
+		throw BinderException("acl_cluster_group_sources: no resource group \"%s\"", only_group);
 	}
 	// who reaches each source - asked once per source, whatever the groups
 	case_insensitive_map_t<vector<string>> readers;
@@ -2153,13 +2158,36 @@ vector<GroupSourceRow> GroupSources(PolicyStore &store, const string &only_group
 		auto result = con.Query("SELECT DISTINCT \"role\" FROM acl_exposures(" + Quoted(source) +
 		                        ") WHERE \"role\" IS NOT NULL AND len(\"caps\") > 0 ORDER BY \"role\"");
 		if (result->HasError()) {
-			result->ThrowError("hugr_node_group_sources: ");
+			result->ThrowError("acl_cluster_group_sources: ");
 		}
 		ResultRows rows(*result);
 		for (idx_t r = 0; r < rows.Count(); r++) {
 			roles.push_back(rows.GetValue(0, r).ToString());
 		}
 		return readers[source] = std::move(roles);
+	};
+	std::set<string> bound;
+	for (auto &row : rows_of("SELECT \"role\" FROM " + catalog.Tbl("role_resource_groups"))) {
+		bound.insert(row[0].ToString());
+	}
+	// every source of the profile, whichever scope - one of another group's is reached but never attachable here
+	vector<std::pair<string, string>> profile_sources; // scope, name
+	for (auto &row : rows_of("SELECT \"scope\", \"name\" FROM " + catalog.Tbl("cluster_items") +
+	                         " WHERE \"kind\" = 'source' ORDER BY \"pos\"")) {
+		profile_sources.emplace_back(row[0].ToString(), row[1].ToString());
+	}
+	// what a source loads through, as group g's nodes read it: its own item of that name, else the cluster's
+	auto dependencies = [&](const string &group, const string &name) {
+		auto own = rows_of("SELECT 1 FROM " + catalog.Tbl("cluster_items") + " WHERE \"kind\" = 'source' AND " +
+		                   "\"scope\" = " + Lit(group) + " AND lower(\"name\") = lower(" + Lit(name) + ")");
+		auto owner = own.empty() ? string() : group;
+		vector<string> deps;
+		for (auto &row :
+		     rows_of("SELECT \"depends_on\" FROM " + catalog.Tbl("cluster_deps") + " WHERE \"scope\" = " + Lit(owner) +
+		             " AND lower(\"name\") = lower(" + Lit(name) + ") ORDER BY \"depends_on\"")) {
+			deps.push_back(row[0].ToString());
+		}
+		return deps;
 	};
 	vector<GroupSourceRow> out;
 	for (auto &group : groups) {
@@ -2168,42 +2196,46 @@ vector<GroupSourceRow> GroupSources(PolicyStore &store, const string &only_group
 		                         " WHERE \"group\" = " + Lit(group.first))) {
 			members.insert(row[0].ToString());
 		}
-		if (group.second) {
-			// the default group serves the roles bound to none (duckdb-acl spec 096)
-			for (auto &row :
-			     rows_of("SELECT \"role\" FROM " + catalog.Tbl("roles") + " WHERE \"role\" NOT IN (SELECT " +
-			             "\"role\" FROM " + catalog.Tbl("role_resource_groups") + ")")) {
-				members.insert(row[0].ToString());
-			}
-		}
+		// the default group serves the roles bound to none (duckdb-acl spec 096) - whether or not a CREATE ROLE wrote
+		// them: a token's role may hold grants with no row of its own
+		auto member = [&](const string &role) {
+			return members.count(role) > 0 || (group.second && !bound.count(role));
+		};
 		auto set = rows_of("SELECT \"spec\" FROM " + catalog.Tbl("cluster_items") +
 		                   " WHERE \"scope\" = " + Lit(group.first) + " AND \"kind\" = 'sources'");
 		bool has_list = !set.empty() && !SourceSetAll(set[0][0].ToString());
 		auto set_spec = set.empty() ? string() : set[0][0].ToString();
 		auto listed = has_list ? SourceSetNames(set_spec) : case_insensitive_set_t();
-		// the sources the group's nodes may attach: the cluster's and its own, in the profile's order
-		vector<string> sources;
+		vector<string> sources;   // the group's nodes may attach these: the cluster's and its own
+		vector<string> elsewhere; // other groups' own sources: never attached on this group's nodes
 		case_insensitive_set_t seen;
-		for (auto &row :
-		     rows_of("SELECT \"name\" FROM " + catalog.Tbl("cluster_items") +
-		             " WHERE \"kind\" = 'source' AND \"scope\" IN ('', " + Lit(group.first) + ") ORDER BY \"pos\"")) {
-			auto name = row[0].ToString();
-			if (seen.insert(name).second) {
-				sources.push_back(name);
+		for (auto &source : profile_sources) {
+			if ((source.first.empty() || source.first == group.first) && seen.insert(source.second).second) {
+				sources.push_back(source.second);
 			}
 		}
-		vector<GroupSourceRow> rows;
-		vector<string> missing;
-		for (auto &source : sources) {
+		case_insensitive_set_t seen_elsewhere;
+		for (auto &source : profile_sources) {
+			if (!seen.count(source.second) && seen_elsewhere.insert(source.second).second) {
+				elsewhere.push_back(source.second);
+			}
+		}
+		auto row_of = [&](const string &source, bool attachable) {
 			GroupSourceRow row;
 			row.group = group.first;
 			row.source = source;
 			for (auto &role : readers_of(source)) {
-				if (members.count(role)) {
+				if (member(role)) {
 					row.roles.push_back(role);
 				}
 			}
-			row.listed = has_list ? (listed.count(source) ? 1 : 0) : -1;
+			row.listed = !attachable ? 0 : has_list ? (listed.count(source) ? 1 : 0) : -1;
+			return row;
+		};
+		vector<GroupSourceRow> rows;
+		vector<string> missing;
+		for (auto &source : sources) {
+			auto row = row_of(source, true);
 			if (row.roles.empty() && row.listed != 1) {
 				continue; // neither reached nor listed: nothing to say
 			}
@@ -2212,16 +2244,42 @@ vector<GroupSourceRow> GroupSources(PolicyStore &store, const string &only_group
 			}
 			rows.push_back(std::move(row));
 		}
+		for (auto &source : elsewhere) {
+			auto row = row_of(source, false);
+			if (row.roles.empty()) {
+				continue;
+			}
+			// another group's own: no source set lists it here - it is attached IN GROUP this group first
+			row.repair = "CLUSTER ATTACH '<path>' AS " + QuotedIfNeeded(source) + " (TYPE <type>, ...) IN GROUP " +
+			             QuotedIfNeeded(group.first);
+			rows.push_back(std::move(row));
+		}
 		if (!missing.empty()) {
 			// the set as it is, then what is missing - its lazy marks kept
 			vector<string> names;
 			for (auto &source : sources) {
 				if (listed.count(source)) {
-					names.push_back(KeywordHelper::WriteOptionallyQuoted(source));
+					names.push_back(QuotedIfNeeded(source));
 				}
 			}
+			// what is missing, each after what it loads through (a set that lists a source lists those too)
+			case_insensitive_set_t added;
+			for (auto &source : sources) {
+				if (listed.count(source)) {
+					added.insert(source);
+				}
+			}
+			std::function<void(const string &)> add = [&](const string &source) {
+				if (!added.insert(source).second) {
+					return;
+				}
+				for (auto &dependency : dependencies(group.first, source)) {
+					add(dependency);
+				}
+				names.push_back(QuotedIfNeeded(source));
+			};
 			for (auto &source : missing) {
-				names.push_back(KeywordHelper::WriteOptionallyQuoted(source));
+				add(source);
 			}
 			string marks;
 			if (JsonField(set_spec, "lazy") == "true") {
@@ -2229,9 +2287,10 @@ vector<GroupSourceRow> GroupSources(PolicyStore &store, const string &only_group
 				marks = " LAZY" + (idle.empty() ? string() : " IDLE '" + idle + " seconds'");
 			}
 			auto repair = "CLUSTER SET SOURCES (" + StringUtil::Join(names, ", ") + ")" + marks + " IN GROUP " +
-			              KeywordHelper::WriteOptionallyQuoted(group.first);
+			              QuotedIfNeeded(group.first);
+			case_insensitive_set_t left_out(missing.begin(), missing.end());
 			for (auto &row : rows) {
-				if (row.listed == 0) {
+				if (left_out.count(row.source)) {
 					row.repair = repair;
 				}
 			}
@@ -2751,6 +2810,18 @@ void RegisterClusterPlatform() {
 	setting.rule_refusal = "acl admin: \"%s\" is not among the settings the cluster bundle sets (the node's resources "
 	                       "and tuning) - a data path, a trust or audit setting is a passthrough scope's";
 	RegisterPlatformFunction(std::move(setting));
+	// spec 035 stage 3: the check of the groups' source sets - the cluster bundle's, who writes them (it names the
+	// roles that reach each source, as platform.exposures does for policy)
+	RegisterPlatformFunction({"group_sources",
+	                          "acl_cluster_group_sources",
+	                          {P("group")},
+	                          {0, 1},
+	                          -1,
+	                          PlatformRight::INFRASTRUCTURE,
+	                          true,
+	                          "TABLE",
+	                          "what each resource group's roles reach against its source set, with the statement that "
+	                          "lists what it leaves out"});
 	RegisterPlatformFunction({"cluster_sources",
 	                          "acl_cluster_sources",
 	                          {A("verb"), A("scope"), P("names"), P("lazy"), P("idle")},
@@ -2794,9 +2865,10 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	loader.RegisterFunction(items);
 	// spec 096: what applies to THIS node, and the version its agent reports applied
 	// spec 035 stage 3: what each group's roles reach against its source set, with the statement that lists it
-	TableFunctionSet group_sources(Identifier("hugr_node_group_sources"));
+	// an acl_* name: in the never set, so no grant opens it to a principal - platform.group_sources is its form
+	TableFunctionSet group_sources(Identifier("acl_cluster_group_sources"));
 	for (auto &arguments : {vector<LogicalType> {}, vector<LogicalType> {v}}) {
-		TableFunction function(Identifier("hugr_node_group_sources"), arguments, GroupSourcesScan, GroupSourcesBindFn,
+		TableFunction function(Identifier("acl_cluster_group_sources"), arguments, GroupSourcesScan, GroupSourcesBindFn,
 		                       GroupSourcesInit);
 		function.function_info = info;
 		group_sources.AddFunction(function);

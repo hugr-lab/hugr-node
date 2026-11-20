@@ -1,5 +1,5 @@
 # name: test/sql/cluster/cluster_group_sources_reach.test
-# description: spec 035 stage 3 - hugr_node_group_sources([group]): the sources a group's roles reach against its
+# description: spec 035 stage 3 - acl_cluster_group_sources([group]): the sources a group's roles reach against its
 #   source set, with the statement that lists a reached source the set leaves out (never applied by itself)
 # group: [sql]
 
@@ -71,25 +71,25 @@ ACL ADMIN GRANT CATALOG hist TO ROLE analyst WITH (select) MAIN;
 # --- a group without a list: what its roles reach, nothing left out ----------------------------------
 
 query TTTT
-SELECT "group", source, roles, listed FROM hugr_node_group_sources('etl') ORDER BY source;
+SELECT "group", source, roles, listed FROM acl_cluster_group_sources('etl') ORDER BY source;
 ----
 etl	crm	[loader]	NULL
 etl	sales	[loader]	NULL
 
 # the default group serves the roles bound to none
 query TTT
-SELECT source, roles, listed FROM hugr_node_group_sources('bi') ORDER BY source;
+SELECT source, roles, listed FROM acl_cluster_group_sources('bi') ORDER BY source;
 ----
 archive	[analyst]	NULL
 
 # no argument: only the groups whose set is a list - none yet
 query I
-SELECT count(*) FROM hugr_node_group_sources();
+SELECT count(*) FROM acl_cluster_group_sources();
 ----
 0
 
 statement error
-SELECT * FROM hugr_node_group_sources('nowhere');
+SELECT * FROM acl_cluster_group_sources('nowhere');
 ----
 <REGEX>:.*no resource group "nowhere".*
 
@@ -99,7 +99,7 @@ statement ok
 ACL ADMIN CLUSTER SET SOURCES (sales) LAZY IDLE '30 min' IN GROUP etl;
 
 query TTTT
-SELECT source, roles, listed, repair FROM hugr_node_group_sources() ORDER BY source;
+SELECT source, roles, listed, repair FROM acl_cluster_group_sources() ORDER BY source;
 ----
 crm	[loader]	false	CLUSTER SET SOURCES (sales, crm) LAZY IDLE '1800 seconds' IN GROUP etl
 sales	[loader]	true	NULL
@@ -109,7 +109,7 @@ statement ok
 ACL ADMIN CLUSTER SET SOURCES (sales, archive) IN GROUP etl;
 
 query TTTT
-SELECT source, roles, listed, repair FROM hugr_node_group_sources('etl') ORDER BY source;
+SELECT source, roles, listed, repair FROM acl_cluster_group_sources('etl') ORDER BY source;
 ----
 archive	[]	true	NULL
 crm	[loader]	false	CLUSTER SET SOURCES (sales, archive, crm) IN GROUP etl
@@ -120,7 +120,7 @@ statement ok
 ACL ADMIN CLUSTER SET SOURCES (sales, archive, crm) IN GROUP etl;
 
 query I
-SELECT count(*) FROM hugr_node_group_sources() WHERE NOT listed;
+SELECT count(*) FROM acl_cluster_group_sources() WHERE NOT listed;
 ----
 0
 
@@ -133,7 +133,7 @@ statement ok
 ACL ADMIN GRANT CATALOG hist TO ROLE loader WITH (select);
 
 query TT
-SELECT source, listed FROM hugr_node_group_sources('etl') WHERE NOT listed ORDER BY source;
+SELECT source, listed FROM acl_cluster_group_sources('etl') WHERE NOT listed ORDER BY source;
 ----
 archive	false
 crm	false
@@ -142,3 +142,92 @@ query T
 SELECT spec FROM acl_cluster_items('etl') WHERE kind = 'sources';
 ----
 {"names": ["sales"]}
+
+# --- the default group: a role with grants and no CREATE ROLE (a token's) is one of its roles -----------
+
+statement ok
+ACL ADMIN GRANT CATALOG hist TO ROLE ghost WITH (select);
+
+query TT
+SELECT source, roles FROM acl_cluster_group_sources('bi') ORDER BY source;
+----
+archive	[analyst, ghost]
+
+# --- the repair lists what a missing source loads through, and runs as given ---------------------------
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS meta (TYPE duckdb);
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS lake (TYPE duckdb) DEPENDS ON (meta);
+
+statement ok
+CREATE TABLE lake.main.facts AS SELECT 1 AS id;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE ops.facts AS lake.main.facts;
+
+statement ok
+ACL ADMIN CLUSTER SET SOURCES (sales, archive, crm) IN GROUP etl;
+
+query TT
+SELECT source, repair FROM acl_cluster_group_sources('etl') WHERE NOT listed ORDER BY source;
+----
+lake	CLUSTER SET SOURCES (sales, crm, archive, meta, lake) IN GROUP etl
+
+statement ok
+ACL ADMIN CLUSTER SET SOURCES (sales, crm, archive, meta, lake) IN GROUP etl;
+
+query I
+SELECT count(*) FROM acl_cluster_group_sources('etl') WHERE NOT listed;
+----
+0
+
+# --- another group's own source its roles reach: never attached here, the repair says what to write -----
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP other (max_sessions 10);
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS only_other (TYPE duckdb) IN GROUP other;
+
+# attached here by hand (break-glass), only so a relation can be written over it
+statement ok
+ATTACH ':memory:' AS only_other;
+
+statement ok
+CREATE TABLE only_other.main.x AS SELECT 1 AS id;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE ops.x AS only_other.main.x;
+
+query TTT
+SELECT source, listed, repair FROM acl_cluster_group_sources('etl') WHERE source = 'only_other';
+----
+only_other	false	CLUSTER ATTACH '<path>' AS only_other (TYPE <type>, ...) IN GROUP etl
+
+# --- a principal: never through a grant by name, the cluster bundle through platform.group_sources ------
+
+statement error
+ACL ADMIN GRANT FUNCTION acl_cluster_group_sources TABLE TO ROLE loader;
+----
+<REGEX>:.*never.*
+
+statement error
+ACL ROLE 'loader' SELECT * FROM acl_cluster_group_sources();
+----
+
+statement ok
+ACL ADMIN CREATE ROLE fleet;
+
+statement ok
+SELECT acl_grant_admin('fleet', 'cluster');
+
+query I
+ACL ROLE 'fleet' SELECT count(*) FROM platform.group_sources('etl') WHERE source = 'lake';
+----
+1
+
+statement error
+ACL ROLE 'loader' SELECT * FROM platform.group_sources('etl');
+----
