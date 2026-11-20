@@ -14,11 +14,14 @@
 #include "acl_policy_catalog.hpp"
 #include "acl_result_rows.hpp"
 #include "acl_sql_text.hpp"
+#include "hugr_node_tick.hpp"
 
 #include "duckdb/main/config.hpp"
 #include "duckdb/parser/peg/passthrough_dialect.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
@@ -27,6 +30,8 @@
 #include "yyjson.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <map>
 #include <functional>
 
 namespace duckdb {
@@ -456,6 +461,214 @@ string JsonField(const string &json, const char *field) {
 
 } // namespace
 
+namespace {
+
+//! spec 035 stage 2: one lazy source of this node - its item and its idle time (0 = never detached), both under the
+//! registry's lock; when a statement last read it and the lock its attach and its idle detach take (never held with
+//! the registry's: an attach may wait on its source for long, the parse of every statement reads the registry)
+struct LazySource {
+	PolicyStore::ClusterItem item;
+	int64_t idle_seconds = 0;
+	mutex attach_lock;
+	std::chrono::steady_clock::time_point last_use; // under attach_lock
+};
+
+//! spec 035 stage 2: the node's lazy sources, from its effective profile - per instance, in its object cache
+class LazySources : public ObjectCacheEntry {
+public:
+	static string ObjectType() {
+		return "hugr_node_lazy_sources";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx(); // never evicted: the node's own state
+	}
+	mutex lock;
+	map<string, shared_ptr<LazySource>> sources; // by the lowercased alias
+};
+
+shared_ptr<LazySources> LazySourcesOf(DatabaseInstance &db) {
+	return db.GetObjectCache().GetOrCreate<LazySources>(LazySources::ObjectType());
+}
+
+//! the source and a copy of its item and idle time, read under the registry's lock
+shared_ptr<LazySource> FindLazySource(DatabaseInstance &db, const string &alias, PolicyStore::ClusterItem &item,
+                                      int64_t &idle_seconds) {
+	auto lazy = LazySourcesOf(db);
+	lock_guard<mutex> guard(lazy->lock);
+	auto found = lazy->sources.find(StringUtil::Lower(alias));
+	if (found == lazy->sources.end()) {
+		return nullptr;
+	}
+	item = found->second->item;
+	idle_seconds = found->second->idle_seconds;
+	return found->second;
+}
+
+} // namespace
+
+bool ClusterSourceLazy(const PolicyStore::ClusterItem &item, int64_t &idle_seconds);
+
+void RefreshLazySources(DatabaseInstance &db, const vector<PolicyStore::ClusterItem> &items) {
+	auto lazy = LazySourcesOf(db);
+	lock_guard<mutex> guard(lazy->lock);
+	map<string, shared_ptr<LazySource>> next;
+	for (auto &item : items) {
+		int64_t idle_seconds = 0;
+		if (!ClusterSourceLazy(item, idle_seconds)) {
+			continue;
+		}
+		auto key = StringUtil::Lower(item.name);
+		auto found = lazy->sources.find(key);
+		auto source = found != lazy->sources.end() ? found->second : make_shared_ptr<LazySource>();
+		if (found == lazy->sources.end()) {
+			source->last_use = std::chrono::steady_clock::now(); // attached by hand before it was marked: idle from now
+		}
+		source->item = item; // an attach in flight runs with the copy it took
+		source->idle_seconds = idle_seconds;
+		next[key] = source;
+	}
+	lazy->sources = std::move(next);
+}
+
+void ForgetLazySource(DatabaseInstance &db, const string &alias) {
+	auto lazy = LazySourcesOf(db);
+	lock_guard<mutex> guard(lazy->lock);
+	lazy->sources.erase(StringUtil::Lower(alias));
+}
+
+vector<string> LazySourceAliases(DatabaseInstance &db) {
+	auto lazy = LazySourcesOf(db);
+	lock_guard<mutex> guard(lazy->lock);
+	vector<string> out;
+	for (auto &source : lazy->sources) {
+		out.push_back(source.second->item.name);
+	}
+	return out;
+}
+
+void AttachLazySource(DatabaseInstance &db, const string &alias) {
+	PolicyStore::ClusterItem item;
+	int64_t idle_seconds = 0;
+	auto source = FindLazySource(db, alias, item, idle_seconds);
+	if (!source) {
+		return; // the profile no longer keeps it lazy: nothing of ours
+	}
+	lock_guard<mutex> attach(source->attach_lock);
+	source->last_use = std::chrono::steady_clock::now();
+	if (DatabaseManager::Get(db).GetDatabase(Identifier(item.name))) {
+		return;
+	}
+	Connection con(db);
+	for (auto &statement : ClusterItemApplyStatements(item)) {
+		auto result = con.Query(statement);
+		if (result->HasError()) {
+			if (DatabaseManager::Get(db).GetDatabase(Identifier(item.name))) {
+				break; // attached meanwhile by another path (the tick's apply, a write's hot apply): there it is
+			}
+			// the class only: a source's error may carry its connection string. The operator's log names the source;
+			// the statement's refusal does not - a principal reads virtual names
+			auto error_class = Exception::ExceptionTypeToString(result->GetErrorType());
+			fprintf(stderr, "hugr_node: lazy source %s could not be attached (%s)\n", item.name.c_str(),
+			        error_class.c_str());
+			fflush(stderr);
+			throw InvalidInputException("acl: a source this statement reads could not be attached (%s)", error_class);
+		}
+	}
+	source->last_use = std::chrono::steady_clock::now();
+	// the tick takes it as this node's: a profile that drops or re-points it then detaches it or waits for a drain
+	NoteAppliedHere(db, "source", item.name);
+}
+
+vector<string> DetachIdleLazySources(DatabaseInstance &db, const std::set<string> &taken) {
+	vector<std::pair<shared_ptr<LazySource>, PolicyStore::ClusterItem>> sources;
+	vector<int64_t> idle_times;
+	{
+		auto lazy = LazySourcesOf(db);
+		lock_guard<mutex> guard(lazy->lock);
+		for (auto &source : lazy->sources) {
+			sources.emplace_back(source.second, source.second->item);
+			idle_times.push_back(source.second->idle_seconds);
+		}
+	}
+	vector<string> detached;
+	auto now = std::chrono::steady_clock::now();
+	for (idx_t i = 0; i < sources.size(); i++) {
+		auto &source = sources[i].first;
+		auto &item = sources[i].second;
+		// a source being attached is in use: never wait on it from the tick (its heartbeat with it)
+		unique_lock<mutex> attach(source->attach_lock, std::try_to_lock);
+		if (!attach.owns_lock()) {
+			continue;
+		}
+		if (!taken.count(StringUtil::Lower(item.name))) {
+			continue; // not the node's: attached by hand (ACL NATIVE) - drift, never the tick's to detach
+		}
+		hugr_node::LazyIdle state;
+		state.idle_seconds = idle_times[i];
+		state.seconds_since_use = std::chrono::duration_cast<std::chrono::seconds>(now - source->last_use).count();
+		{
+			auto attached = DatabaseManager::Get(db).GetDatabase(Identifier(item.name));
+			state.attached = attached != nullptr;
+			// duckdb's own rule (InvokeCloseIfLastReference): the manager's reference and this one are all there
+			// is unless a transaction - a running statement, an open one - still uses the database
+			state.held = attached && attached.use_count() > 2;
+		}
+		if (!hugr_node::DecideIdleDetach(state)) {
+			continue;
+		}
+		Connection con(db);
+		auto result = con.Query("DETACH " + Ident(item.name));
+		if (!result->HasError()) {
+			detached.push_back(item.name);
+		}
+	}
+	return detached;
+}
+
+void RefreshLazySourcesAfterWrite(PolicyStore &store, DatabaseInstance &db) {
+	// the writing node attaches a source it marked lazy on demand at once; the others at their next tick
+	try {
+		RefreshLazySources(db, store.ClusterEffective());
+	} catch (std::exception &) { // NOLINT: the next tick refreshes them
+	}
+}
+
+string ClusterSourceIdentity(const string &spec) {
+	using namespace duckdb_yyjson; // NOLINT
+	auto doc = yyjson_read(spec.c_str(), spec.size(), 0);
+	if (!doc) {
+		return spec;
+	}
+	auto copy = yyjson_doc_mut_copy(doc, nullptr);
+	yyjson_doc_free(doc);
+	if (!copy) {
+		return spec;
+	}
+	auto root = yyjson_mut_doc_get_root(copy);
+	yyjson_mut_obj_remove_key(root, "lazy");
+	yyjson_mut_obj_remove_key(root, "idle_seconds");
+	size_t length = 0;
+	auto text = yyjson_mut_write(copy, 0, &length);
+	string out = text ? string(text, length) : spec;
+	free(text);
+	yyjson_mut_doc_free(copy);
+	return out;
+}
+
+bool ClusterSourceLazy(const PolicyStore::ClusterItem &item, int64_t &idle_seconds) {
+	idle_seconds = 0;
+	if (item.kind != "source" || JsonField(item.spec, "lazy") != "true") {
+		return false;
+	}
+	auto idle = JsonField(item.spec, "idle_seconds");
+	int64_t seconds = 0;
+	idle_seconds = !idle.empty() && TryCast::Operation<string_t, int64_t>(string_t(idle), seconds) ? seconds : 0;
+	return true;
+}
+
 string ClusterExtensionOfType(const string &type) {
 	return ExtensionOfType(type);
 }
@@ -690,7 +903,8 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterExtension(const string &verb, con
 PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const string &alias, const string &path,
                                                       const string &type, const string &secret,
                                                       const string &options_json, const vector<string> &depends_on,
-                                                      const string &comment, const string &lineage) {
+                                                      const string &comment, const string &lineage, bool lazy,
+                                                      const string &idle) {
 	RequireClusterCatalog(catalog, "acl_cluster_attach");
 	auto db = instance.lock();
 	if (!db) {
@@ -734,12 +948,43 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 		                      "(TYPE %s, SECRET <name>)",
 		                      source_type, source_type);
 	}
+	// spec 035 stage 2: a lazy source attaches alone, when a statement reads it - nothing it loads through is attached
+	// with it, and the node's secrets service is never lazy
+	if (lazy && !depends_on.empty()) {
+		throw BinderException(
+		    "acl cluster: a lazy source attaches alone - LAZY and DEPENDS ON are not written together");
+	}
+	if (lazy && StringUtil::CIEquals(SourceTypeOf(type, path), "tresor")) {
+		throw BinderException("acl cluster: the secrets service is attached at the bootstrap, never LAZY");
+	}
+	// a lazy source's idle time, read by duckdb's own INTERVAL (never a reader of ours)
+	int64_t idle_seconds = 0;
+	if (!idle.empty()) {
+		if (!lazy) {
+			throw BinderException("acl cluster: IDLE is a lazy source's - write LAZY IDLE '<interval>'");
+		}
+		Connection con(*db);
+		auto read = con.Query("SELECT CAST(epoch(CAST(" + Quoted(idle) + " AS INTERVAL)) AS BIGINT)");
+		if (read->HasError() || read->RowCount() == 0 || read->Collection().GetValue(0, 0).IsNull()) {
+			throw BinderException("acl cluster: IDLE '%s' is not an interval duckdb reads ('30 min', '2 hours')", idle);
+		}
+		idle_seconds = read->Collection().GetValue(0, 0).GetValue<int64_t>();
+		if (idle_seconds < 60) {
+			throw BinderException("acl cluster: IDLE '%s' is under a minute - a lazy source idles a minute at least",
+			                      idle);
+		}
+	}
 	auto spec = "{" + JsonQuote("type") + ": " + JsonQuote(type) + ", " + JsonQuote("path") + ": " + JsonQuote(path) +
 	            ", " + JsonQuote("secret") + ": " + JsonQuote(secret) + ", " + JsonQuote("options") + ": " +
 	            JsonObjectOf(options) +
-	            (lineage.empty() ? string() : ", " + JsonQuote("lineage") + ": " + JsonQuote(lineage)) + "}";
+	            (lineage.empty() ? string() : ", " + JsonQuote("lineage") + ": " + JsonQuote(lineage)) +
+	            (lazy ? ", " + JsonQuote("lazy") + ": " + JsonQuote("true") : string()) +
+	            (idle_seconds > 0 ? ", " + JsonQuote("idle_seconds") + ": " + JsonQuote(std::to_string(idle_seconds))
+	                              : string()) +
+	            "}";
 	ClusterAnswer answer;
 	bool repoint = false;
+	bool exists = false;
 	// a group's source named like a cluster's overrides it on the group's nodes: there it is a re-point
 	bool overrides = false;
 	vector<string> left_out; // spec 035: groups whose source set does not list it
@@ -747,9 +992,31 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 	    [&](const ReadFn &read, vector<string> &statements) {
 		    RequireScope(read, *catalog, scope);
 		    auto current = CurrentSpec(read, *catalog, scope, "source", alias);
-		    repoint = !current.empty();
+		    exists = !current.empty();
+		    // spec 035 stage 2: a change of the lazy marks alone moves nothing - the source is where it was
+		    repoint = exists && ClusterSourceIdentity(current) != ClusterSourceIdentity(spec);
 		    overrides = !scope.empty() && !CurrentSpec(read, *catalog, "", "source", alias).empty();
 		    answer.item_class = repoint || overrides ? "drain" : "hot";
+		    // spec 035 stage 2: nothing loads through a lazy source, and a source others load through is not lazy
+		    for (auto &dep : depends_on) {
+			    for (auto &dep_scope : {scope, string()}) {
+				    if (JsonField(CurrentSpec(read, *catalog, dep_scope, "source", dep), "lazy") == "true") {
+					    throw BinderException("acl cluster: DEPENDS ON \"%s\" - a lazy source; nothing loads through "
+					                          "one",
+					                          dep);
+				    }
+			    }
+		    }
+		    if (lazy) {
+			    auto dependents = read("SELECT \"name\" FROM " + catalog->Tbl("cluster_deps") +
+			                           " WHERE lower(\"depends_on\") = lower(" + Lit(alias) + ") ORDER BY \"name\"");
+			    if (dependents->RowCount() > 0) {
+				    ResultRows rows(*dependents);
+				    throw BinderException("acl cluster: \"%s\" is what %s loads through - a source others depend on "
+				                          "is never LAZY",
+				                          alias, rows.GetValue(0, 0).ToString());
+			    }
+		    }
 		    // dependencies: sources of this scope or of the whole cluster, never a cycle
 		    for (auto &dep : depends_on) {
 			    auto exists = read("SELECT 1 FROM " + catalog->Tbl("cluster_items") +
@@ -813,7 +1080,7 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 			    }
 		    }
 		    statements.push_back(
-		        UpsertItem(*catalog, scope, "source", alias, spec, answer.item_class, comment, repoint));
+		        UpsertItem(*catalog, scope, "source", alias, spec, answer.item_class, comment, exists));
 		    statements.push_back("DELETE FROM " + catalog->Tbl("cluster_deps") + " WHERE \"scope\" = " + Lit(scope) +
 		                         " AND lower(\"name\") = lower(" + Lit(alias) + ")");
 		    for (auto &dep : depends_on) {
@@ -848,10 +1115,16 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 			    }
 			    return;
 		    }
+		    if (lazy) {
+			    answer.note = "lazy - attached on this node by the first statement that reads it" +
+			                  string(idle_seconds > 0 ? ", detached after it idles" : ", never detached by itself");
+			    return;
+		    }
 		    NodeQuery(*db, AttachStatement(alias, path, type, secret, options, lineage));
 		    answer.applied_here = true;
 		    NoteAppliedHere(*db, "source", alias);
 	    });
+	RefreshLazySourcesAfterWrite(*this, *db);
 	if (!left_out.empty()) {
 		auto said = "not attached by the nodes of group(s) " + StringUtil::Join(left_out, ", ") +
 		            " - their source set does not list it (CLUSTER SET SOURCES names what they attach)";
@@ -1045,6 +1318,7 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const
 				    repointed.push_back(it->second);
 				    continue;
 			    }
+			    ForgetLazySource(*db, it->second); // spec 035 stage 2: no statement attaches it again meanwhile
 			    Connection con(*db);
 			    auto result = con.Query("DETACH " + Ident(it->second));
 			    if (result->HasError()) {
@@ -1075,6 +1349,7 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const
 			                   " - the node reports it pending for a drain";
 		    }
 	    });
+	RefreshLazySourcesAfterWrite(*this, *db);
 	return answer;
 }
 
@@ -1315,8 +1590,11 @@ vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 	}
 	for (auto &source : profile[2]) {
 		if (!on_node.count(source.first)) {
-			out.push_back({"database", source.first, "profile_only", "", JsonField(source.second->spec, "path"),
-			               source.second->scope});
+			// spec 035 stage 2: a lazy source not attached is as the profile wants it - attached on demand
+			int64_t idle_seconds = 0;
+			out.push_back({"database", source.first,
+			               ClusterSourceLazy(*source.second, idle_seconds) ? "lazy" : "profile_only", "",
+			               JsonField(source.second->spec, "path"), source.second->scope});
 		}
 	}
 	// extensions: the loaded ones; statically linked and acl itself are the build's
@@ -1545,7 +1823,18 @@ void ClusterExtensionFunc(DataChunk &args, ExpressionState &state, Vector &resul
 	});
 }
 
-//! acl_cluster_attach(scope, alias, path, type, secret, options_json, depends_on_csv, comment[, lineage])
+bool LazyFlag(const string &text) {
+	if (text.empty() || StringUtil::CIEquals(text, "false")) {
+		return false;
+	}
+	if (StringUtil::CIEquals(text, "true")) {
+		return true;
+	}
+	throw BinderException("acl cluster: lazy is 'true' or 'false' - not '%s'", text);
+}
+
+//! acl_cluster_attach(scope, alias, path, type, secret, options_json, depends_on_csv, comment[, lineage[, lazy[,
+//! idle]]]) - lazy 'true' marks the source LAZY (spec 035 stage 2), idle its IDLE interval
 void ClusterAttachFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	EachRow(args, result, [&](idx_t row) {
 		vector<string> deps;
@@ -1559,7 +1848,9 @@ void ClusterAttachFunc(DataChunk &args, ExpressionState &state, Vector &result) 
 		}
 		return StoreOf(state).ClusterAttach(Arg(args, 0, row), Arg(args, 1, row), Arg(args, 2, row), Arg(args, 3, row),
 		                                    Arg(args, 4, row), Arg(args, 5, row), deps, Arg(args, 7, row),
-		                                    args.ColumnCount() > 8 ? Arg(args, 8, row) : string());
+		                                    args.ColumnCount() > 8 ? Arg(args, 8, row) : string(),
+		                                    args.ColumnCount() > 9 && LazyFlag(Arg(args, 9, row)),
+		                                    args.ColumnCount() > 10 ? Arg(args, 10, row) : string());
 	});
 }
 
@@ -1799,8 +2090,8 @@ arena_ptr<TransformResultValue> FinalizeClusterExtension(PEGTransformer &transfo
 	return call.Result();
 }
 
-// AclClusterAttach <- 'CLUSTER' 'ATTACH' AclQuotedValue 'AS' AclNameValue AclClusterOptions? AclClusterLineage?
-//                     AclClusterDepends? AclClusterInGroup? AclComment?
+// AclClusterAttach <- 'CLUSTER' 'ATTACH' AclQuotedValue 'AS' AclNameValue AclClusterOptions? AclClusterLazy?
+//                     AclClusterLineage? AclClusterDepends? AclClusterInGroup? AclComment?
 arena_ptr<TransformResultValue> FinalizeClusterAttach(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	MgmtCall call(transformer, "acl_cluster_attach");
@@ -1834,12 +2125,23 @@ arena_ptr<TransformResultValue> FinalizeClusterAttach(PEGTransformer &transforme
 			}
 		}
 	}
-	string lineage; // spec 112 §9: the name the source is known by, declared where it is attached
+	// spec 035 stage 2: AclClusterLazy <- 'LAZY' AclClusterIdle?, AclClusterIdle <- 'IDLE' AclQuotedValue
+	string lazy, idle;
 	if (auto clause = MgmtCall::Optional(list.GetChild(6))) {
+		lazy = "true";
+		if (auto given = MgmtCall::Optional(clause->Cast<ListParseResult>().GetChild(1))) {
+			idle = call.Quoted(given->Cast<ListParseResult>().GetChild(1), "the source's idle time");
+			if (idle.empty()) {
+				throw BinderException("acl admin: IDLE names an interval ('30 min') - LAZY alone is never detached");
+			}
+		}
+	}
+	string lineage; // spec 112 §9: the name the source is known by, declared where it is attached
+	if (auto clause = MgmtCall::Optional(list.GetChild(7))) {
 		lineage = call.Quoted(clause->Cast<ListParseResult>().GetChild(1), "the source's lineage identity");
 	}
 	string deps;
-	if (auto clause = MgmtCall::Optional(list.GetChild(7))) {
+	if (auto clause = MgmtCall::Optional(list.GetChild(8))) {
 		// AclClusterDepends <- 'DEPENDS' 'ON' '(' AclNameValue AclClusterDependsMore* ','? ')'
 		auto &parts = clause->Cast<ListParseResult>();
 		vector<reference<ParseResult>> items {parts.GetChild(3)};
@@ -1860,14 +2162,14 @@ arena_ptr<TransformResultValue> FinalizeClusterAttach(PEGTransformer &transforme
 		}
 		deps = StringUtil::Join(names, ",");
 	}
-	auto scope = ClusterGroup(call, list.GetChild(8));
-	auto note = ClusterComment(call, list.GetChild(9));
+	auto scope = ClusterGroup(call, list.GetChild(9));
+	auto note = ClusterComment(call, list.GetChild(10));
 	vector<string> json;
 	for (auto &option : options) {
 		json.push_back(JsonQuote(option.first) + ": " + JsonQuote(option.second));
 	}
-	for (auto &value :
-	     {scope, alias, path, type, secret, "{" + StringUtil::Join(json, ", ") + "}", deps, note, lineage}) {
+	for (auto &value : {scope, alias, path, type, secret, "{" + StringUtil::Join(json, ", ") + "}", deps, note, lineage,
+	                    lazy, idle}) {
 		call.Arg(Value(value));
 	}
 	return call.Result();
@@ -1960,12 +2262,14 @@ void RegisterClusterRules() {
 	rule("AclClusterOption <- AclWordToken AclValue?");
 	rule("AclClusterOptionMore <- ',' AclClusterOption");
 	rule("AclClusterOptions <- '(' AclClusterOption AclClusterOptionMore* ','? ')'");
+	rule("AclClusterIdle <- 'IDLE' AclQuotedValue");
+	rule("AclClusterLazy <- 'LAZY' AclClusterIdle?");
 	rule("AclClusterLineage <- 'LINEAGE' AclQuotedValue");
 	rule("AclClusterDependsMore <- ',' AclNameValue");
 	rule("AclClusterDepends <- 'DEPENDS' 'ON' '(' AclNameValue AclClusterDependsMore* ','? ')'");
 	rules.push_back(GrammarChange::AddRule(
-	    "AclClusterAttach <- 'CLUSTER' 'ATTACH' AclQuotedValue 'AS' AclNameValue AclClusterOptions? AclClusterLineage? "
-	    "AclClusterDepends? AclClusterInGroup? AclComment?",
+	    "AclClusterAttach <- 'CLUSTER' 'ATTACH' AclQuotedValue 'AS' AclNameValue AclClusterOptions? AclClusterLazy? "
+	    "AclClusterLineage? AclClusterDepends? AclClusterInGroup? AclComment?",
 	    MgmtStart<FinalizeClusterAttach>));
 	rule("AclClusterDetachFlag <- 'CASCADE' / 'FORCE'");
 	rules.push_back(GrammarChange::AddRule(
@@ -1994,7 +2298,8 @@ void RegisterClusterRules() {
 	     {"attach"},
 	     StringUtil::Format(
 	         "write CLUSTER ATTACH '<path>' AS <alias> [(TYPE <type>, SECRET <secret>, <option> "
-	         "[<value>], ...)] [LINEAGE '<identity>'] [DEPENDS ON (<source>, ...)] %s [COMMENT '<text>']",
+	         "[<value>], ...)] [LAZY [IDLE '<interval>']] [LINEAGE '<identity>'] [DEPENDS ON (<source>, ...)] %s "
+	         "[COMMENT '<text>']",
 	         group)},
 	    {"AclClusterDetach",
 	     {"detach"},
@@ -2058,8 +2363,8 @@ void RegisterClusterPlatform() {
 	RegisterPlatformFunction({"cluster_attach",
 	                          "acl_cluster_attach",
 	                          {A("scope"), A("alias"), A("path"), A("type"), A("secret"), P("options"), A("depends_on"),
-	                           P("comment"), P("lineage")},
-	                          {8, 9},
+	                           P("comment"), P("lineage"), P("lazy"), P("idle")},
+	                          {8, 9, 10, 11},
 	                          -1,
 	                          PlatformRight::INFRASTRUCTURE,
 	                          false,
@@ -2113,6 +2418,8 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	scalar("acl_cluster_extension", {v, v, v, v, v, v}, ClusterExtensionFunc, AnswerType());
 	scalar("acl_cluster_attach", {v, v, v, v, v, v, v, v}, ClusterAttachFunc, AnswerType());
 	scalar("acl_cluster_attach", {v, v, v, v, v, v, v, v, v}, ClusterAttachFunc, AnswerType());
+	scalar("acl_cluster_attach", {v, v, v, v, v, v, v, v, v, v}, ClusterAttachFunc, AnswerType());
+	scalar("acl_cluster_attach", {v, v, v, v, v, v, v, v, v, v, v}, ClusterAttachFunc, AnswerType());
 	scalar("acl_cluster_detach", {v, v, v, v}, ClusterDetachFunc, AnswerType());
 	scalar("acl_cluster_setting", {v, v, v, v}, ClusterSettingFunc, AnswerType());
 	scalar("acl_cluster_sources", {v, v, v}, ClusterSourcesFunc, AnswerType());
@@ -2178,6 +2485,17 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	node->node_traits.partial_sources = [node]() {
 		auto group = node->NodeGroup();
 		return node->catalog && GroupDeclaresSources(*node->catalog, group) ? group : string();
+	};
+	// spec 035 stage 2 (duckdb-acl spec 177): the sources marked LAZY, attached by the statement that reads them
+	node->node_traits.lazy_sources = [node]() {
+		auto db = node->instance.lock();
+		return db ? LazySourceAliases(*db) : vector<string>();
+	};
+	node->node_traits.attach_on_demand = [node](const string &alias) {
+		auto db = node->instance.lock();
+		if (db) {
+			AttachLazySource(*db, alias);
+		}
 	};
 }
 

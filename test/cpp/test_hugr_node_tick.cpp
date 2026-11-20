@@ -159,5 +159,48 @@ int main(int argc, char *argv[]) {
 			auto group_back = DecideGroup(true, true, true, true, true);
 			Check(!group_back.resume, "the group back while scaled down: still drained");
 		});
+
+		Scenario("spec 035 stage 2: a lazy source is as the profile wants it, attached or not", [&] {
+			std::vector<TickItem> items = {{"source", "archive", SALES}};
+			TickTaken taken = {{{"source", "archive"}, SALES}};
+			auto asleep = DecideTick(items, {{"database", "archive", "lazy"}}, taken);
+			Check(asleep.apply.empty() && asleep.pending.empty() && asleep.detach.empty(),
+			      "not attached: nothing to apply, nothing pending - it counts as applied");
+			auto awake = DecideTick(items, {{"database", "archive", "same"}}, taken);
+			Check(awake.apply.empty() && awake.pending.empty(), "attached on demand: same");
+			auto dropped = DecideTick({}, {{"database", "archive", "node_only"}}, taken);
+			Check(dropped.detach.size() == 1 && dropped.detach[0] == "archive",
+			      "dropped by the profile while attached: detached, as any source it took");
+			auto late = DecideTick(items, {{"database", "archive", "same"}}, {}, {{"source", "archive"}});
+			Check(late.adopt.size() == 1,
+			      "written after the bootstrap, attached on demand (its applied-here note): the node takes it");
+			auto by_hand = DecideTick(items, {{"database", "archive", "same"}}, {});
+			Check(by_hand.adopt.empty(), "attached by hand under its alias (no note): never taken");
+			auto repointed = DecideTick({{"source", "archive", SALES_V2}}, {{"database", "archive", "same"}}, taken);
+			Check(Has(repointed.pending, "source", "archive", "drain"),
+			      "re-pointed while attached on demand: pending a drain, as any source");
+			auto dropped_asleep = DecideTick({}, {}, taken);
+			Check(dropped_asleep.detach.empty() && dropped_asleep.forget.size() == 1,
+			      "dropped while not attached: forgotten");
+		});
+
+		Scenario("spec 035 stage 2: the idle detach", [&] {
+			LazyIdle idle;
+			idle.idle_seconds = 1800;
+			idle.seconds_since_use = 1800;
+			idle.attached = true;
+			Check(DecideIdleDetach(idle), "idle for its time, used by nobody: detached");
+			idle.seconds_since_use = 1799;
+			Check(!DecideIdleDetach(idle), "read within its time: kept");
+			idle.seconds_since_use = 7200;
+			idle.held = true;
+			Check(!DecideIdleDetach(idle), "a transaction still uses it (a running statement, an open one): kept");
+			idle.held = false;
+			idle.attached = false;
+			Check(!DecideIdleDetach(idle), "not attached: nothing to detach");
+			idle.attached = true;
+			idle.idle_seconds = 0;
+			Check(!DecideIdleDetach(idle), "LAZY without IDLE: never detached by itself");
+		});
 	});
 }

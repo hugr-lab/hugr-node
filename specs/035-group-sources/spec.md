@@ -1,6 +1,7 @@
 # Spec 035: a resource group's sources, and sources attached on demand
 
-- **Status**: accepted (the owner, 2026-11-16); stage 1 (the source set and the partial node) implemented 2026-11-20
+- **Status**: accepted (the owner, 2026-11-16); stage 1 (the source set and the partial node) and stage 2 (the lazy
+  sources) implemented 2026-11-20
 - **Date**: 2026-11-16
 - **Author**: Claude, from the owner's decisions of 2026-11-16
 - **Follows**: duckdb-acl spec 093 (the cluster profile: `ACL CLUSTER ATTACH … [IN GROUP g]`), spec 096 (a resource
@@ -153,3 +154,51 @@ ATTACH item's spec, `sources` a new kind with its list. No schema step: the item
   principal's own DDL record (duckdb-acl spec 113) is not refused: it records an object in a source the node holds.
 - Tests: `test/sql/cluster/cluster_group_sources.test`, and the bootstrap e2e's step 11b (a source left out is
   detached by both nodes, and attached again on RESET).
+
+## Stage 2 as built (2026-11-20)
+
+- `CLUSTER ATTACH … LAZY [IDLE '<interval>']`. The rule is `AclClusterLazy <- 'LAZY' AclClusterIdle?`, after the
+  options list, and it compiles to `acl_cluster_attach`'s two last arguments, `lazy` ('true') and `idle`.
+  - The interval is read by duckdb (`epoch(CAST(… AS INTERVAL))`). One under a minute, or one that does not read, is
+    refused. `IDLE` without `LAZY` is refused too.
+  - The spec carries `"lazy": "true"` and `"idle_seconds": "<n>"`.
+  - A re-write that changes only the marks is no re-point (`ClusterSourceIdentity`: the spec without them). The tick
+    compares a source by that identity as well.
+- **Not attached by the profile.** The bootstrap (`ProfileItemStatements`) and the writing node's hot apply skip a
+  lazy source. The drift says `lazy` for one not attached, and the tick treats `lazy` as applied.
+- **The registry** (`LazySources`, per instance in its object cache) keeps, per lazy alias, its item, its idle time,
+  its last use and a lock. It is refreshed from the effective profile at the bootstrap, at every tick and after this
+  node's own ATTACH / DETACH writes; the other nodes take a change at their next tick.
+- **Attached on demand.** duckdb-acl spec 177's traits read the registry. `attach_on_demand` takes the source's lock
+  (never with the registry's: a slow ATTACH must not stall every parse), notes the use, and runs the item's ATTACH on
+  a connection of its own when the database is not there.
+  - A failure throws `acl: a source this statement reads could not be attached (<class>)`; the node's log names the
+    source, the principal is not told it.
+  - An ATTACH that fails because another path attached it meanwhile is success.
+  - What it attached is an applied-here note, so the tick takes it as the node's (the bootstrap takes no lazy item):
+    a profile that drops it detaches it, one that re-points it leaves it pending a drain.
+- **The idle detach** runs in the tick (`DetachIdleLazySources`, the decision `DecideIdleDetach` in
+  hugr_node_tick.hpp). It detaches an attached source with an `IDLE` whose last use is older than it, unless a
+  transaction holds the database. "Holds" is duckdb's own rule: the manager's reference and ours are all there is
+  (`use_count() > 2` means a running statement or an open transaction still uses it). It runs under the source's
+  lock, so an attach and the detach never cross; the tick only tries that lock, so a source being attached (in use)
+  is left for the next tick and never holds up the heartbeat. Only a source the tick took is detached - a database
+  attached by hand under the alias is drift - and the detach drops it from what the tick took. The tick takes the
+  applied-here notes before it reads the drift, so a note left after that read is the next tick's, never lost.
+- `CLUSTER DETACH` of a lazy source takes it out of the writing node's registry before its DETACH, so no statement
+  attaches it again in between.
+- **Refused where written** (the review): `LAZY` with `DEPENDS ON`, a source depending on a lazy one, marking lazy a
+  source others depend on (a lazy source attaches alone), a lazy `tresor`, `IDLE ''`, a `lazy` argument other than
+  `'true'` / `'false'`.
+- **Known limit.** A listing never wakes a source, so an object read live from a lazy source that is not attached is
+  listed without columns. A client that loads the catalog whole (quack) sees it so; such a source's objects should
+  declare their columns.
+- `hugr_node_group_sources(g)` and the check's `group_source_missing` are stage 3.
+- Tests:
+  - `test/sql/cluster/cluster_lazy_sources.test`: the refusals, the spec, the drift's `lazy` / `same`, the policy
+    write that attaches the source, a principal's read that attaches it again, a listing that does not, the marks
+    changed without a re-point, and no longer lazy = attached;
+  - `test_hugr_node_tick.cpp`: the tick's `lazy` state and the idle decision;
+  - the bootstrap e2e's step 17b, over Flight with an administrator's token: node b's bootstrap skips the source,
+    node a attaches it for a policy write and for a read, detaches it after its idle minute, and a read attaches it
+    again.

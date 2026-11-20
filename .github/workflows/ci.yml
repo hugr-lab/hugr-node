@@ -111,6 +111,10 @@ jobs:
           go-version-file: _tresor-server/go.mod
           cache: false
 
+      # spec 035 stage 2: the bootstrap's lazy source is read over Flight by a third-party client
+      - name: The e2e's Flight SQL client
+        run: pip install pyarrow adbc_driver_flightsql adbc_driver_manager
+
       # spec 005: acl_otel's export; spec 006: a node bootstraps itself - from the same make target (kista is cloned
       # from its main by the script); spec 011: the hugr type across processes
       - name: End to end - tresor inside the cluster, acl_otel's export, the bootstrap, the hugr type
@@ -119,5 +123,6 @@ jobs:
           grep -q '^PASS: tresor in the cluster' e2e.log
           grep -q '^PASS: acl_otel in hugr_node' e2e.log
           grep -q '^PASS: a node bootstraps itself' e2e.log
+          grep -q '^ok: a lazy source' e2e.log
           grep -q '^PASS: the hugr type across processes' e2e.log
           grep -q "^PASS: the hugr type's identity through tresor" e2e.log

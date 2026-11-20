@@ -106,8 +106,8 @@ inline TickDecision DecideTick(const std::vector<TickItem> &items, const std::ve
 			}
 			continue;
 		}
-		if (state == "bootstrap") {
-			continue;
+		if (state == "bootstrap" || state == "lazy") {
+			continue; // spec 035 stage 2: a lazy source not attached is as the profile wants it
 		}
 		if (item.kind == "source") {
 			if (state == "profile_only") {
@@ -150,6 +150,22 @@ inline TickDecision DecideTick(const std::vector<TickItem> &items, const std::ve
 	}
 	out.needs_restart = !out.pending.empty();
 	return out;
+}
+
+//! spec 035 stage 2: one lazy source as the idle detach sees it - its idle time (0 = never detached), the seconds since
+//! a statement last read it, whether it is attached, and whether a transaction still uses it (a running statement, an
+//! open transaction: duckdb keeps the database for it)
+struct LazyIdle {
+	int64_t idle_seconds = 0;
+	int64_t seconds_since_use = 0;
+	bool attached = false;
+	bool held = false;
+};
+
+//! Detach it now: attached, idle past its time, used by nobody. One in use waits for the next tick
+inline bool DecideIdleDetach(const LazyIdle &source) {
+	return source.attached && source.idle_seconds > 0 && source.seconds_since_use >= source.idle_seconds &&
+	       !source.held;
 }
 
 //! What the tick does about the node's own drain: two reasons drain it - its resource group the policy lacks

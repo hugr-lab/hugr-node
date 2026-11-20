@@ -10,6 +10,8 @@
 
 #include "acl_policy.hpp"
 
+#include <set>
+
 namespace duckdb {
 class ExtensionLoader;
 
@@ -32,6 +34,21 @@ string ClusterExtensionOfType(const string &type);
 //! elsewhere detaches it here too. Taken once: the tick reads and clears the notes
 void NoteAppliedHere(DatabaseInstance &db, const string &kind, const string &name);
 vector<std::pair<string, string>> TakeAppliedHere(DatabaseInstance &db);
+
+//! spec 035 stage 2: a source item's spec without its lazy marks - where the source is (a change of the marks alone
+//! re-points nothing); and whether an item is a lazy source, with its idle time in seconds (0 = never detached)
+string ClusterSourceIdentity(const string &spec);
+bool ClusterSourceLazy(const PolicyStore::ClusterItem &item, int64_t &idle_seconds);
+//! spec 035 stage 2: the node's lazy sources, from its effective profile (bootstrap, every tick, its own writes); the
+//! trait's attach on demand (duckdb-acl spec 177); the tick's idle detach - what it detached
+void RefreshLazySources(DatabaseInstance &db, const vector<PolicyStore::ClusterItem> &items);
+vector<string> LazySourceAliases(DatabaseInstance &db);
+//! a source the profile drops: out of the registry before its DETACH, so no statement attaches it again meanwhile
+void ForgetLazySource(DatabaseInstance &db, const string &alias);
+void AttachLazySource(DatabaseInstance &db, const string &alias);
+//! `taken`: the sources the tick took as the node's (lowercased) - a database attached by hand is never detached
+vector<string> DetachIdleLazySources(DatabaseInstance &db, const std::set<string> &taken);
+void RefreshLazySourcesAfterWrite(PolicyStore &store, DatabaseInstance &db);
 
 //! spec 118: a setting the cluster bundle may put in the profile - the node's resources and tuning (an
 //! allowlist); a data path, a trust or audit setting and anything else is passthrough's
