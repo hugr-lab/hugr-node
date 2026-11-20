@@ -34,6 +34,8 @@ CLUSTER ATTACH '<path>' AS <alias> (TYPE <type> [, SECRET <secret>] [, <option> 
 CLUSTER DETACH <alias> [CASCADE] [FORCE] [IN GROUP <group>]
 CLUSTER SET <setting> = | TO <value> [IN GROUP <group>]
 CLUSTER RESET <setting> [IN GROUP <group>]
+CLUSTER SET SOURCES (<alias>, …) IN GROUP <group>
+CLUSTER RESET SOURCES IN GROUP <group>
 ```
 
 The statements are read on duckdb's tokens (spec 020), like acl's own management statements: a comment may stand
@@ -66,6 +68,34 @@ attaches the source with it (`ATTACH … LINEAGE '…'`). It is a name, never a 
 them, each with the scope it came from); `acl_cluster_applied(version)` is the node agent saying which
 profile version this node has converged to, which the load report shows (`config.applied` against
 `config.target`).
+
+### A group's source set
+
+By default a group's nodes attach every source: the cluster's and the group's own. `CLUSTER SET SOURCES (sales,
+crm) IN GROUP etl` declares the sources its nodes attach (spec 035), and `CLUSTER RESET SOURCES IN GROUP etl` gives
+them every source again.
+
+- **The names** are aliases of `ATTACH` items, the cluster's or that group's own. A name that is neither is refused
+  where it is written. A cluster-wide set is refused: the cluster attaches every source.
+- **Dependencies stay listed.** A listed source that `DEPENDS ON` another needs that one listed too. The rule holds
+  when the set is written, when an `ATTACH` re-points a listed source, and when a `DETACH` of a group's own source
+  hands its nodes the cluster's source of that name. Where it is a group's own item, the group's own dependencies
+  decide.
+- **An `ATTACH` the set leaves out** is written, and its answer names the groups whose nodes do not attach it.
+- **The nodes converge at their next tick.** A source left out is detached (a source in use waits for a drain),
+  and a listed one that is missing is attached. `acl_cluster_effective()` shows only the listed sources, and the set
+  itself is listed in `acl_cluster_items()` as an item of kind `sources`. A source attached to the group later is
+  attached only once the set names it.
+- **Such a node writes no policy** (duckdb-acl spec 176). Every management statement that writes the policy or the
+  profile, `platform.check_catalog` and `platform.check_grant` are refused there with `acl: this node attaches the
+  sources of group "etl" only - run it on a node of a group that attaches every source`. That is because each of
+  them would be judged against sources the node lacks. The node's operation (sessions, `DRAIN` / `RESUME NODE`),
+  `console_info`, `SET` / `RESET SESSION VIEW AS`, the policy's reads, the group's queries and a principal's own DDL
+  (its record names an object in a source the node holds) all run there. `ACL NATIVE` and the operator's own SQL
+  are unchanged.
+- A listing names a source outside the set as `not attached` (duckdb-acl spec 136).
+
+### What a statement does
 
 A statement does four things:
 

@@ -1,0 +1,227 @@
+# name: test/sql/cluster/cluster_group_sources.test
+# description: spec 035 stage 1 - a group's source set (CLUSTER SET | RESET SOURCES … IN GROUP g): its nodes attach
+#   only the listed sources (acl_cluster_effective), and such a node writes no policy (duckdb-acl spec 176)
+# group: [sql]
+
+require hugr_node
+
+statement ok
+SET GLOBAL acl_jwks_locations = 'test/idp/';
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP etl (max_sessions 10);
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP other (max_sessions 10);
+
+statement ok
+SET GLOBAL acl_node_group = 'etl';
+
+statement ok
+SELECT acl_cluster_attach('', 'sales', ':memory:', 'duckdb', '', '{}', '', '');
+
+statement ok
+SELECT acl_cluster_attach('', 'crm', ':memory:', 'duckdb', '', '{}', '', '');
+
+statement ok
+SELECT acl_cluster_attach('', 'crm_ext', ':memory:', 'duckdb', '', '{}', 'crm', '');
+
+statement ok
+SELECT acl_cluster_attach('etl', 'scratch', ':memory:', 'duckdb', '', '{}', '', '');
+
+query I
+SELECT name FROM acl_cluster_effective() WHERE kind = 'source' ORDER BY name;
+----
+crm
+crm_ext
+sales
+scratch
+
+# --- refused where written -------------------------------------------------------------------------
+
+statement error
+ACL ADMIN CLUSTER SET SOURCES (sales);
+----
+<REGEX>:.*a source set is a group's - write it IN GROUP <group>.*
+
+statement error
+ACL ADMIN CLUSTER SET SOURCES (sales, nowhere) IN GROUP etl;
+----
+<REGEX>:.*"nowhere" is no source of the cluster's nor of group "etl"'s.*
+
+# a group's own source is not another group's
+statement error
+ACL ADMIN CLUSTER SET SOURCES (scratch) IN GROUP other;
+----
+<REGEX>:.*"scratch" is no source of the cluster's nor of group "other"'s.*
+
+statement error
+ACL ADMIN CLUSTER SET SOURCES (crm_ext) IN GROUP etl;
+----
+<REGEX>:.*group "etl"'s source set lists "crm_ext", which depends on "crm" - list it there too.*
+
+statement error
+ACL ADMIN CLUSTER SET SOURCES (sales) IN GROUP nogroup;
+----
+<REGEX>:.*resource group "nogroup" does not exist.*
+
+statement error
+ACL ADMIN CLUSTER RESET SOURCES IN GROUP etl;
+----
+<REGEX>:.*group "etl" declares no source set.*
+
+# --- written: the group's nodes attach only the list ------------------------------------------------
+
+statement ok
+ACL ADMIN CLUSTER SET SOURCES (SALES, scratch) IN GROUP etl;
+
+# the names as the items write them, the set kept as an item of the group (no item to apply)
+query III
+SELECT scope, kind, spec FROM acl_cluster_items() WHERE kind = 'sources';
+----
+etl	sources	{"names": ["sales", "scratch"]}
+
+query I
+SELECT name FROM acl_cluster_effective() ORDER BY name;
+----
+sales
+scratch
+
+# the node is partial now: a policy write is refused, naming where to run it
+statement error
+ACL ADMIN CREATE ROLE analyst;
+----
+<REGEX>:.*this node attaches the sources of group "etl" only - run it on a node of a group that attaches every source.*
+
+statement error
+ACL ADMIN CLUSTER SET threads = 2 IN GROUP etl;
+----
+<REGEX>:.*this node attaches the sources of group "etl" only.*
+
+# the operator's own SQL on this node is its own (never refused) - a source the set leaves out is written for the
+# cluster, never attached here
+query II
+SELECT (r).applied_here, (r).note LIKE '%not attached by the nodes of group(s) etl%'
+FROM (SELECT acl_cluster_attach('', 'elsewhere', ':memory:', 'duckdb', '', '{}', '', '') AS r);
+----
+false	true
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'elsewhere';
+----
+0
+
+statement ok
+SELECT acl_cluster_detach('', 'elsewhere', 'false', 'false');
+
+# its reads and operation run
+query I
+SELECT count(*) FROM acl_cluster_items();
+----
+5
+
+statement ok
+ACL ADMIN RESUME NODE;
+
+# a node of another group attaches every source and writes
+statement ok
+SET GLOBAL acl_node_group = 'other';
+
+query I
+SELECT count(*) FROM acl_cluster_effective() WHERE kind = 'source';
+----
+3
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+# a group with a set cannot be dropped while it has it - the refusal names what removes it
+statement error
+ACL ADMIN DROP RESOURCE GROUP etl;
+----
+<REGEX>:.*source set \(RESET SOURCES\).*
+
+statement ok
+ACL ADMIN CLUSTER SET SOURCES (sales, crm, crm_ext) IN GROUP etl;
+
+query I
+SELECT spec FROM acl_cluster_items() WHERE kind = 'sources';
+----
+{"names": ["sales", "crm", "crm_ext"]}
+
+# a source the set leaves out is attached by every group but etl, and the answer says so
+query I
+SELECT (acl_cluster_attach('', 'later', ':memory:', 'duckdb', '', '{}', '', '')).note LIKE
+    '%not attached by the nodes of group(s) etl - their source set does not list it%';
+----
+true
+
+# re-pointing a listed source to depend on one the set leaves out is refused: etl's nodes could not attach it
+statement error
+SELECT acl_cluster_attach('', 'sales', ':memory:', 'duckdb', '', '{}', 'later', '');
+----
+<REGEX>:.*group "etl"'s source set lists "sales", which would depend on "later".*
+
+# a group's own source of a cluster source's name: its own dependencies decide (none here), not the cluster's
+statement ok
+SELECT acl_cluster_attach('etl', 'crm_ext', ':memory:', 'duckdb', '', '{}', '', '');
+
+statement ok
+ACL ADMIN CLUSTER SET SOURCES (sales, crm_ext) IN GROUP etl;
+
+# ...and re-pointing the cluster's crm_ext is not judged against etl's set: etl reads its own
+statement ok
+SELECT acl_cluster_attach('', 'crm_ext', ':memory:', 'duckdb', '', '{}', 'crm', '');
+
+# a group's own source a set leaves out: the answer says only that
+statement ok
+SELECT acl_cluster_attach('etl', 'etl_only', ':memory:', 'duckdb', '', '{}', '', '');
+
+query I
+SELECT (acl_cluster_attach('etl', 'etl_only', ':memory:', 'duckdb', '', '{}', '', '')).note;
+----
+not attached by the nodes of group(s) etl - their source set does not list it (CLUSTER SET SOURCES names what they attach)
+
+statement ok
+SELECT acl_cluster_detach('etl', 'etl_only', 'false', 'false');
+
+# detaching etl's own crm_ext would give its nodes the cluster's, which depends on crm the set leaves out
+statement error
+SELECT acl_cluster_detach('etl', 'crm_ext', 'false', 'false');
+----
+<REGEX>:.*group "etl"'s source set lists "crm_ext", which depends on "crm" - list it there too.*
+
+statement ok
+ACL ADMIN CLUSTER SET SOURCES (sales, crm, crm_ext) IN GROUP etl;
+
+statement ok
+SELECT acl_cluster_detach('etl', 'crm_ext', 'false', 'false');
+
+statement ok
+ACL ADMIN CLUSTER SET SOURCES (sales, crm, crm_ext) IN GROUP etl;
+
+statement ok
+SELECT acl_cluster_detach('', 'later', 'false', 'false');
+
+statement ok
+ACL ADMIN CLUSTER RESET SOURCES IN GROUP etl;
+
+statement ok
+SET GLOBAL acl_node_group = 'etl';
+
+query I
+SELECT count(*) FROM acl_cluster_effective() WHERE kind = 'source';
+----
+4
+
+statement ok
+ACL ADMIN CREATE ROLE loader;

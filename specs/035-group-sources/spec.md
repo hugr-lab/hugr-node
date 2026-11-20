@@ -1,6 +1,6 @@
 # Spec 035: a resource group's sources, and sources attached on demand
 
-- **Status**: accepted (the owner, 2026-11-16)
+- **Status**: accepted (the owner, 2026-11-16); stage 1 (the source set and the partial node) implemented 2026-11-20
 - **Date**: 2026-11-16
 - **Author**: Claude, from the owner's decisions of 2026-11-16
 - **Follows**: duckdb-acl spec 093 (the cluster profile: `ACL CLUSTER ATTACH … [IN GROUP g]`), spec 096 (a resource
@@ -134,3 +134,22 @@ ATTACH item's spec, `sources` a new kind with its list. No schema step: the item
   clearly; a policy change would otherwise attach and detach sources by itself. The derivation stays a suggestion.
 - **Every source lazy.** The owner: only specific ones - a first query paying an attach is acceptable for an archive,
   not for the sources every query reads.
+
+## Stage 1 as built (2026-11-20)
+
+- `CLUSTER SET SOURCES (…) IN GROUP g` / `CLUSTER RESET SOURCES IN GROUP g` compile to `acl_cluster_sources(verb,
+  scope, names_json)` (`platform.cluster_sources`, INFRASTRUCTURE). The item is kind `sources`, name `sources`, spec
+  `{"names": [...]}`, with the aliases as their items write them. A listed source that `DEPENDS ON` another needs
+  that one listed too. The rule is checked when the set is written, when an `ATTACH` re-points a listed source, and
+  when a `DETACH` of a group's own listed source hands its nodes the cluster's. Each check reads the item the group
+  reads: its own, else the cluster's. An `ATTACH` a set leaves out is written, its answer names those groups, and a
+  node of such a group does not attach it.
+- `ClusterEffective` drops the `sources` item and every source the set leaves out, so the drift, the tick and the
+  agent's bootstrap read the narrowed profile as they read any other.
+- The partial node is duckdb-acl spec 176's seam (`NodeTraits::partial_sources`: the node's group when it declares a
+  set). It refuses every compiled management call except OPERATE / OPEN and view-as, plus `platform.check_catalog` /
+  `check_grant`. The trait is read only for a batch that writes.
+  The operator's own SQL on the node (its bootstrap's direct `acl_*` calls) and `ACL NATIVE` are unchanged. A
+  principal's own DDL record (duckdb-acl spec 113) is not refused: it records an object in a source the node holds.
+- Tests: `test/sql/cluster/cluster_group_sources.test`, and the bootstrap e2e's step 11b (a source left out is
+  detached by both nodes, and attached again on RESET).

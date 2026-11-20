@@ -59,7 +59,7 @@ ACL ROLE "fleet" SELECT deployment, scopes, list_contains(my_views, 'drift'),
     len(list_filter(my_functions, lambda f: f LIKE 'cluster_%'))
 FROM platform.console_info();
 ----
-cluster	[observe, operate, cluster, policy, manage, passthrough]	true	4
+cluster	[observe, operate, cluster, policy, manage, passthrough]	true	5
 
 # secrets only in the secrets service: without one, refused
 statement error

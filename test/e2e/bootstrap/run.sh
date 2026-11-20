@@ -23,6 +23,7 @@
 #      re-pointed to the same type it is pending a drain on both, and dropped it is detached by both;
 #  11. a hot item failing on a node (a file the other holds) is listed there with its error's class, its version not
 #      recorded, the rest of the write applied;
+#  11b. a group's source set (spec 035): SET SOURCES leaves a source out - both detach it; RESET brings it back;
 #  12. a restart-class item (SET ... IN GROUP) is reported by both as needs_restart, with the item pending; withdrawn
 #      before it ran it waits no more, while a setting the nodes took at their bootstrap and the profile dropped does;
 #  13. a dropped resource group drains both by themselves, and recreating it resumes them;
@@ -587,6 +588,32 @@ for label in hugr-node-e2e-a hugr-node-e2e-b; do
 	wait_for 20 settled || fail "$label still reports pending items: $(beat "$label" 'b["config"]')"
 done
 echo "ok: a hot item failing on a node is listed there with its error's class, the rest applied; dropped, nothing waits"
+
+# spec 035: the group's nodes attach only the sources its set names - one left out is detached, back on RESET
+operator_sql "ACL ADMIN CLUSTER ATTACH ':memory:' AS e2e_kept (TYPE duckdb);" \
+	"ACL ADMIN CLUSTER ATTACH ':memory:' AS e2e_left (TYPE duckdb);" >/dev/null
+for node in a b; do
+	both_taken() { grep -q "tick: source e2e_kept applied" "$TMP/node-$node.log" &&
+		grep -q "tick: source e2e_left applied" "$TMP/node-$node.log"; }
+	wait_for 20 both_taken || fail "node $node did not take both sources"
+done
+operator_sql "ACL ADMIN CLUSTER SET SOURCES (e2e_kept) IN GROUP e2e;" >/dev/null
+for node in a b; do
+	left() { grep -q "tick: source e2e_left detached" "$TMP/node-$node.log"; }
+	wait_for 20 left || fail "node $node did not detach the source its group's set leaves out"
+	grep -q "tick: source e2e_kept detached" "$TMP/node-$node.log" && fail "node $node detached the listed source"
+done
+operator_sql "ACL ADMIN CLUSTER RESET SOURCES IN GROUP e2e;" >/dev/null
+for node in a b; do
+	back() { [ "$(grep -c "tick: source e2e_left applied" "$TMP/node-$node.log")" -ge 2 ]; }
+	wait_for 20 back || fail "node $node did not attach the source again once the set was reset"
+done
+operator_sql "ACL ADMIN CLUSTER DETACH e2e_kept;" "ACL ADMIN CLUSTER DETACH e2e_left;" >/dev/null
+for label in hugr-node-e2e-a hugr-node-e2e-b; do
+	settled() { [ "$(beat "$label" '[p["name"] for p in b["config"]["pending"]]')" = "[]" ]; }
+	wait_for 20 settled || fail "$label still reports pending items: $(beat "$label" 'b["config"]')"
+done
+echo "ok: a group's source set leaves a source out - both nodes detach it; reset, both attach it again"
 
 operator_sql "ACL ADMIN CLUSTER SET acl_max_sessions = 77 IN GROUP e2e;" >/dev/null
 for label in hugr-node-e2e-a hugr-node-e2e-b; do

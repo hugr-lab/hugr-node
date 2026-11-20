@@ -391,6 +391,57 @@ string DeleteItem(CatalogBackend &catalog, const string &scope, const string &ki
 	       " AND \"kind\" = " + Lit(kind) + " AND lower(\"name\") = lower(" + Lit(name) + ")";
 }
 
+//! hugr-node spec 035: the aliases a group's `sources` item names (its spec `{"names": [...]}`)
+case_insensitive_set_t SourceSetNames(const string &spec) {
+	using namespace duckdb_yyjson; // NOLINT
+	auto doc = yyjson_read(spec.c_str(), spec.size(), 0);
+	auto list = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), "names") : nullptr;
+	if (!list || !yyjson_is_arr(list)) {
+		if (doc) {
+			yyjson_doc_free(doc);
+		}
+		throw InvalidInputException("acl cluster: a group's source set is not readable");
+	}
+	case_insensitive_set_t names;
+	size_t i, n;
+	yyjson_val *value;
+	yyjson_arr_foreach(list, i, n, value) {
+		if (yyjson_is_str(value)) {
+			names.insert(yyjson_get_str(value));
+		}
+	}
+	yyjson_doc_free(doc);
+	return names;
+}
+
+//! hugr-node spec 035: group's set lists `name`, whose item - from `owner` ('' the cluster, else the group) - must have
+//! every source it depends on listed too
+void RequireListedDependencies(const std::function<unique_ptr<QueryResult>(const string &)> &read,
+                               CatalogBackend &catalog, const string &group, const string &owner, const string &name,
+                               const case_insensitive_set_t &listed) {
+	auto deps = read("SELECT \"depends_on\" FROM " + catalog.Tbl("cluster_deps") + " WHERE \"scope\" = " + Lit(owner) +
+	                 " AND lower(\"name\") = lower(" + Lit(name) + ")");
+	ResultRows rows(*deps);
+	for (idx_t r = 0; r < rows.Count(); r++) {
+		auto dependency = rows.GetValue(0, r).ToString();
+		if (!listed.count(dependency)) {
+			throw BinderException("acl cluster: group \"%s\"'s source set lists \"%s\", which depends on \"%s\" - "
+			                      "list it there too (CLUSTER SET SOURCES)",
+			                      group, name, dependency);
+		}
+	}
+}
+
+//! hugr-node spec 035: whether `group` declares its sources (its nodes attach only those)
+bool GroupDeclaresSources(CatalogBackend &catalog, const string &group) {
+	if (group.empty() || catalog.FunctionMode()) {
+		return false;
+	}
+	auto result = catalog.Query("SELECT 1 FROM " + catalog.Tbl("cluster_items") + " WHERE \"scope\" = " + Lit(group) +
+	                            " AND \"kind\" = 'sources'");
+	return result->RowCount() > 0;
+}
+
 string JsonField(const string &json, const char *field) {
 	using namespace duckdb_yyjson; // NOLINT
 	auto doc = yyjson_read(json.c_str(), json.size(), 0);
@@ -691,6 +742,7 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 	bool repoint = false;
 	// a group's source named like a cluster's overrides it on the group's nodes: there it is a re-point
 	bool overrides = false;
+	vector<string> left_out; // spec 035: groups whose source set does not list it
 	answer.version = catalog->WriteWithReads(
 	    [&](const ReadFn &read, vector<string> &statements) {
 		    RequireScope(read, *catalog, scope);
@@ -735,6 +787,31 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 				                          alias);
 			    }
 		    }
+		    // spec 035: the groups whose source set this source reaches - a set that lists it needs what it depends on
+		    // listed too, and one that does not list it leaves it off its nodes (said in the answer)
+		    auto sets = read("SELECT \"scope\", \"spec\" FROM " + catalog->Tbl("cluster_items") +
+		                     " WHERE \"kind\" = 'sources'" +
+		                     (scope.empty() ? string() : " AND \"scope\" = " + Lit(scope)) + " ORDER BY \"scope\"");
+		    ResultRows set_rows(*sets);
+		    for (idx_t r = 0; r < set_rows.Count(); r++) {
+			    auto group = set_rows.GetValue(0, r).ToString();
+			    if (scope.empty() && !CurrentSpec(read, *catalog, group, "source", alias).empty()) {
+				    continue; // the group reads its own item of that name, not this one
+			    }
+			    auto listed = SourceSetNames(set_rows.GetValue(1, r).ToString());
+			    if (!listed.count(alias)) {
+				    left_out.push_back(group);
+				    continue;
+			    }
+			    for (auto &dep : depends_on) {
+				    if (!listed.count(dep)) {
+					    throw BinderException(
+					        "acl cluster: group \"%s\"'s source set lists \"%s\", which would depend on "
+					        "\"%s\" - list it there first (CLUSTER SET SOURCES)",
+					        group, alias, dep);
+				    }
+			    }
+		    }
 		    statements.push_back(
 		        UpsertItem(*catalog, scope, "source", alias, spec, answer.item_class, comment, repoint));
 		    statements.push_back("DELETE FROM " + catalog->Tbl("cluster_deps") + " WHERE \"scope\" = " + Lit(scope) +
@@ -750,6 +827,9 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 			        return GroupHasItem(*catalog, group, "source", alias);
 		        })) {
 			    return;
+		    }
+		    if (std::find(left_out.begin(), left_out.end(), NodeGroupOf(*db)) != left_out.end()) {
+			    return; // spec 035: this node's group does not attach it (the note says so)
 		    }
 		    if (repoint || (overrides && NodeHasDatabase(*db, alias))) {
 			    answer.note = string(overrides && !repoint ? "drain class - it overrides the cluster's source of that "
@@ -772,6 +852,12 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 		    answer.applied_here = true;
 		    NoteAppliedHere(*db, "source", alias);
 	    });
+	if (!left_out.empty()) {
+		auto said = "not attached by the nodes of group(s) " + StringUtil::Join(left_out, ", ") +
+		            " - their source set does not list it (CLUSTER SET SOURCES names what they attach)";
+		// a group's own item its set leaves out: that is all there is to say about it
+		answer.note = scope.empty() && !answer.note.empty() ? answer.note + "; " + said : said;
+	}
 	return answer;
 }
 
@@ -802,6 +888,17 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const
 		    RequireScope(read, *catalog, scope);
 		    if (CurrentSpec(read, *catalog, scope, "source", alias).empty()) {
 			    throw BinderException("acl cluster: source \"%s\" is not in the profile", alias);
+		    }
+		    // spec 035: a group's own source its set lists gives way to the cluster's of that name - which must find
+		    // what it depends on listed too
+		    if (!scope.empty() && !CurrentSpec(read, *catalog, "", "source", alias).empty()) {
+			    auto set = CurrentSpec(read, *catalog, scope, "sources", "sources");
+			    if (!set.empty()) {
+				    auto listed = SourceSetNames(set);
+				    if (listed.count(alias)) {
+					    RequireListedDependencies(read, *catalog, scope, "", alias, listed);
+				    }
+			    }
 		    }
 		    // who depends on it (transitively, for CASCADE). An edge is of its dependent's scope and names
 		    // a source of that scope, else the cluster's: a group edge depends on a cluster source only
@@ -978,6 +1075,94 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const
 			                   " - the node reports it pending for a drain";
 		    }
 	    });
+	return answer;
+}
+
+//! hugr-node spec 035: a group's source set - `set` the aliases its nodes attach (the cluster's or the group's own
+//! sources), `reset` it (every source again). One item per group, kind `sources`; a cluster-wide one is refused: the
+//! cluster attaches every source. Its nodes converge at their next tick: what left is detached (a source in use waits
+//! for a drain), what is listed and missing is attached.
+static PolicyStore::ClusterAnswer ClusterSources(PolicyStore &store, const string &verb, const string &scope,
+                                                 const string &names_json) {
+	RequireClusterCatalog(store.catalog, "acl_cluster_sources");
+	auto &catalog = *store.catalog;
+	auto v = StringUtil::Lower(verb);
+	if (v != "set" && v != "reset") {
+		throw BinderException("acl_cluster_sources: the verb is set or reset, not \"%s\"", verb);
+	}
+	if (scope.empty()) {
+		throw BinderException("acl cluster: a source set is a group's - write it IN GROUP <group>: the cluster "
+		                      "attaches every source");
+	}
+	vector<string> names;
+	if (v == "set") {
+		using namespace duckdb_yyjson; // NOLINT
+		auto doc = yyjson_read(names_json.c_str(), names_json.size(), 0);
+		auto root = doc ? yyjson_doc_get_root(doc) : nullptr;
+		if (!root || !yyjson_is_arr(root)) {
+			if (doc) {
+				yyjson_doc_free(doc);
+			}
+			throw BinderException("acl_cluster_sources: the sources are a JSON array of aliases");
+		}
+		case_insensitive_set_t seen;
+		size_t i, n;
+		yyjson_val *value;
+		yyjson_arr_foreach(root, i, n, value) {
+			if (!yyjson_is_str(value)) {
+				continue;
+			}
+			string name = yyjson_get_str(value);
+			if (seen.insert(name).second) {
+				names.push_back(name);
+			}
+		}
+		yyjson_doc_free(doc);
+		if (names.empty()) {
+			throw BinderException("acl cluster: a source set names at least one source - RESET SOURCES gives the "
+			                      "group every source again");
+		}
+	}
+	PolicyStore::ClusterAnswer answer;
+	answer.item_class = "hot";
+	answer.version = catalog.WriteWithReads(
+	    [&](const ReadFn &read, vector<string> &statements) {
+		    RequireScope(read, catalog, scope);
+		    auto current = CurrentSpec(read, catalog, scope, "sources", "sources");
+		    if (v == "reset") {
+			    if (current.empty()) {
+				    throw BinderException("acl cluster: group \"%s\" declares no source set", scope);
+			    }
+			    statements.push_back(DeleteItem(catalog, scope, "sources", "sources"));
+			    return;
+		    }
+		    vector<string> json;
+		    for (auto &name : names) {
+			    // a source of the cluster or of this group, by its alias as written there
+			    auto found = read("SELECT \"name\" FROM " + catalog.Tbl("cluster_items") +
+			                      " WHERE \"kind\" = 'source' AND \"scope\" IN ('', " + Lit(scope) +
+			                      ") AND lower(\"name\") = lower(" + Lit(name) + ")");
+			    if (found->RowCount() == 0) {
+				    throw BinderException("acl cluster: \"%s\" is no source of the cluster's nor of group \"%s\"'s",
+				                          name, scope);
+			    }
+			    json.push_back(acl::JsonQuote(found->Collection().GetValue(0, 0).ToString()));
+		    }
+		    // a listed source that loads through another (DEPENDS ON) needs it attached too
+		    case_insensitive_set_t listed(names.begin(), names.end());
+		    for (auto &name : names) {
+			    // the item the group's nodes read: its own of that name, else the cluster's
+			    auto owner = CurrentSpec(read, catalog, scope, "source", name).empty() ? string() : scope;
+			    RequireListedDependencies(read, catalog, scope, owner, name, listed);
+		    }
+		    statements.push_back(UpsertItem(catalog, scope, "sources", "sources",
+		                                    "{\"names\": [" + StringUtil::Join(json, ", ") + "]}", answer.item_class,
+		                                    "", !current.empty()));
+	    },
+	    "config_version", [](int64_t) {});
+	answer.note = v == "set" ? "the group's nodes attach only these sources from their next tick - what left is "
+	                           "detached (a source in use waits for a drain)"
+	                         : "the group's nodes attach every source again from their next tick";
 	return answer;
 }
 
@@ -1249,6 +1434,24 @@ vector<PolicyStore::ClusterItem> PolicyStore::ClusterEffective() {
 			out[found->second] = item; // the group's item overrides the cluster's
 		}
 	}
+	// hugr-node spec 035: a group that declares its sources attaches only those - its `sources` item is no item to
+	// apply, the filter it is
+	case_insensitive_set_t declared;
+	bool partial = false;
+	for (auto &item : out) {
+		if (item.kind == "sources" && !item.scope.empty()) {
+			declared = SourceSetNames(item.spec);
+			partial = true;
+		}
+	}
+	vector<ClusterItem> kept;
+	for (auto &item : out) {
+		if (item.kind == "sources" || (partial && item.kind == "source" && !declared.count(item.name))) {
+			continue;
+		}
+		kept.push_back(std::move(item));
+	}
+	out = std::move(kept);
 	// the profile's order - settings, extensions, sources - whichever scope each came from: a group's own
 	// extension must come before the cluster's source that loads through it
 	auto rank = [](const string &kind) {
@@ -1374,6 +1577,13 @@ void ClusterSettingFunc(DataChunk &args, ExpressionState &state, Vector &result)
 	EachRow(args, result, [&](idx_t row) {
 		return StoreOf(state).ClusterSetting(Arg(args, 0, row), Arg(args, 1, row), Arg(args, 2, row),
 		                                     Arg(args, 3, row));
+	});
+}
+
+//! acl_cluster_sources(verb, scope, names_json)
+void ClusterSourcesFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	EachRow(args, result, [&](idx_t row) {
+		return ClusterSources(StoreOf(state), Arg(args, 0, row), Arg(args, 1, row), Arg(args, 2, row));
 	});
 }
 
@@ -1686,18 +1896,42 @@ arena_ptr<TransformResultValue> FinalizeClusterDetach(PEGTransformer &transforme
 
 // AclClusterSet <- 'CLUSTER' 'SET' AclWordToken AclClusterAssign AclValue AclClusterInGroup?
 // AclClusterReset <- 'CLUSTER' 'RESET' AclWordToken AclClusterInGroup?
+// AclClusterSet <- 'CLUSTER' 'SET' AclClusterSetWhat AclClusterInGroup?
+// AclClusterReset <- 'CLUSTER' 'RESET' AclClusterResetWhat AclClusterInGroup? - hugr-node spec 035: SOURCES is a
+// group's source set, a word a setting
 arena_ptr<TransformResultValue> FinalizeClusterSetting(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
-	MgmtCall call(transformer, "acl_cluster_setting");
 	auto verb = MgmtCall::Keyword(list.GetChild(1));
-	auto name = MgmtCall::Word(list.GetChild(2));
-	string value;
-	idx_t group_at = 3;
-	if (verb == "set") {
-		value = call.Text(list.GetChild(4), "a value");
-		group_at = 5;
+	auto &what = MgmtCall::Part(list.GetChild(2));
+	// RESET's 'SOURCES' is a one-keyword rule - what holds the keyword itself
+	if (what.Name() == "AclClusterSources" || (verb == "reset" && MgmtCall::Keyword(what) == "sources")) {
+		MgmtCall call(transformer, "acl_cluster_sources");
+		vector<string> json;
+		if (verb == "set") {
+			// 'SOURCES' '(' AclNameValue AclClusterSourcesMore* ','? ')'
+			auto &parts = what.Cast<ListParseResult>();
+			json.push_back(acl::JsonQuote(call.NameValue(parts.GetChild(2), "a source's alias")));
+			for (auto &more : MgmtCall::Each(parts.GetChild(3))) {
+				json.push_back(acl::JsonQuote(call.NameValue(
+				    MgmtCall::Part(more.get()).Cast<ListParseResult>().GetChild(1), "a source's alias")));
+			}
+		}
+		auto scope = ClusterGroup(call, list.GetChild(3));
+		for (auto &part : {verb, scope, "[" + StringUtil::Join(json, ", ") + "]"}) {
+			call.Arg(Value(part));
+		}
+		return call.Result();
 	}
-	auto scope = ClusterGroup(call, list.GetChild(group_at));
+	MgmtCall call(transformer, "acl_cluster_setting");
+	string name, value;
+	if (verb == "set") {
+		auto &setting = what.Cast<ListParseResult>(); // AclWordToken AclClusterAssign AclValue
+		name = MgmtCall::Word(setting.GetChild(0));
+		value = call.Text(setting.GetChild(2), "a value");
+	} else {
+		name = MgmtCall::Word(what);
+	}
+	auto scope = ClusterGroup(call, list.GetChild(3));
 	for (auto &part : {verb, scope, name, value}) {
 		call.Arg(Value(part));
 	}
@@ -1738,11 +1972,17 @@ void RegisterClusterRules() {
 	    "AclClusterDetach <- 'CLUSTER' 'DETACH' AclNameValue AclClusterDetachFlag* AclClusterInGroup?",
 	    MgmtStart<FinalizeClusterDetach>));
 	rule("AclClusterAssign <- '=' / 'TO'");
-	rules.push_back(GrammarChange::AddRule(
-	    "AclClusterSet <- 'CLUSTER' 'SET' AclWordToken AclClusterAssign AclValue AclClusterInGroup?",
-	    MgmtStart<FinalizeClusterSetting>));
-	rules.push_back(GrammarChange::AddRule("AclClusterReset <- 'CLUSTER' 'RESET' AclWordToken AclClusterInGroup?",
+	rule("AclClusterSetting <- AclWordToken AclClusterAssign AclValue");
+	rule("AclClusterSourcesMore <- ',' AclNameValue");
+	rule("AclClusterSources <- 'SOURCES' '(' AclNameValue AclClusterSourcesMore* ','? ')'");
+	rule("AclClusterSetWhat <- AclClusterSources / AclClusterSetting");
+	rule("AclClusterResetSources <- 'SOURCES'");
+	rule("AclClusterResetWhat <- AclClusterResetSources / AclWordToken");
+	rules.push_back(GrammarChange::AddRule("AclClusterSet <- 'CLUSTER' 'SET' AclClusterSetWhat AclClusterInGroup?",
 	                                       MgmtStart<FinalizeClusterSetting>));
+	rules.push_back(
+	    GrammarChange::AddRule("AclClusterReset <- 'CLUSTER' 'RESET' AclClusterResetWhat AclClusterInGroup?",
+	                           MgmtStart<FinalizeClusterSetting>));
 	const char *group = "[IN GROUP <group>]";
 	vector<MgmtStatementForm> forms {
 	    {"AclClusterExtension",
@@ -1759,8 +1999,14 @@ void RegisterClusterRules() {
 	    {"AclClusterDetach",
 	     {"detach"},
 	     StringUtil::Format("write CLUSTER DETACH <alias> [CASCADE] [FORCE] %s", group)},
-	    {"AclClusterSet", {"set"}, StringUtil::Format("write CLUSTER SET <setting> = | TO <value> %s", group)},
-	    {"AclClusterReset", {"reset"}, StringUtil::Format("write CLUSTER RESET <setting> %s", group)}};
+	    {"AclClusterSet",
+	     {"set"},
+	     StringUtil::Format("write CLUSTER SET <setting> = | TO <value> %s, or CLUSTER SET SOURCES (<source>, ...) "
+	                        "IN GROUP <group>",
+	                        group)},
+	    {"AclClusterReset",
+	     {"reset"},
+	     StringUtil::Format("write CLUSTER RESET <setting> %s, or CLUSTER RESET SOURCES IN GROUP <group>", group)}};
 	RegisterMgmtRules("cluster", std::move(forms), std::move(rules),
 	                  "ACL CLUSTER expects INSTALL, UPDATE or REMOVE EXTENSION, ATTACH, DETACH, SET or RESET");
 }
@@ -1843,6 +2089,15 @@ void RegisterClusterPlatform() {
 	setting.rule_refusal = "acl admin: \"%s\" is not among the settings the cluster bundle sets (the node's resources "
 	                       "and tuning) - a data path, a trust or audit setting is a passthrough scope's";
 	RegisterPlatformFunction(std::move(setting));
+	RegisterPlatformFunction({"cluster_sources",
+	                          "acl_cluster_sources",
+	                          {A("verb"), A("scope"), P("names")},
+	                          {3},
+	                          -1,
+	                          PlatformRight::INFRASTRUCTURE,
+	                          false,
+	                          ANSWER,
+	                          "set / reset a group's source set (hugr-node spec 035)"});
 }
 
 } // namespace
@@ -1860,6 +2115,7 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	scalar("acl_cluster_attach", {v, v, v, v, v, v, v, v, v}, ClusterAttachFunc, AnswerType());
 	scalar("acl_cluster_detach", {v, v, v, v}, ClusterDetachFunc, AnswerType());
 	scalar("acl_cluster_setting", {v, v, v, v}, ClusterSettingFunc, AnswerType());
+	scalar("acl_cluster_sources", {v, v, v}, ClusterSourcesFunc, AnswerType());
 	scalar("acl_cluster_version", {}, ClusterVersionFunc, LogicalType::BIGINT);
 
 	auto info = make_shared_ptr<ClusterInfo>(store);
@@ -1916,6 +2172,12 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	};
 	node->node_traits.config_target = [node]() {
 		return node->ClusterVersion();
+	};
+	// spec 035 (duckdb-acl spec 176): a node whose group declares its sources attaches only part of them - it writes
+	// no policy and runs no check of the stored facts against the sources
+	node->node_traits.partial_sources = [node]() {
+		auto group = node->NodeGroup();
+		return node->catalog && GroupDeclaresSources(*node->catalog, group) ? group : string();
 	};
 }
 
