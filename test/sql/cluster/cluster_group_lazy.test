@@ -1,0 +1,175 @@
+# name: test/sql/cluster/cluster_group_lazy.test
+# description: spec 035 stage 2b - a group's source set attaches lazily (CLUSTER SET SOURCES (…) | ALL LAZY [IDLE …]
+#   IN GROUP g): its sources are marked lazy in acl_cluster_effective() on the group's nodes, but a DEPENDS ON chain's
+# group: [sql]
+
+require hugr_node
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ACL ADMIN CREATE RESOURCE GROUP etl (max_sessions 10);
+
+statement ok
+SET GLOBAL acl_node_group = 'etl';
+
+statement ok
+ATTACH '{TEST_DIR}/group_lazy_archive.duckdb' AS seed;
+
+statement ok
+CREATE OR REPLACE TABLE seed.main.t AS SELECT 1 AS a;
+
+statement ok
+DETACH seed;
+
+statement ok
+ACL ADMIN CLUSTER ATTACH '{TEST_DIR}/group_lazy_archive.duckdb' AS archive (TYPE duckdb);
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS base (TYPE duckdb);
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS leaning (TYPE duckdb) DEPENDS ON (base);
+
+# --- refused where written -------------------------------------------------------------------------
+
+statement error
+ACL ADMIN CLUSTER SET SOURCES ALL IN GROUP etl;
+----
+<REGEX>:.*SOURCES ALL is written with LAZY.*
+
+statement error
+ACL ADMIN CLUSTER SET SOURCES ALL LAZY;
+----
+<REGEX>:.*a source set is a group's.*
+
+statement error
+ACL ADMIN CLUSTER SET SOURCES ALL LAZY IDLE '10 seconds' IN GROUP etl;
+----
+<REGEX>:.*under a minute.*
+
+statement error
+ACL ADMIN CLUSTER SET SOURCES ALL LAZY IDLE '' IN GROUP etl;
+----
+<REGEX>:.*IDLE names an interval.*
+
+statement error
+SELECT acl_cluster_sources('reset', 'etl', '[]', 'true', '');
+----
+<REGEX>:.*RESET SOURCES takes no LAZY.*
+
+# --- ALL LAZY: every source lazy on the group's nodes, a chain at once; the node is not partial -------
+
+query T
+SELECT (ACL_ANSWER).note FROM (SELECT acl_cluster_sources('set', 'etl', 'ALL', 'true', '30 min') AS ACL_ANSWER);
+----
+the group's nodes attach every source, each when a statement first reads it, detached after it idles - a source in a DEPENDS ON chain is attached at once
+
+query TTT
+SELECT name, spec LIKE '%"lazy": "true"%' OR spec LIKE '%"lazy":"true"%', spec LIKE '%1800%'
+FROM acl_cluster_effective() WHERE kind = 'source' ORDER BY name;
+----
+archive	true	true
+base	false	false
+leaning	false	false
+
+# every source, so the node writes the policy (duckdb-acl spec 176's partial node is a listed set only)
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+# the grammar's form
+statement ok
+ACL ADMIN CLUSTER SET SOURCES ALL LAZY IDLE '30 min' IN GROUP etl;
+
+query T
+SELECT spec FROM acl_cluster_items('etl') WHERE kind = 'sources';
+----
+{"all": "true", "lazy": "true", "idle_seconds": "1800"}
+
+# attached before the set came: the drift says same; detached, lazy; a principal's read attaches it
+query TT
+SELECT name, state FROM acl_platform_drift() WHERE kind = 'database' AND name = 'archive';
+----
+archive	same
+
+statement ok
+DETACH archive;
+
+query TT
+SELECT name, state FROM acl_platform_drift() WHERE kind = 'database' AND name = 'archive';
+----
+archive	lazy
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS archive.main.t;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+statement ok
+DETACH archive;
+
+query I
+ACL ROLE 'analyst' SELECT a FROM t;
+----
+1
+
+query TT
+SELECT name, state FROM acl_platform_drift() WHERE kind = 'database' AND name = 'archive';
+----
+archive	same
+
+# a source attached later is not attached on this node: the group's set attaches it on demand
+query TT
+SELECT (r).applied_here, (r).note FROM (SELECT acl_cluster_attach('', 'later', ':memory:', 'duckdb', '', '{}', '', '')
+    AS r);
+----
+false	lazy on this node - its group's source set attaches each source when a statement first reads it
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'later';
+----
+0
+
+# --- a listed set, lazy: only those, each on demand; the node is partial again ----------------------
+
+statement ok
+ACL ADMIN CLUSTER SET SOURCES (archive) LAZY IN GROUP etl;
+
+query TT
+SELECT name, spec LIKE '%"lazy"%' FROM acl_cluster_effective() WHERE kind = 'source' ORDER BY name;
+----
+archive	true
+
+statement error
+ACL ADMIN CREATE ROLE refused_partial;
+----
+<REGEX>:.*attaches the sources of group "etl" only.*
+
+query T
+SELECT spec FROM acl_cluster_items('etl') WHERE kind = 'sources';
+----
+{"names": ["archive"], "lazy": "true"}
+
+# --- reset: every source, as the profile says (the operator's own call: the partial node refuses the grammar's) --
+
+statement ok
+SELECT acl_cluster_sources('reset', 'etl', '[]');
+
+query TT
+SELECT name, spec LIKE '%"lazy"%' FROM acl_cluster_effective() WHERE kind = 'source' ORDER BY name;
+----
+archive	false
+base	false
+later	false
+leaning	false

@@ -35,7 +35,7 @@ CLUSTER ATTACH '<path>' AS <alias> (TYPE <type> [, SECRET <secret>] [, <option> 
 CLUSTER DETACH <alias> [CASCADE] [FORCE] [IN GROUP <group>]
 CLUSTER SET <setting> = | TO <value> [IN GROUP <group>]
 CLUSTER RESET <setting> [IN GROUP <group>]
-CLUSTER SET SOURCES (<alias>, …) IN GROUP <group>
+CLUSTER SET SOURCES (<alias>, …) | ALL [LAZY [IDLE '<interval>']] IN GROUP <group>
 CLUSTER RESET SOURCES IN GROUP <group>
 ```
 
@@ -95,6 +95,16 @@ them every source again.
   (its record names an object in a source the node holds) all run there. `ACL NATIVE` and the operator's own SQL
   are unchanged.
 - A listing names a source outside the set as `not attached` (duckdb-acl spec 136).
+
+- **Lazily** (spec 035 stage 2b). `CLUSTER SET SOURCES (sales, crm) LAZY IDLE '30 min' IN GROUP etl` attaches only
+  those sources, each when a statement first reads it. `CLUSTER SET SOURCES ALL LAZY … IN GROUP etl` does the same for
+  every source, so the group's nodes start with none attached and have no list to keep up to date. A new grant of a
+  role of the group works at its first statement. On the group's nodes the set's marks replace a source's own
+  (`acl_cluster_effective()` shows them), and everything below about a lazy source applies.
+  - A source in a `DEPENDS ON` chain (one that loads through another, or one another loads through) is attached at
+    once all the same.
+  - `ALL` is written only with `LAZY`: every source attached at once is what `RESET SOURCES` gives.
+  - A node of an `ALL` group is not partial, so it writes the policy: its probes attach the lazy sources first.
 
 ### A lazy source
 
