@@ -1,4 +1,4 @@
-# Spec 047: the administrator's SQL at a node's boot and at a session's start
+# Spec 047: the administrator's SQL at a node's boot
 
 - **Status**: accepted (2026-11-26, the owner's answers below)
 - **Date**: 2026-11-26
@@ -218,6 +218,14 @@ The bootstrap's step 6 applies the profile. Scripts join it in their places:
   Tests added: `DecideTick`'s script rule (`test/cpp/test_hugr_node_tick.cpp`), and in the e2e a `RETRY` after the
   sources queued while the place goes on.
 - **Docs**: `docs/cluster.md`, "Scripts" and "The bootstrap, one listing".
+
+## Session scripts moved to the policy (the owner, 2026-11-26)
+
+The owner placed a session's scripts in the policy, not in the cluster profile: on a resource group, a role, and a
+role's grant of a group, written by the `policy` bundle, run in layers (group, roles, grants), cached per policy
+version. That is duckdb-acl spec 181, built in acl itself: the open node gets it too, and no hugr-node seam is
+needed. `ON SESSION` above is superseded; the profile refuses it and names the policy's statement. Stages 2-3 below
+are spec 181's.
 
 ## Stages
 

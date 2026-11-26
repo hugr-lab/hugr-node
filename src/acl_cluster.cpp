@@ -1856,8 +1856,8 @@ static PolicyStore::ClusterAnswer ClusterScript(PolicyStore &store, const string
 			                          "SOURCES or ON SESSION");
 		    }
 		    if (place == "on_session") {
-			    throw BinderException("acl cluster: ON SESSION scripts come with duckdb-acl's session seam (hugr-node "
-			                          "spec 047 stage 3) - not yet");
+			    throw BinderException("acl cluster: a session's script is the policy's, not the profile's - ALTER "
+			                          "RESOURCE GROUP | ROLE ... SET SESSION SCRIPT (duckdb-acl spec 181)");
 		    }
 		    auto trimmed = sql;
 		    StringUtil::Trim(trimmed);

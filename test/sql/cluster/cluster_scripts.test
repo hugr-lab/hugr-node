@@ -77,7 +77,7 @@ ACL ADMIN CLUSTER ADD SCRIPT x AFTER SOURCE nowhere AS 'SELECT 1';
 statement error
 ACL ADMIN CLUSTER ADD SCRIPT x ON SESSION AS 'SELECT 1';
 ----
-<REGEX>:.*ON SESSION scripts come with duckdb-acl's session seam.*
+<REGEX>:.*a session's script is the policy's, not the profile's.*
 
 statement error
 ACL ADMIN CLUSTER ADD SCRIPT x BEFORE SOURCES;

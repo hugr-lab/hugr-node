@@ -229,8 +229,9 @@ ACL CLUSTER ADD SCRIPT 30_views AFTER SOURCES
   running nodes keep what they ran, and the node reports it pending until it restarts (the orchestrator rolls it).
 - **A source holds the scripts that follow it**: `CLUSTER DETACH` of it is refused while one does, and `CASCADE` drops
   them with it.
-- **A session's script** (`ON SESSION`, run on each new session's connection) comes with duckdb-acl's session seam,
-  in a later stage of spec 047.
+- **A session's script** is the policy's, not the profile's: a resource group's, a role's or a role's grant of a
+  group, written by the `policy` bundle (`ALTER RESOURCE GROUP | ROLE … SET SESSION SCRIPT`, duckdb-acl spec 181).
+  `CLUSTER ADD SCRIPT … ON SESSION` is refused and says so.
 
 ### The bootstrap, one listing
 
