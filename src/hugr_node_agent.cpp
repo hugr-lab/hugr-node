@@ -1284,6 +1284,9 @@ unique_ptr<QueryResult> TickQuery(DatabaseInstance &db, const string &sql) {
 //! one hot item's statements; '' when they hold, else the error's class
 string ApplyHot(DatabaseInstance &db, const acl::PolicyStore::ClusterItem &item, const PodResources &pod) {
 	try {
+		if (acl::ClusterSourceNamesSecret(item)) {
+			acl::RefreshSecretsLists(db); // spec 046: a secret made with the item is the node's
+		}
 		bool cut = false;
 		for (auto &sql : ProfileItemStatements(item, pod, cut)) {
 			Connection con(db);
