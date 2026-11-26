@@ -262,6 +262,10 @@ SET GLOBAL acl_allow_anonymous_admin = true;
 -- a thread-count change joins every scheduler worker, so it proves the node does not run on one (spec 006)
 ACL ADMIN CLUSTER SET threads = 3;
 ACL ADMIN CLUSTER ATTACH ':memory:' AS e2e_src (TYPE duckdb);
+-- spec 047: the scripts in their places - the last reads what the one after e2e_src wrote
+ACL ADMIN CLUSTER ADD SCRIPT 10_first BEFORE SOURCES AS 'SET GLOBAL preserve_insertion_order = true';
+ACL ADMIN CLUSTER ADD SCRIPT 20_after_src AFTER SOURCE e2e_src AS 'CREATE TABLE e2e_src.main.marked AS SELECT getvariable(''acl_node_label'') IS NOT NULL AS labelled';
+ACL ADMIN CLUSTER ADD SCRIPT 30_last AFTER SOURCES AS 'SELECT * FROM e2e_src.main.marked WHERE labelled';
 SELECT 'version:' || acl_cluster_version();
 EOF
 "$DUCKDB" -no-agent -unsigned -bail -csv -noheader <"$TMP/seed.sql" >"$TMP/seed.log" 2>&1 || true
@@ -349,6 +353,17 @@ echo "ok: the node attached the policy catalog with the secret from tresor"
 grep -q 'step 6 profile: setting threads: ok' "$TMP/node.log" && grep -q 'step 6 profile: source e2e_src: ok' "$TMP/node.log" &&
 	grep -q "ready - profile version $VERSION," "$TMP/node.log" || fail "the profile was not applied (version $VERSION)"
 echo "ok: the node applied the cluster profile (a setting, a source) at version $VERSION"
+# spec 047: each script ran, in its place: before the source, after it, after every source
+first="$(grep -n 'script 10_first (before_sources) ran' "$TMP/node.log" | cut -d: -f1)"
+src="$(grep -n 'step 6 profile: source e2e_src: ok' "$TMP/node.log" | head -1 | cut -d: -f1)"
+after="$(grep -n 'script 20_after_src (after_source e2e_src) ran' "$TMP/node.log" | cut -d: -f1)"
+last="$(grep -n 'script 30_last (after_sources) ran' "$TMP/node.log" | cut -d: -f1)"
+[ -n "$first" ] && [ -n "$src" ] && [ -n "$after" ] && [ -n "$last" ] && [ "$first" -lt "$src" ] &&
+	[ "$src" -lt "$after" ] && [ "$after" -lt "$last" ] || {
+	grep 'script \|step 6' "$TMP/node.log" >&2
+	fail "the profile's scripts did not run in their places"
+}
+echo "ok: the scripts ran in their places - before the sources, after e2e_src (its write read by the last), after the sources"
 port_open || fail "the Flight port is not open"
 echo "ok: the node serves Flight on localhost:$FLIGHT_PORT"
 # spec 043: the load report is served over the Handshake, and only to a bearer holding observe - a Handshake without
@@ -397,6 +412,28 @@ NODE_PID=""
 	fail "a broken step did not stop the bootstrap with the step named (exit $status)"
 }
 echo "ok: a broken step stopped the bootstrap with the step named, and no port opened"
+
+# --- spec 047: a script whose ON ERROR is FAIL NODE stops the bootstrap -------------------------------------------------
+script_sql() {
+	printf "LOAD '%s';\nATTACH 'host=127.0.0.1 port=%s dbname=postgres user=postgres password=pg-e2e' AS pg (TYPE postgres);\nSELECT acl_use_db('pg', 'acl');\nSET GLOBAL acl_allow_anonymous_admin = true;\n%s\n" "$PGEXT" "$PG_PORT" "$1" |
+		"$DUCKDB" -no-agent -unsigned -bail -csv -noheader >"$TMP/script.log" 2>&1 || {
+		redact <"$TMP/script.log" >&2
+		fail "the operator could not write: $1"
+	}
+}
+script_sql "ACL ADMIN CLUSTER ADD SCRIPT 05_broken BEFORE SOURCES AS 'SELECT * FROM e2e_nowhere';"
+document policy_catalog >"$TMP/bootstrap.json"
+start_node "$TMP/script_broken.log"
+if wait_ready_or_exit "$TMP/script_broken.log"; then fail "a node whose FAIL NODE script failed became ready"; fi
+status=0
+wait "$NODE_PID" || status=$?
+NODE_PID=""
+[ "$status" != 0 ] && grep -q 'script 05_broken (before_sources) failed' "$TMP/script_broken.log" && ! port_open || {
+	redact <"$TMP/script_broken.log" >&2
+	fail "a failed FAIL NODE script did not stop the bootstrap (exit $status)"
+}
+script_sql "ACL ADMIN CLUSTER DROP SCRIPT 05_broken;"
+echo "ok: a script whose ON ERROR is FAIL NODE failed, and the node never served"
 
 # --- spec 010: the orchestrated entry - two nodes, one catalog, a fake orchestrator ---------------------------------------
 # the operator's SQL on the catalog, from outside any node (what an administrator's statement does through a node)

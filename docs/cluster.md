@@ -37,6 +37,10 @@ CLUSTER SET <setting> = | TO <value> [IN GROUP <group>]
 CLUSTER RESET <setting> [IN GROUP <group>]
 CLUSTER SET SOURCES (<alias>, …) | ALL [LAZY [IDLE '<interval>']] IN GROUP <group>
 CLUSTER RESET SOURCES IN GROUP <group>
+CLUSTER ADD SCRIPT <name> BEFORE SOURCES | AFTER SOURCE <alias> | AFTER SOURCES AS '<sql>'
+        [ON ERROR FAIL NODE | CONTINUE | DETACH SOURCE | RETRY] [IN GROUP <group>] [COMMENT '<text>']
+CLUSTER ALTER SCRIPT <name> [<place>] [AS '<sql>'] [ON ERROR …] [IN GROUP <group>]
+CLUSTER DROP SCRIPT <name> [IN GROUP <group>]
 ```
 
 The statements are read on duckdb's tokens (spec 020), like acl's own management statements: a comment may stand
@@ -170,6 +174,77 @@ those roles can see (`CLUSTER SET SOURCES … IN GROUP`, above).
   re-points nothing: an attached source stays, and one no longer lazy is attached as any source.
 - `ACL NATIVE` and the operator's own SQL are not rewritten, so they never attach a lazy source themselves; they may
   `ATTACH` it by hand.
+
+### Scripts
+
+`CLUSTER ADD SCRIPT` puts the administrator's own SQL into a node's boot (spec 047): what a setting cannot say, such
+as a macro or a table in an attached database, a source's own parameters once it is connected, or a command in the
+source before anything reads it.
+
+```sql
+ACL CLUSTER ADD SCRIPT 10_defaults BEFORE SOURCES AS 'SET GLOBAL preserve_insertion_order = false';
+ACL CLUSTER ADD SCRIPT 20_warehouse AFTER SOURCE warehouse
+    AS 'CALL postgres_execute(''warehouse'', ''ANALYZE'')' ON ERROR DETACH SOURCE;
+ACL CLUSTER ADD SCRIPT 30_views AFTER SOURCES
+    AS 'CREATE OR REPLACE MACRO local.main.today() AS current_date' ON ERROR RETRY;
+```
+
+- **The SQL is the node's own, unchecked.** It is one literal and may hold several statements. It is stored as
+  written and run as the node on a connection of its own, unprefixed, outside acl: nothing reads it, no lint, no
+  rule. So write no credential in it - name a secret of the secrets service instead (`SECRET s`). Its text is in
+  `platform.cluster_items` for whoever reads the profile.
+- **Who writes it**: the `cluster` bundle, as every profile item.
+- **Its place** in the boot. The profile's extensions and settings come first, then:
+  1. `BEFORE SOURCES`;
+  2. each source's ATTACH, followed at once by its `AFTER SOURCE <alias>` scripts, which run only if it attached;
+  3. `AFTER SOURCES`.
+
+  Inside a place, scripts run in their names' order: name them to order them (`10_…`, `20_…`; a name that starts
+  with a digit is written bare).
+- **A script after a source runs at every attach of it**: a lazy source's attach on demand (before the statement
+  reads it), its attach again after an idle detach, a re-pointed source's new attach.
+- **What it knows**: the node sets `getvariable('acl_node_group')` (its resource group) and
+  `getvariable('acl_node_label')` on the script's connection first. One cluster-wide script can then do a group's
+  part in its conditions (DuckDB has no `IF`): `… WHERE getvariable('acl_node_group') = 'etl'`. `IN GROUP` is the
+  other way.
+- **What it leaves**: what a connection holds (a `USE`, a variable, a plain `SET`) goes with the script's
+  connection. A boot script changes the node's global state (`SET GLOBAL`, before step 7 locks the configuration),
+  the attached databases, and the sources.
+- **`ON ERROR`**, the script's own policy:
+
+  | policy | before / after the sources | after a source |
+  | --- | --- | --- |
+  | `FAIL NODE` (default before and after the sources) | the bootstrap stops, naming the script; the node never serves | the same at boot; once the node serves, it holds the source as `DETACH SOURCE` does |
+  | `CONTINUE` | logged, and the boot goes on | the source stays attached, as the script left it |
+  | `DETACH SOURCE` (default after a source) | refused | the source is detached and the node serves without it until its profile changes or the node restarts; a lazy source's read is refused (`could not be attached (its script failed)`) and the next read tries again |
+  | `RETRY` | after the sources only (refused before them: nothing serves on an initialisation still pending); the node serves, and the tick retries it from 10 s, doubling, up to 5 min | the source stays detached, and each try attaches it and runs the script again |
+
+  The log names every run, `hugr_node: script <name> (<place>) ran | failed (<class>)`, never its text or its error's
+  message. A script failing now is listed by the heartbeat as pending, class `error`.
+- **A changed script applies at a restart.** A new, changed or dropped script is a restart item, like a setting:
+  running nodes keep what they ran, and the node reports it pending until it restarts (the orchestrator rolls it).
+- **A source holds the scripts that follow it**: `CLUSTER DETACH` of it is refused while one does, and `CASCADE` drops
+  them with it.
+- **A session's script** (`ON SESSION`, run on each new session's connection) comes with duckdb-acl's session seam,
+  in a later stage of spec 047.
+
+### The bootstrap, one listing
+
+`platform.bootstrap_order()` (the `cluster` bundle's; `acl_cluster_bootstrap_order()` for the node's operator) lists
+a node's whole bootstrap in its order, as `(pos, step, sql)`. Step 6 is expanded:
+- the profile's extensions and settings (an engine setting cut to the pod, marked);
+- the scripts before the sources;
+- each source, followed by its scripts (a lazy source marked as attached on demand);
+- the scripts after the sources.
+
+Each script row names its place and its `ON ERROR`, and carries its SQL. The other steps are the node's own, from the
+document it booted with (names and paths only, never a credential). A document given as the argument is listed
+instead, and a node that did not boot (a test) lists step 6 alone. The bootstrap walks the same order, so the listing
+is what a node runs.
+
+```sql
+SELECT pos, step, sql FROM platform.bootstrap_order();
+```
 
 ### What a statement does
 

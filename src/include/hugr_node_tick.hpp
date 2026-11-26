@@ -98,6 +98,9 @@ inline TickDecision DecideTick(const std::vector<TickItem> &items, const std::ve
 			if (took == taken.end()) {
 				if (applied_here.count(key)) {
 					out.adopt.push_back(i);
+				} else if (item.kind == "script") {
+					// spec 047: a script written after the boot runs at the next one (the owner: a restart item)
+					out.pending.push_back({item.kind, item.name, "restart", ""});
 				}
 			} else if (item.kind != "setting" && took->second != item.spec) {
 				// held, but not as the profile has it now: a source re-pointed to the same type, an extension written
