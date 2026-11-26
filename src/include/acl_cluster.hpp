@@ -50,6 +50,14 @@ void AttachLazySource(DatabaseInstance &db, const string &alias);
 vector<string> DetachIdleLazySources(DatabaseInstance &db, const std::set<string> &taken);
 void RefreshLazySourcesAfterWrite(PolicyStore &store, DatabaseInstance &db);
 
+//! spec 046: the node's secrets services keep the list of the secrets the node may use for 30 s (tresor spec 004), so
+//! a secret made a moment ago is no match until then. Asking each attached service for its list refreshes it - done
+//! before a source naming a secret is attached, and by the `hugr` type before it refuses a secret it does not see. A
+//! service that cannot list keeps its last list (its own rule); nothing here fails
+void RefreshSecretsLists(DatabaseInstance &db);
+//! whether a profile item is a source that names a secret
+bool ClusterSourceNamesSecret(const PolicyStore::ClusterItem &item);
+
 //! spec 118: a setting the cluster bundle may put in the profile - the node's resources and tuning (an
 //! allowlist); a data path, a trust or audit setting and anything else is passthrough's
 bool ClusterBundleMaySet(const string &name);

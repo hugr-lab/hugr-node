@@ -574,6 +574,25 @@ vector<string> LazySourceAliases(DatabaseInstance &db) {
 	return out;
 }
 
+void RefreshSecretsLists(DatabaseInstance &db) {
+	try {
+		auto services = NodeQuery(db, "SELECT database_name FROM duckdb_databases() WHERE type = 'tresor'");
+		ResultRows rows(*services);
+		for (idx_t r = 0; r < rows.Count(); r++) {
+			try {
+				NodeQuery(db, "SELECT count(*) FROM " + Ident(rows.GetValue(0, r).ToString()) + ".secrets()");
+			} catch (std::exception &) {
+				// the service keeps its last list, and the attach that follows says what is missing
+			}
+		}
+	} catch (std::exception &) {
+	}
+}
+
+bool ClusterSourceNamesSecret(const PolicyStore::ClusterItem &item) {
+	return item.kind == "source" && !JsonField(item.spec, "secret").empty();
+}
+
 void AttachLazySource(DatabaseInstance &db, const string &alias) {
 	PolicyStore::ClusterItem item;
 	int64_t idle_seconds = 0;
@@ -585,6 +604,9 @@ void AttachLazySource(DatabaseInstance &db, const string &alias) {
 	source->last_use = std::chrono::steady_clock::now();
 	if (DatabaseManager::Get(db).GetDatabase(Identifier(item.name))) {
 		return;
+	}
+	if (ClusterSourceNamesSecret(item)) {
+		RefreshSecretsLists(db); // spec 046
 	}
 	Connection con(db);
 	for (auto &statement : ClusterItemApplyStatements(item)) {
@@ -1194,6 +1216,9 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 			    answer.note = "lazy - attached on this node by the first statement that reads it" +
 			                  string(idle_seconds > 0 ? ", detached after it idles" : ", never detached by itself");
 			    return;
+		    }
+		    if (!secret.empty()) {
+			    RefreshSecretsLists(*db); // spec 046: a secret made just before is the node's
 		    }
 		    NodeQuery(*db, AttachStatement(alias, path, type, secret, options, lineage));
 		    answer.applied_here = true;

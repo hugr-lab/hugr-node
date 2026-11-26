@@ -6,6 +6,7 @@
 #include "hugr_client.hpp"
 
 #include "acl_audit.hpp"
+#include "acl_cluster.hpp"
 
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/common/exception.hpp"
@@ -147,8 +148,12 @@ string Pool::ReadToken() {
 	// the statement that made the connect (tresor spec 008); the secret is read at every connect - a reconnect is
 	// the token's refresh (tresor's mint+exchange caches it until shortly before its exp)
 	auto &manager = SecretManager::Get(db);
-	auto transaction = CatalogTransaction::GetSystemTransaction(db);
-	auto entry = manager.GetSecretByName(transaction, secret);
+	auto entry = manager.GetSecretByName(CatalogTransaction::GetSystemTransaction(db), secret);
+	if (!entry) {
+		// spec 046: a secret made after the node's secrets service last listed them - asked again once
+		acl::RefreshSecretsLists(db);
+		entry = manager.GetSecretByName(CatalogTransaction::GetSystemTransaction(db), secret);
+	}
 	if (!entry) {
 		throw InvalidInputException("hugr: %s: no secret \"%s\" the node may use", catalog, secret);
 	}

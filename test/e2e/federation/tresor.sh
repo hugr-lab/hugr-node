@@ -7,7 +7,8 @@
 #   2. a user of A (alice, through an acl session) reads B through A's virtual table;
 #   3. B ended A's sessions: the reconnect inside alice's statement reads the secret as the node - alice may not use
 #      it - and her statement succeeds through the one retry;
-#   4. no token is in A's or B's output.
+#   4. a secret made after A listed its secrets is attached at once (spec 046: the list asked again);
+#   5. no token is in A's or B's output.
 # Needs docker, go, python3, curl and the hugr_node build. A missing tool or build is a SKIP (exit 0).
 #
 #   test/e2e/federation/tresor.sh   # TRESOR_SERVER_DIR=<checkout> builds that tresor-server; otherwise its main is
@@ -208,7 +209,27 @@ alice_reads || fail "alice's statement did not read B after B ended A's sessions
 	fail "the statement was not retried once"
 echo "ok: B ended A's sessions - alice's statement reconnected, reading the secret as the node (only nodes may use it)"
 
-# --- 4. no token in the output -------------------------------------------------------------------------------------------
+# --- 4. a secret made after A listed its secrets (spec 046) ------------------------------------------------------------
+# A's tresor catalog keeps its list 30 s (tresor spec 004): listed just now, a secret the operator makes next is no match
+# until then - the type asks the service again before it refuses
+says A "SELECT count(*) FROM node.secrets()" >/dev/null
+cat >"$TMP/seed2.sql" <<EOF
+CREATE SECRET etl (TYPE tresor, SCOPE 'tresor:$HOST', FLOW 'client_credentials', CLIENT_ID 'etl', CLIENT_SECRET 'etl-secret', ISSUER '$ISSUER');
+ATTACH 'tresor:$HOST' AS owner (INSECURE_HTTP true, SECRET etl);
+CREATE PERSISTENT SECRET b_link2 IN owner (TYPE hugr, SCOPE 'hugr:localhost:$B_PORT', TOKEN 'mint+exchange://echo-api');
+CALL owner.grant_secret('b_link2', 'role:nodes', ['use']);
+SELECT 'seeded:' || count(*) FROM owner.secrets() WHERE name = 'b_link2';
+EOF
+"$DUCKDB" -no-agent -unsigned -csv -noheader <"$TMP/seed2.sql" >"$TMP/seed2.log" 2>&1 || true
+grep -q '^seeded:1$' "$TMP/seed2.log" || {
+	redact <"$TMP/seed2.log" >&2
+	fail "the operator could not make the second link's secret"
+}
+run A "ATTACH 'localhost:$B_PORT' AS b2 (TYPE hugr, SECRET b_link2, DISABLE_SSL true, POOL_SIZE 1);"
+[ "$(says A "SELECT count(*) FROM b2.main.orders")" = 2 ] || fail "A does not read B through the new secret"
+echo "ok: a secret made after A listed its secrets is A's at once - the type asked the service again"
+
+# --- 5. no token in the output -------------------------------------------------------------------------------------------
 if grep -q 'eyJ' "$TMP/A.log" "$TMP/B.log"; then
 	fail "a token is in a node's output"
 fi
