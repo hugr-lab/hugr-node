@@ -16,6 +16,7 @@
 #include "acl_cluster.hpp"
 #include "acl_door_common.hpp"
 #include "acl_node_label.hpp"
+#include "acl_platform.hpp"
 #include "acl_result_rows.hpp"
 #include "hugr_node_extension.hpp"
 #include "hugr_node_tick.hpp"
@@ -954,8 +955,145 @@ vector<string> ProfileItemStatements(const acl::PolicyStore::ClusterItem &item, 
 	return {"SET GLOBAL " + Ident(item.name) + " = " + Quoted(EngineValueOf(quantity, kept))};
 }
 
+//! spec 047: the profile's part of the bootstrap (step 6) in its order - the extensions and settings, the scripts
+//! before the sources, each source followed by the scripts after it, the scripts after the sources. The bootstrap walks
+//! this, and the listings show it, so the two never differ
+void WalkProfileOrder(const vector<acl::PolicyStore::ClusterItem> &effective,
+                      const std::function<void(const acl::PolicyStore::ClusterItem &)> &on_item,
+                      const std::function<void(const string &place, const string &source)> &on_scripts) {
+	for (auto &item : effective) {
+		if (item.kind != "source" && item.kind != "script") {
+			on_item(item);
+		}
+	}
+	on_scripts("before_sources", string());
+	for (auto &item : effective) {
+		if (item.kind == "source") {
+			on_item(item);
+			on_scripts("after_source", item.name);
+		}
+	}
+	on_scripts("after_sources", string());
+}
+
+//! spec 047: step 6 as rows - each item's statements, a lazy source's ATTACH marked as run on demand, each script with
+//! its place, its policy and its SQL
+vector<PlanStep> ProfileOrder(const vector<acl::PolicyStore::ClusterItem> &effective, const PodResources &pod) {
+	vector<PlanStep> out;
+	WalkProfileOrder(
+	    effective,
+	    [&](const acl::PolicyStore::ClusterItem &item) {
+		    int64_t idle_seconds = 0;
+		    if (acl::ClusterSourceLazy(item, idle_seconds)) {
+			    for (auto &sql : acl::ClusterItemApplyStatements(item)) {
+				    out.push_back(
+				        {"6 profile: source " + item.name + " (lazy: attached when a statement first reads it)", sql});
+			    }
+			    return;
+		    }
+		    bool cut = false;
+		    for (auto &sql : ProfileItemStatements(item, pod, cut)) {
+			    out.push_back({"6 profile: " + item.kind + " " + item.name + (cut ? " (cut to the pod)" : ""), sql});
+		    }
+	    },
+	    [&](const string &place, const string &source) {
+		    // a lazy source's scripts run at its attach on demand, not here
+		    bool at_attach = false;
+		    for (auto &item : effective) {
+			    int64_t idle_seconds = 0;
+			    if (item.kind == "source" && StringUtil::CIEquals(item.name, source) &&
+			        acl::ClusterSourceLazy(item, idle_seconds)) {
+				    at_attach = true;
+			    }
+		    }
+		    for (auto &script : acl::ClusterScriptsIn(effective, place, source)) {
+			    out.push_back({"6 profile: script " + script.name + " (" + place +
+			                       (source.empty() ? "" : " " + source) + ", on error " +
+			                       acl::ClusterScriptField(script, "on_error") + (at_attach ? ", at its attach" : "") +
+			                       ")",
+			                   acl::ClusterScriptField(script, "sql")});
+		    }
+	    });
+	return out;
+}
+
+//! spec 047: the document this node booted with (names only, by its contract), for the bootstrap's listing
+class BootRecord : public ObjectCacheEntry {
+public:
+	static string ObjectType() {
+		return "hugr_node_boot_record";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx();
+	}
+	mutex lock;
+	string document;
+};
+
+void RecordBootDocument(DatabaseInstance &db, const string &document) {
+	auto record = db.GetObjectCache().GetOrCreate<BootRecord>(BootRecord::ObjectType());
+	lock_guard<mutex> guard(record->lock);
+	record->document = document;
+}
+
+//! acl_cluster_bootstrap_order([document_json]) - platform.bootstrap_order(), the cluster bundle's (spec 047): the
+//! node's whole bootstrap in its order, step 6 expanded - the profile's items and the scripts in their places, with
+//! their SQL. The document is this node's own (as it booted) unless one is given; with none, step 6 alone
+struct OrderBind : public TableFunctionData {
+	vector<PlanStep> steps;
+};
+
+unique_ptr<FunctionData> OrderBindFn(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &types,
+                                     vector<Identifier> &names) {
+	names = {Identifier("pos"), Identifier("step"), Identifier("sql")};
+	types = {LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR};
+	auto &store = input.info->Cast<AgentInfo>().store;
+	auto env = AgentEnvironment::FromProcess();
+	auto profile = ProfileOrder(store->ClusterEffective(), env.pod);
+	string document;
+	if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
+		document = input.inputs[0].ToString();
+	} else {
+		auto record =
+		    DatabaseInstance::GetDatabase(context).GetObjectCache().GetOrCreate<BootRecord>(BootRecord::ObjectType());
+		lock_guard<mutex> guard(record->lock);
+		document = record->document;
+	}
+	auto bind = make_uniq<OrderBind>();
+	if (document.empty()) {
+		bind->steps = std::move(profile);
+		return std::move(bind);
+	}
+	for (auto &step : BootstrapPlan(env, BootstrapDocument::Parse(document), "<random per process>")) {
+		if (StringUtil::StartsWith(step.step, "6 profile")) {
+			bind->steps.insert(bind->steps.end(), profile.begin(), profile.end());
+		} else {
+			bind->steps.push_back(step);
+		}
+	}
+	return std::move(bind);
+}
+
+void OrderScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
+	auto &bind = data.bind_data->Cast<OrderBind>();
+	auto &state = data.global_state->Cast<StepsState>();
+	idx_t count = 0;
+	while (state.next < bind.steps.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &step = bind.steps[state.next];
+		output.data[0].SetValue(count, Value::BIGINT(int64_t(state.next) + 1));
+		output.data[1].SetValue(count, Value(step.step));
+		output.data[2].SetValue(count, Value(step.sql));
+		state.next++;
+		count++;
+	}
+	output.SetChildCardinality(count);
+}
+
 //! hugr_node_profile_statements([environment := json]): what applies this node's effective profile, in its order -
-//! an engine setting cut to the pod the environment describes (spec 010)
+//! an engine setting cut to the pod the environment describes (spec 010); the scripts in their places (spec 047)
 unique_ptr<FunctionData> ProfileBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
                                      vector<Identifier> &names) {
 	StepsColumns(types, names);
@@ -968,13 +1106,7 @@ unique_ptr<FunctionData> ProfileBind(ClientContext &, TableFunctionBindInput &in
 		env = AgentEnvironment::FromProcess();
 	}
 	auto bind = make_uniq<StepsBind>();
-	for (auto &item : store->ClusterEffective()) {
-		bool cut = false;
-		for (auto &sql : ProfileItemStatements(item, env.pod, cut)) {
-			bind->steps.push_back(
-			    {"6 profile: " + item.kind + " " + item.name + (cut ? " (cut to the pod)" : ""), sql});
-		}
-	}
+	bind->steps = ProfileOrder(store->ClusterEffective(), env.pod);
 	return std::move(bind);
 }
 
@@ -1220,7 +1352,50 @@ struct TickState {
 	std::vector<TickPending> pending;
 	bool needs_restart = false;
 	std::map<string, int64_t> drift_counts;
+	//! spec 047: a source detached because a script after it failed, by its lowercased alias - held (DETACH SOURCE,
+	//! or FAIL NODE once serving) until its spec changes or the node restarts, or tried again at `next_try` (RETRY)
+	struct Held {
+		string spec;
+		bool retry = false;
+		std::chrono::steady_clock::time_point next_try;
+		int64_t backoff_s = 0;
+		string why;
+	};
+	std::map<string, Held> held;
+	//! spec 047: AFTER SOURCES scripts that failed with RETRY: tried again at `next_try` until they pass
+	std::map<string, Held> scripts_retry;
 };
+
+//! spec 047: the next try of a RETRY - 10 s, doubling, at most 5 minutes
+void Backoff(TickState::Held &held) {
+	held.backoff_s = held.backoff_s == 0 ? 10 : std::min<int64_t>(held.backoff_s * 2, 300);
+	held.next_try = std::chrono::steady_clock::now() + std::chrono::seconds(held.backoff_s);
+}
+
+//! spec 047: what a held source is held for - its identity and the scripts after it; a change of either lets it go
+//! (the source attached again with its scripts as they are now); '' when the profile has no such source
+string HoldSignature(const vector<acl::PolicyStore::ClusterItem> &items, const string &alias) {
+	for (auto &item : items) {
+		if (item.kind == "source" && StringUtil::CIEquals(item.name, alias)) {
+			auto out = acl::ClusterSourceIdentity(item.spec);
+			for (auto &script : acl::ClusterScriptsIn(items, "after_source", item.name)) {
+				out += "|" + StringUtil::Lower(script.name) + "=" + script.spec;
+			}
+			return out;
+		}
+	}
+	return string();
+}
+
+//! spec 047: an AFTER SOURCES script queued for its retry, still the profile's as it was
+bool ScriptStill(const vector<acl::PolicyStore::ClusterItem> &items, const string &name, const string &spec) {
+	for (auto &item : items) {
+		if (item.kind == "script" && StringUtil::Lower(item.name) == name) {
+			return item.spec == spec;
+		}
+	}
+	return false;
+}
 
 //! an item as the tick reads it: an extension by its canonical name (`postgres` is loaded as `postgres_scanner`)
 TickItem TickItemOf(const acl::PolicyStore::ClusterItem &item) {
@@ -1326,8 +1501,27 @@ void Converge(DatabaseInstance &db, acl::PolicyStore &store, const AgentEnvironm
 		state.taken.erase(key);
 	}
 	bool hot_failed = false;
+	auto now = std::chrono::steady_clock::now();
+	// spec 047: a hold or a retry the profile no longer backs goes - the source or its scripts changed or left, the
+	// script changed or left - and the item is then applied as the profile has it now
+	for (auto it = state.held.begin(); it != state.held.end();) {
+		it = HoldSignature(items, it->first) == it->second.spec ? std::next(it) : state.held.erase(it);
+	}
+	for (auto it = state.scripts_retry.begin(); it != state.scripts_retry.end();) {
+		it = ScriptStill(items, it->first, it->second.spec) ? std::next(it) : state.scripts_retry.erase(it);
+	}
 	for (auto index : decision.apply) {
 		auto &item = items[index];
+		// spec 047: a source its script holds detached - until its spec changes (DETACH SOURCE), or its next try
+		// (RETRY)
+		if (item.kind == "source") {
+			auto held = state.held.find(StringUtil::Lower(item.name));
+			if (held != state.held.end() && (!held->second.retry || now < held->second.next_try)) {
+				// reported, never a block on the version applied: the rest of the profile holds
+				decision.pending.push_back({item.kind, item.name, "error", held->second.why});
+				continue;
+			}
+		}
 		auto error = ApplyHot(db, item, env.pod);
 		if (!error.empty()) {
 			// listed, and the rest still apply
@@ -1336,8 +1530,62 @@ void Converge(DatabaseInstance &db, acl::PolicyStore &store, const AgentEnvironm
 			Log("tick: " + item.kind + " " + item.name + " could not be applied (" + error + ")");
 			continue;
 		}
+		if (item.kind == "source") {
+			acl::ClusterScriptFailure failure;
+			if (!acl::RunClusterScripts(db, "after_source", item.name, failure)) {
+				// once serving, FAIL NODE holds the source as DETACH SOURCE does: the node stays up without it
+				auto why = "script " + failure.name + " failed (" + failure.error_class + ")";
+				Connection con(db);
+				auto detached = con.Query("DETACH " + Ident(item.name));
+				if (detached->HasError()) {
+					// in use: the node keeps it as attached (taken) and it goes with a drain
+					state.taken[TickKeyOf(tick_items[index])] = tick_items[index].spec;
+					decision.pending.push_back({item.kind, item.name, "drain", why + "; in use, not detached"});
+					Log("tick: source " + item.name + " - " + why + ", and in use: not detached");
+					continue;
+				}
+				auto &held = state.held[StringUtil::Lower(item.name)];
+				held.spec = HoldSignature(items, item.name);
+				held.retry = failure.policy == "retry";
+				held.why = why;
+				if (held.retry) {
+					Backoff(held);
+				}
+				decision.pending.push_back({item.kind, item.name, "error", held.why});
+				Log("tick: source " + item.name + " detached - " + held.why);
+				continue;
+			}
+			state.held.erase(StringUtil::Lower(item.name));
+		}
 		state.taken[TickKeyOf(tick_items[index])] = tick_items[index].spec;
 		Log("tick: " + item.kind + " " + item.name + " applied (profile version " + std::to_string(version) + ")");
+	}
+	// spec 047: the AFTER SOURCES scripts that failed with RETRY, at their next try
+	for (auto it = state.scripts_retry.begin(); it != state.scripts_retry.end();) {
+		if (now < it->second.next_try) {
+			decision.pending.push_back({"script", it->first, "error", it->second.why});
+			++it;
+			continue;
+		}
+		bool passed = true;
+		for (auto &script : acl::ClusterScriptsAt(db, "after_sources")) {
+			if (StringUtil::Lower(script.name) != it->first) {
+				continue;
+			}
+			auto error = acl::RunClusterScript(db, script);
+			if (!error.empty()) {
+				passed = false;
+				it->second.why = "script " + script.name + " failed (" + error + ")";
+			}
+		}
+		if (passed) {
+			Log("tick: script " + it->first + " passed on retry");
+			it = state.scripts_retry.erase(it);
+			continue;
+		}
+		Backoff(it->second);
+		decision.pending.push_back({"script", it->first, "error", it->second.why});
+		++it;
 	}
 	for (auto &alias : decision.detach) {
 		Connection con(db);
@@ -1374,7 +1622,8 @@ void Converge(DatabaseInstance &db, acl::PolicyStore &store, const AgentEnvironm
 	state.pending = decision.pending;
 	state.needs_restart = false;
 	for (auto &pending : state.pending) {
-		state.needs_restart = state.needs_restart || pending.item_class != "hot";
+		// spec 047: a failing script is reported ("error"), and a restart does not mend it
+		state.needs_restart = state.needs_restart || (pending.item_class != "hot" && pending.item_class != "error");
 	}
 }
 
@@ -1559,6 +1808,7 @@ string RunPragma(ClientContext &context, const FunctionParameters &parameters) {
 		}
 		Log("step 2 bootstrap document: ok");
 		document = BootstrapDocument::Parse(text);
+		RecordBootDocument(db, text);
 		env = WithDocument(env, document);
 		for (auto &step : TresorSteps(env)) {
 			RunStep(db, "3 tresor", step.sql);
@@ -1574,6 +1824,7 @@ string RunPragma(ClientContext &context, const FunctionParameters &parameters) {
 			                            "answered nothing");
 		}
 		document = BootstrapDocument::Parse(fetched_rows.GetValue(0, 0).ToString());
+		RecordBootDocument(db, fetched_rows.GetValue(0, 0).ToString());
 	}
 	if (document.catalog_type.empty()) {
 		// the repository first: the type's extension may come from it
@@ -1612,21 +1863,104 @@ string RunPragma(ClientContext &context, const FunctionParameters &parameters) {
 	auto version = store->ClusterVersion();
 	auto effective = store->ClusterEffective();
 	// spec 035 stage 2: a lazy source is not attached here - the first statement that reads it does
-	acl::RefreshLazySources(db, effective);
-	for (auto &item : effective) {
-		bool cut = false;
-		for (auto &sql : ProfileItemStatements(item, env.pod, cut)) {
-			RunStep(db, "6 profile: " + item.kind + " " + item.name, sql);
+	acl::RefreshLazySources(db, effective); // spec 047: the scripts' registry too
+	// spec 047: the scripts in their places - the profile's extensions and settings first, then the scripts before
+	// the sources, each source followed by its scripts, the scripts after the sources
+	auto scripts_at = [&](const string &place, const string &source) {
+		acl::ClusterScriptFailure failure;
+		vector<acl::ClusterScriptFailure> queued;
+		bool passed = acl::RunClusterScripts(db, place, source, failure, place == "after_sources" ? &queued : nullptr);
+		// RETRY after the sources: the node serves, the tick tries each again; the place's other scripts ran
+		for (auto &retry : queued) {
+			auto &held = tick.scripts_retry[StringUtil::Lower(retry.name)];
+			held.retry = true;
+			held.why = "script " + retry.name + " failed (" + retry.error_class + ")";
+			for (auto &item : effective) {
+				if (item.kind == "script" && StringUtil::CIEquals(item.name, retry.name)) {
+					held.spec = item.spec;
+				}
+			}
+			Backoff(held);
+			Log("step 6 profile: " + held.why + " - retried by the tick");
 		}
-		if (cut) {
-			Log("step 6 profile: " + item.name + " cut to the pod's ceiling");
+		if (passed) {
+			return true;
 		}
-		int64_t idle_seconds = 0;
-		if (acl::ClusterSourceLazy(item, idle_seconds)) {
-			continue; // not attached here: the node takes it when a statement attaches it (its applied-here note)
+		if (failure.policy == "fail_node") {
+			throw InvalidInputException(
+			    "hugr_node: bootstrap step 6 profile: script %s (%s) failed (%s) - its ON ERROR "
+			    "FAIL NODE stops the node",
+			    failure.name, place, failure.error_class);
 		}
+		auto &held = tick.held[StringUtil::Lower(source)];
+		held.retry = failure.policy == "retry";
+		held.why = "script " + failure.name + " failed (" + failure.error_class + ")";
+		if (held.retry) {
+			Backoff(held);
+		}
+		return false;
+	};
+	auto take = [&](const acl::PolicyStore::ClusterItem &item) {
 		auto tick_item = TickItemOf(item);
 		tick.taken[TickKeyOf(tick_item)] = tick_item.spec;
+	};
+	std::set<string> attached; // the sources this boot attached (lowercased): their scripts follow
+	WalkProfileOrder(
+	    effective,
+	    [&](const acl::PolicyStore::ClusterItem &item) {
+		    if (item.kind == "source") {
+			    // what loads through a source a script holds detached is held with it (its ATTACH would fail)
+			    for (auto &dependency : item.depends_on) {
+				    auto held = tick.held.find(StringUtil::Lower(dependency));
+				    if (held != tick.held.end()) {
+					    auto &own = tick.held[StringUtil::Lower(item.name)];
+					    own.retry = held->second.retry;
+					    own.next_try = held->second.next_try;
+					    own.why = "it depends on " + dependency + ", held: " + held->second.why;
+					    own.spec = HoldSignature(effective, item.name);
+					    Log("step 6 profile: source " + item.name + " not attached - " + own.why);
+					    return;
+				    }
+			    }
+		    }
+		    bool cut = false;
+		    for (auto &sql : ProfileItemStatements(item, env.pod, cut)) {
+			    RunStep(db, "6 profile: " + item.kind + " " + item.name, sql);
+		    }
+		    if (cut) {
+			    Log("step 6 profile: " + item.name + " cut to the pod's ceiling");
+		    }
+		    int64_t idle_seconds = 0;
+		    if (acl::ClusterSourceLazy(item, idle_seconds)) {
+			    return; // not attached here: the node takes it when a statement attaches it (its applied-here note)
+		    }
+		    if (item.kind == "source") {
+			    attached.insert(StringUtil::Lower(item.name));
+		    }
+		    take(item);
+	    },
+	    [&](const string &place, const string &source) {
+		    if (place != "after_source") {
+			    scripts_at(place, source);
+			    return;
+		    }
+		    // a source's scripts, once it attached here (a lazy one's run at its attach on demand)
+		    if (!attached.count(StringUtil::Lower(source)) || scripts_at(place, source)) {
+			    return;
+		    }
+		    // its script failed: the node serves without it (DETACH SOURCE), or the tick tries again (RETRY)
+		    RunStep(db, "6 profile: source " + source + " detached", "DETACH " + Ident(source));
+		    tick.taken.erase({"source", TickLower(source)});
+		    auto &held = tick.held[StringUtil::Lower(source)];
+		    held.spec = HoldSignature(effective, source);
+		    Log("step 6 profile: source " + source + " detached - " + held.why +
+		        (held.retry ? ", retried by the tick"
+		                    : ", held until it or its scripts change in the profile, or the node restarts"));
+	    });
+	for (auto &item : effective) {
+		if (item.kind == "script") {
+			take(item); // a change of it is a restart's (the owner): the tick lists it pending
+		}
 	}
 	RunStep(db, "7 lock", "SET GLOBAL lock_configuration = true");
 	RunStep(db, "8 serve", "SELECT acl_cluster_applied(" + std::to_string(version) + ")");
@@ -1684,6 +2018,23 @@ void RegisterHugrNodeAgent(ExtensionLoader &loader, const shared_ptr<acl::Policy
 	    "options", [](TypedKwargs &options) { options.Add("environment", LogicalType::VARCHAR); });
 	profile.function_info = info;
 	loader.RegisterFunction(profile);
+
+	// spec 047: the node's bootstrap in its order, scripts and all - platform.bootstrap_order(), the cluster bundle's
+	for (auto &arguments : {vector<LogicalType> {}, vector<LogicalType> {LogicalType::VARCHAR}}) {
+		TableFunction order(Identifier("acl_cluster_bootstrap_order"), arguments, OrderScan, OrderBindFn, StepsInit);
+		order.function_info = info;
+		loader.RegisterFunction(order);
+	}
+	acl::RegisterPlatformFunction({"bootstrap_order",
+	                               "acl_cluster_bootstrap_order",
+	                               {acl::PlatformParam {"document", false, "VARCHAR"}},
+	                               {0, 1},
+	                               -1,
+	                               acl::PlatformRight::INFRASTRUCTURE,
+	                               true,
+	                               "TABLE",
+	                               "the node's bootstrap in its order: its steps, the profile's items and the "
+	                               "administrator's scripts in their places, with their SQL"});
 }
 
 } // namespace hugr_node

@@ -58,6 +58,28 @@ void RefreshSecretsLists(DatabaseInstance &db);
 //! whether a profile item is a source that names a secret
 bool ClusterSourceNamesSecret(const PolicyStore::ClusterItem &item);
 
+//! spec 047: the administrator's scripts - kind `script`, spec {place, source, sql, on_error}. `place`: before_sources,
+//! after_source (of `source`), after_sources, on_session. The node's registry is refreshed with its lazy sources
+//! (RefreshLazySources); a place's scripts run in their names' order, each on its own connection of the node's,
+//! unprefixed, with `acl_node_group` / `acl_node_label` set as variables first
+struct ClusterScriptFailure {
+	string name;
+	string policy; // fail_node, detach_source, retry (continue never stops)
+	string error_class;
+};
+string ClusterScriptField(const PolicyStore::ClusterItem &item, const char *field);
+vector<PolicyStore::ClusterItem> ClusterScriptsAt(DatabaseInstance &db, const string &place,
+                                                  const string &source = string());
+//! the same choice over a list of items (the effective profile): what the listing and the bootstrap's order read
+vector<PolicyStore::ClusterItem> ClusterScriptsIn(const vector<PolicyStore::ClusterItem> &items, const string &place,
+                                                  const string &source = string());
+//! '' when the script ran, else its error's class (logged with its name and place)
+string RunClusterScript(DatabaseInstance &db, const PolicyStore::ClusterItem &script);
+//! every script at a place (a source's for after_source); false at the first whose policy stops (not continue). With
+//! `queued`, a RETRY failure is queued there and the place goes on (the scripts after the sources)
+bool RunClusterScripts(DatabaseInstance &db, const string &place, const string &source, ClusterScriptFailure &failure,
+                       vector<ClusterScriptFailure> *queued = nullptr);
+
 //! spec 118: a setting the cluster bundle may put in the profile - the node's resources and tuning (an
 //! allowlist); a data path, a trust or audit setting and anything else is passthrough's
 bool ClusterBundleMaySet(const string &name);

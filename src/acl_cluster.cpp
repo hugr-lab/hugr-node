@@ -532,11 +532,116 @@ shared_ptr<LazySource> FindLazySource(DatabaseInstance &db, const string &alias,
 	return found->second;
 }
 
+//! spec 047: the node's scripts, from its effective profile (refreshed with the lazy sources) - per instance
+class ClusterScripts : public ObjectCacheEntry {
+public:
+	static string ObjectType() {
+		return "hugr_node_cluster_scripts";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx();
+	}
+	mutex lock;
+	vector<PolicyStore::ClusterItem> scripts;
+};
+
+shared_ptr<ClusterScripts> ClusterScriptsOf(DatabaseInstance &db) {
+	return db.GetObjectCache().GetOrCreate<ClusterScripts>(ClusterScripts::ObjectType());
+}
+
 } // namespace
 
 bool ClusterSourceLazy(const PolicyStore::ClusterItem &item, int64_t &idle_seconds);
 
+string ClusterScriptField(const PolicyStore::ClusterItem &item, const char *field) {
+	return JsonField(item.spec, field);
+}
+
+vector<PolicyStore::ClusterItem> ClusterScriptsIn(const vector<PolicyStore::ClusterItem> &items, const string &place,
+                                                  const string &source) {
+	vector<PolicyStore::ClusterItem> out;
+	for (auto &item : items) {
+		if (item.kind == "script" && ClusterScriptField(item, "place") == place &&
+		    (source.empty() || StringUtil::CIEquals(ClusterScriptField(item, "source"), source))) {
+			out.push_back(item);
+		}
+	}
+	// a place's scripts by their names: the administrator names them to order them
+	std::sort(out.begin(), out.end(), [](const PolicyStore::ClusterItem &a, const PolicyStore::ClusterItem &b) {
+		return StringUtil::Lower(a.name) < StringUtil::Lower(b.name);
+	});
+	return out;
+}
+
+vector<PolicyStore::ClusterItem> ClusterScriptsAt(DatabaseInstance &db, const string &place, const string &source) {
+	auto registry = ClusterScriptsOf(db);
+	vector<PolicyStore::ClusterItem> scripts;
+	{
+		lock_guard<mutex> guard(registry->lock);
+		scripts = registry->scripts;
+	}
+	return ClusterScriptsIn(scripts, place, source);
+}
+
+string RunClusterScript(DatabaseInstance &db, const PolicyStore::ClusterItem &script) {
+	Connection con(db);
+	// what node it prepares, for the script's conditions (no IF in SQL: a WHERE): the node's own settings
+	auto context = con.Query("SET VARIABLE acl_node_group = current_setting('acl_node_group'); "
+	                         "SET VARIABLE acl_node_label = current_setting('acl_node_label')");
+	if (context->HasError()) {
+		return Exception::ExceptionTypeToString(context->GetErrorType());
+	}
+	auto result = con.Query(ClusterScriptField(script, "sql"));
+	string error;
+	if (result->HasError()) {
+		error = Exception::ExceptionTypeToString(result->GetErrorType());
+	}
+	// the name and the class, never the text (it may name things) nor the error's message (a source's may carry its
+	// connection string)
+	fprintf(stderr, "hugr_node: script %s (%s%s) %s\n", script.name.c_str(),
+	        ClusterScriptField(script, "place").c_str(),
+	        ClusterScriptField(script, "source").empty() ? "" : (" " + ClusterScriptField(script, "source")).c_str(),
+	        error.empty() ? "ran" : ("failed (" + error + ")").c_str());
+	fflush(stderr);
+	return error;
+}
+
+bool RunClusterScripts(DatabaseInstance &db, const string &place, const string &source, ClusterScriptFailure &failure,
+                       vector<ClusterScriptFailure> *queued) {
+	for (auto &script : ClusterScriptsAt(db, place, source)) {
+		auto error = RunClusterScript(db, script);
+		if (error.empty()) {
+			continue;
+		}
+		auto policy = ClusterScriptField(script, "on_error");
+		if (policy == "continue") {
+			continue;
+		}
+		if (policy == "retry" && queued) {
+			queued->push_back({script.name, policy, error}); // retried by itself; the place goes on
+			continue;
+		}
+		failure = {script.name, policy, error};
+		return false;
+	}
+	return true;
+}
+
 void RefreshLazySources(DatabaseInstance &db, const vector<PolicyStore::ClusterItem> &items) {
+	{
+		// spec 047: the scripts come with the same effective profile
+		auto registry = ClusterScriptsOf(db);
+		lock_guard<mutex> guard(registry->lock);
+		registry->scripts.clear();
+		for (auto &item : items) {
+			if (item.kind == "script") {
+				registry->scripts.push_back(item);
+			}
+		}
+	}
 	auto lazy = LazySourcesOf(db);
 	lock_guard<mutex> guard(lazy->lock);
 	map<string, shared_ptr<LazySource>> next;
@@ -623,6 +728,18 @@ void AttachLazySource(DatabaseInstance &db, const string &alias) {
 			fflush(stderr);
 			throw InvalidInputException("acl: a source this statement reads could not be attached (%s)", error_class);
 		}
+	}
+	// spec 047: its scripts, before the statement reads it - every attach of it (after an idle detach too)
+	ClusterScriptFailure failure;
+	if (!RunClusterScripts(db, "after_source", item.name, failure)) {
+		Connection undo(db);
+		auto detached = undo.Query("DETACH " + Ident(item.name));
+		if (detached->HasError()) {
+			fprintf(stderr, "hugr_node: lazy source %s could not be detached after its script failed (%s)\n",
+			        item.name.c_str(), Exception::ExceptionTypeToString(detached->GetErrorType()).c_str());
+			fflush(stderr);
+		}
+		throw InvalidInputException("acl: a source this statement reads could not be attached (its script failed)");
 	}
 	source->last_use = std::chrono::steady_clock::now();
 	// the tick takes it as this node's: a profile that drops or re-points it then detaches it or waits for a drain
@@ -798,6 +915,9 @@ vector<std::pair<string, string>> TakeAppliedHere(DatabaseInstance &db) {
 
 vector<string> ClusterItemApplyStatements(const PolicyStore::ClusterItem &item) {
 	using namespace duckdb_yyjson; // NOLINT
+	if (item.kind == "script") {
+		return {}; // spec 047: run in its place (RunClusterScripts), never as an item's statements
+	}
 	if (item.kind == "setting") {
 		return {"SET GLOBAL " + Ident(item.name) + " = " + Quoted(JsonField(item.spec, "value"))};
 	}
@@ -1221,6 +1341,17 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 			    RefreshSecretsLists(*db); // spec 046: a secret made just before is the node's
 		    }
 		    NodeQuery(*db, AttachStatement(alias, path, type, secret, options, lineage));
+		    // spec 047: the scripts after it (a re-attach of a name the profile has had) - a failure detaches it here
+		    // and says so; every node applies the script's own policy at its attach
+		    ClusterScriptFailure failure;
+		    if (!RunClusterScripts(*db, "after_source", alias, failure)) {
+			    Connection undo(*db);
+			    auto detached = undo.Query("DETACH " + Ident(alias));
+			    answer.note =
+			        "script " + failure.name + " after it failed here (" + failure.error_class + ") - " +
+			        (detached->HasError() ? "and it could not be detached here (in use)" : "detached on this node");
+			    return;
+		    }
 		    answer.applied_here = true;
 		    NoteAppliedHere(*db, "source", alias);
 	    });
@@ -1391,6 +1522,35 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterDetach(const string &scope, const
 					    readers.push_back(view_rows.GetValue(0, i).ToString());
 				    }
 			    }
+		    }
+		    // spec 047: a script that follows a removed source goes with it under CASCADE, else it holds the DETACH
+		    auto scripts_result = read("SELECT \"scope\", \"name\", \"spec\" FROM " + catalog->Tbl("cluster_items") +
+		                               " WHERE \"kind\" = 'script'");
+		    ResultRows scripts(*scripts_result);
+		    vector<std::pair<string, string>> scripts_removed;
+		    for (idx_t i = 0; i < scripts.Count(); i++) {
+			    auto script_scope = scripts.GetValue(0, i).ToString();
+			    auto script = scripts.GetValue(1, i).ToString();
+			    auto follows = JsonField(scripts.GetValue(2, i).ToString(), "source");
+			    if (follows.empty() || JsonField(scripts.GetValue(2, i).ToString(), "place") != "after_source") {
+				    continue;
+			    }
+			    for (auto &r : removed) {
+				    if (falls_back.count(key(r)) || !depends_on_removed(script_scope, follows, r)) {
+					    continue;
+				    }
+				    if (!cascade) {
+					    throw BinderException(
+					        "acl cluster: script \"%s\"%s runs AFTER SOURCE \"%s\" - remove it first, "
+					        "or DETACH %s CASCADE",
+					        script, script_scope.empty() ? string() : " of group " + script_scope, r.second, alias);
+				    }
+				    scripts_removed.emplace_back(script_scope, script);
+				    break;
+			    }
+		    }
+		    for (auto &script : scripts_removed) {
+			    statements.push_back(DeleteItem(*catalog, script.first, "script", script.second));
 		    }
 		    if (!readers.empty() && !force) {
 			    throw BinderException("acl cluster: the policy reads through %s: %s - remove those first, or DETACH %s "
@@ -1640,6 +1800,114 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterSetting(const string &verb, const
 	return answer;
 }
 
+//! spec 047: the administrator's script - `add` it at its place, `update` what is given (the rest kept), `remove` it.
+//! Its SQL is stored as written and run as the node, outside acl (the owner): nothing here reads it. A restart item:
+//! running nodes keep what they ran; a script after a source also runs at each later attach of that source
+static PolicyStore::ClusterAnswer ClusterScript(PolicyStore &store, const string &verb, const string &scope,
+                                                const string &name, const string &place_p, const string &source_p,
+                                                const string &sql_p, const string &on_error_p, const string &comment) {
+	RequireClusterCatalog(store.catalog, "acl_cluster_script");
+	auto &catalog = *store.catalog;
+	auto v = StringUtil::Lower(verb);
+	if (v != "add" && v != "update" && v != "remove") {
+		throw BinderException("acl_cluster_script: the verb is add, update or remove, not \"%s\"", verb);
+	}
+	if (name.empty()) {
+		throw BinderException("acl cluster: a script is named - the name orders it among its place's");
+	}
+	LintKey(name, "a script's name");
+	auto db = store.instance.lock();
+	if (!db) {
+		throw BinderException("acl cluster: the instance is gone");
+	}
+	static const case_insensitive_set_t PLACES = {"before_sources", "after_source", "after_sources", "on_session"};
+	PolicyStore::ClusterAnswer answer;
+	answer.item_class = "restart";
+	answer.version = catalog.WriteWithReads(
+	    [&](const ReadFn &read, vector<string> &statements) {
+		    RequireScope(read, catalog, scope);
+		    auto current = CurrentSpec(read, catalog, scope, "script", name);
+		    if (v == "remove") {
+			    if (current.empty()) {
+				    throw BinderException("acl cluster: script \"%s\" is not in the profile", name);
+			    }
+			    statements.push_back(DeleteItem(catalog, scope, "script", name));
+			    return;
+		    }
+		    if (v == "add" && !current.empty()) {
+			    throw BinderException("acl cluster: script \"%s\" is in the profile already - CLUSTER ALTER SCRIPT "
+			                          "changes it",
+			                          name);
+		    }
+		    if (v == "update" && current.empty()) {
+			    throw BinderException("acl cluster: script \"%s\" is not in the profile - CLUSTER ADD SCRIPT writes it",
+			                          name);
+		    }
+		    // what the update does not give stays as it is
+		    auto place = !place_p.empty() ? StringUtil::Lower(place_p) : JsonField(current, "place");
+		    auto source = !place_p.empty() ? source_p : JsonField(current, "source");
+		    auto sql = !sql_p.empty() ? sql_p : JsonField(current, "sql");
+		    auto on_error = StringUtil::Lower(on_error_p);
+		    if (on_error.empty() && place_p.empty()) {
+			    on_error = JsonField(current, "on_error");
+		    }
+		    if (!PLACES.count(place)) {
+			    throw BinderException("acl cluster: a script's place is BEFORE SOURCES, AFTER SOURCE <alias>, AFTER "
+			                          "SOURCES or ON SESSION");
+		    }
+		    if (place == "on_session") {
+			    throw BinderException("acl cluster: a session's script is the policy's, not the profile's - ALTER "
+			                          "RESOURCE GROUP | ROLE ... SET SESSION SCRIPT (duckdb-acl spec 181)");
+		    }
+		    auto trimmed = sql;
+		    StringUtil::Trim(trimmed);
+		    if (trimmed.empty()) {
+			    throw BinderException("acl cluster: a script's SQL is written: AS '<sql>'");
+		    }
+		    // the policies a place takes, and its default (the owner, 2026-11-26)
+		    if (on_error.empty()) {
+			    on_error = place == "after_source" ? "detach_source" : "fail_node";
+		    }
+		    bool allowed = on_error == "fail_node" || on_error == "continue" ||
+		                   (on_error == "detach_source" && place == "after_source") ||
+		                   (on_error == "retry" && place != "before_sources");
+		    if (!allowed) {
+			    throw BinderException("acl cluster: ON ERROR %s is not for a script %s - %s", on_error, place,
+			                          place == "before_sources"
+			                              ? "it takes FAIL NODE or CONTINUE (nothing serves on an initialisation "
+			                                "still pending)"
+			                          : place == "after_sources" ? "it takes FAIL NODE, CONTINUE or RETRY"
+			                                                     : "it takes FAIL NODE, CONTINUE, DETACH SOURCE "
+			                                                       "or RETRY");
+		    }
+		    if (place == "after_source") {
+			    // the source it follows: this scope's, or the cluster's
+			    auto found = read("SELECT \"name\" FROM " + catalog.Tbl("cluster_items") +
+			                      " WHERE \"kind\" = 'source' AND \"scope\" IN ('', " + Lit(scope) +
+			                      ") AND lower(\"name\") = lower(" + Lit(source) + ")");
+			    if (found->RowCount() == 0) {
+				    throw BinderException("acl cluster: AFTER SOURCE \"%s\" names no source of the profile%s", source,
+				                          scope.empty() ? string() : " (the cluster's or group " + scope + "'s)");
+			    }
+			    source = found->Collection().GetValue(0, 0).ToString();
+		    } else {
+			    source.clear();
+		    }
+		    auto spec = JsonObjectOf({{"place", place}, {"source", source}, {"sql", sql}, {"on_error", on_error}});
+		    auto kept_comment =
+		        comment.empty() && v == "update" ? CurrentComment(read, catalog, scope, "script", name) : comment;
+		    statements.push_back(UpsertItem(catalog, scope, "script", StringUtil::Lower(name), spec, answer.item_class,
+		                                    kept_comment, !current.empty()));
+	    },
+	    "config_version",
+	    [&](int64_t) {
+		    answer.note = "restart class - a node runs its scripts at its boot; each node reports the change pending "
+		                  "until it restarts (the orchestrator rolls it)";
+	    });
+	RefreshLazySourcesAfterWrite(store, *db);
+	return answer;
+}
+
 //! spec 010 review: an extension's setting the scratch cannot render (it lacks the extension) is the same value when
 //! it reads as the same boolean (`yes` as written, `true` on the node) or the same number (`2`, `2.0`)
 static bool SameValue(const string &node_value, const string &wanted) {
@@ -1675,6 +1943,9 @@ vector<PolicyStore::DriftRow> PolicyStore::ClusterDrift() {
 		return kind == "setting" ? 0 : kind == "extension" ? 1 : 2;
 	};
 	for (auto &item : effective) {
+		if (item.kind == "script") {
+			continue; // spec 047: a script leaves nothing on the node to compare
+		}
 		// spec 010 review: an extension by its canonical name - `postgres` is loaded as `postgres_scanner`
 		auto name = item.kind == "extension" ? ExtensionHelper::ApplyExtensionAlias(item.name) : item.name;
 		profile[slot(item.kind)][name] = &item;
@@ -2039,6 +2310,14 @@ void ClusterSourcesFunc(DataChunk &args, ExpressionState &state, Vector &result)
 		return ClusterSources(StoreOf(state), Arg(args, 0, row), Arg(args, 1, row), Arg(args, 2, row),
 		                      args.ColumnCount() > 3 && LazyFlag(Arg(args, 3, row)),
 		                      args.ColumnCount() > 4 ? Arg(args, 4, row) : string());
+	});
+}
+
+//! acl_cluster_script(verb, scope, name, place, source, sql, on_error, comment) - spec 047
+void ClusterScriptFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+	EachRow(args, result, [&](idx_t row) {
+		return ClusterScript(StoreOf(state), Arg(args, 0, row), Arg(args, 1, row), Arg(args, 2, row), Arg(args, 3, row),
+		                     Arg(args, 4, row), Arg(args, 5, row), Arg(args, 6, row), Arg(args, 7, row));
 	});
 }
 
@@ -2678,6 +2957,54 @@ arena_ptr<TransformResultValue> FinalizeClusterDetach(PEGTransformer &transforme
 // AclClusterSet <- 'CLUSTER' 'SET' AclClusterSetWhat AclClusterInGroup?
 // AclClusterReset <- 'CLUSTER' 'RESET' AclClusterResetWhat AclClusterInGroup? - hugr-node spec 035: SOURCES is a
 // group's source set, a word a setting
+// AclClusterScript <- 'CLUSTER' AclClusterScriptVerb 'SCRIPT' AclNameValue AclClusterScriptPlace? AclClusterScriptBody?
+//                     AclClusterScriptOnError? AclClusterInGroup? AclComment?
+arena_ptr<TransformResultValue> FinalizeClusterScript(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	MgmtCall call(transformer, "acl_cluster_script");
+	auto verb = MgmtCall::Keyword(list.GetChild(1));
+	auto &named = MgmtCall::Part(list.GetChild(3));
+	auto name = named.Name() == "AclWordToken" ? MgmtCall::Word(named) : call.NameValue(named, "a script's name");
+	string place, source, sql, on_error;
+	if (auto clause = MgmtCall::Optional(list.GetChild(4))) {
+		auto &which = MgmtCall::Part(*clause);
+		if (which.Name() == "AclClusterScriptBefore") {
+			place = "before_sources";
+		} else if (which.Name() == "AclClusterScriptAfterOne") {
+			place = "after_source";
+			source = call.NameValue(which.Cast<ListParseResult>().GetChild(2), "a source's alias");
+		} else if (which.Name() == "AclClusterScriptAfterAll") {
+			place = "after_sources";
+		} else {
+			place = "on_session";
+		}
+	}
+	if (auto clause = MgmtCall::Optional(list.GetChild(5))) {
+		sql = call.Quoted(clause->Cast<ListParseResult>().GetChild(1), "a script's SQL");
+	}
+	if (auto clause = MgmtCall::Optional(list.GetChild(6))) {
+		auto &policy = MgmtCall::Part(clause->Cast<ListParseResult>().GetChild(2));
+		if (policy.Name() == "AclClusterScriptFail") {
+			on_error = "fail_" + MgmtCall::Keyword(policy.Cast<ListParseResult>().GetChild(1));
+		} else if (policy.Name() == "AclClusterScriptDetach") {
+			on_error = "detach_source";
+		} else {
+			on_error = MgmtCall::Keyword(policy);
+		}
+	}
+	if (verb == "drop" && (!place.empty() || !sql.empty() || !on_error.empty())) {
+		throw ParserException("acl cluster: CLUSTER DROP SCRIPT <name> [IN GROUP <group>] takes nothing else");
+	}
+	// the function's verbs: add, update, remove
+	verb = verb == "alter" ? "update" : verb == "drop" ? "remove" : verb;
+	auto scope = ClusterGroup(call, list.GetChild(7));
+	auto comment = ClusterComment(call, list.GetChild(8));
+	for (auto &part : {verb, scope, name, place, source, sql, on_error, comment}) {
+		call.Arg(Value(part));
+	}
+	return call.Result();
+}
+
 arena_ptr<TransformResultValue> FinalizeClusterSetting(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto verb = MgmtCall::Keyword(list.GetChild(1));
@@ -2787,6 +3114,26 @@ void RegisterClusterRules() {
 	rules.push_back(
 	    GrammarChange::AddRule("AclClusterReset <- 'CLUSTER' 'RESET' AclClusterResetWhat AclClusterInGroup?",
 	                           MgmtStart<FinalizeClusterSetting>));
+	// spec 047: the administrator's scripts
+	rule("AclClusterScriptVerb <- 'ADD' / 'ALTER' / 'DROP'");
+	// a script's name orders it among its place's: `10_vars` is written bare (a word the tokenizer split at its digit)
+	rule("AclClusterScriptName <- AclNameValue / AclWordToken");
+	rule("AclClusterScriptBefore <- 'BEFORE' 'SOURCES'");
+	rule("AclClusterScriptAfterOne <- 'AFTER' 'SOURCE' AclNameValue");
+	rule("AclClusterScriptAfterAll <- 'AFTER' 'SOURCES'");
+	rule("AclClusterScriptSession <- 'ON' 'SESSION'");
+	rule("AclClusterScriptPlace <- AclClusterScriptBefore / AclClusterScriptAfterOne / AclClusterScriptAfterAll / "
+	     "AclClusterScriptSession");
+	rule("AclClusterScriptBody <- 'AS' AclQuotedValue");
+	rule("AclClusterScriptFailWhat <- 'NODE' / 'SESSION'");
+	rule("AclClusterScriptFail <- 'FAIL' AclClusterScriptFailWhat");
+	rule("AclClusterScriptDetach <- 'DETACH' 'SOURCE'");
+	rule("AclClusterScriptPolicy <- AclClusterScriptFail / AclClusterScriptDetach / 'CONTINUE' / 'RETRY'");
+	rule("AclClusterScriptOnError <- 'ON' 'ERROR' AclClusterScriptPolicy");
+	rules.push_back(GrammarChange::AddRule(
+	    "AclClusterScript <- 'CLUSTER' AclClusterScriptVerb 'SCRIPT' AclClusterScriptName AclClusterScriptPlace? "
+	    "AclClusterScriptBody? AclClusterScriptOnError? AclClusterInGroup? AclComment?",
+	    MgmtStart<FinalizeClusterScript>));
 	const char *group = "[IN GROUP <group>]";
 	vector<MgmtStatementForm> forms {
 	    {"AclClusterExtension",
@@ -2809,11 +3156,20 @@ void RegisterClusterRules() {
 	     StringUtil::Format("write CLUSTER SET <setting> = | TO <value> %s, or CLUSTER SET SOURCES (<source>, ...) | "
 	                        "ALL [LAZY [IDLE '<interval>']] IN GROUP <group>",
 	                        group)},
+	    {"AclClusterScript",
+	     {"add", "alter", "drop"},
+	     StringUtil::Format("write CLUSTER ADD SCRIPT <name> BEFORE SOURCES | AFTER SOURCE <alias> | AFTER SOURCES "
+	                        "AS '<sql>' [ON ERROR FAIL NODE | CONTINUE | DETACH SOURCE | RETRY] %s [COMMENT '<text>'], "
+	                        "CLUSTER ALTER SCRIPT <name> [<place>] [AS '<sql>'] [ON ERROR …] %s, or CLUSTER DROP "
+	                        "SCRIPT <name> %s",
+	                        group, group, group)},
 	    {"AclClusterReset",
 	     {"reset"},
 	     StringUtil::Format("write CLUSTER RESET <setting> %s, or CLUSTER RESET SOURCES IN GROUP <group>", group)}};
-	RegisterMgmtRules("cluster", std::move(forms), std::move(rules),
-	                  "ACL CLUSTER expects INSTALL, UPDATE or REMOVE EXTENSION, ATTACH, DETACH, SET or RESET");
+	RegisterMgmtRules(
+	    "cluster", std::move(forms), std::move(rules),
+	    "ACL CLUSTER expects INSTALL, UPDATE or REMOVE EXTENSION, ATTACH, DETACH, SET, RESET or ADD, ALTER or "
+	    "DROP SCRIPT");
 }
 
 //! spec 126: the cluster's part of the `platform` catalog - its views and functions, registered at load; the ONE
@@ -2894,6 +3250,17 @@ void RegisterClusterPlatform() {
 	setting.rule_refusal = "acl admin: \"%s\" is not among the settings the cluster bundle sets (the node's resources "
 	                       "and tuning) - a data path, a trust or audit setting is a passthrough scope's";
 	RegisterPlatformFunction(std::move(setting));
+	// spec 047: the administrator's scripts - the cluster bundle's (the owner, 2026-11-26)
+	RegisterPlatformFunction(
+	    {"cluster_script",
+	     "acl_cluster_script",
+	     {A("verb"), A("scope"), A("name"), P("place"), P("source"), P("sql"), P("on_error"), P("comment")},
+	     {8},
+	     -1,
+	     PlatformRight::INFRASTRUCTURE,
+	     false,
+	     ANSWER,
+	     "add / update / remove a script of the profile"});
 	// spec 035 stage 3: the check of the groups' source sets - the cluster bundle's, who writes them (it names the
 	// roles that reach each source, as platform.exposures does for policy)
 	RegisterPlatformFunction({"group_sources",
@@ -2940,6 +3307,7 @@ void RegisterAclCluster(ExtensionLoader &loader, const shared_ptr<PolicyStore> &
 	scalar("acl_cluster_sources", {v, v, v}, ClusterSourcesFunc, AnswerType());
 	scalar("acl_cluster_sources", {v, v, v, v}, ClusterSourcesFunc, AnswerType());
 	scalar("acl_cluster_sources", {v, v, v, v, v}, ClusterSourcesFunc, AnswerType());
+	scalar("acl_cluster_script", {v, v, v, v, v, v, v, v}, ClusterScriptFunc, AnswerType());
 	scalar("acl_cluster_version", {}, ClusterVersionFunc, LogicalType::BIGINT);
 
 	auto info = make_shared_ptr<ClusterInfo>(store);

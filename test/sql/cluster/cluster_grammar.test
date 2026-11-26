@@ -164,7 +164,7 @@ ACL ADMIN CLUSTER REMOVE spatial;
 statement error
 ACL ADMIN CLUSTER FOO;
 ----
-<REGEX>:.*ACL CLUSTER expects INSTALL, UPDATE or REMOVE EXTENSION, ATTACH, DETACH, SET or RESET.*
+<REGEX>:.*ACL CLUSTER expects INSTALL, UPDATE or REMOVE EXTENSION, ATTACH, DETACH, SET, RESET or ADD, ALTER or DROP SCRIPT.*
 
 # a value is one plain literal: an escape string, a string joined across a line break
 statement error

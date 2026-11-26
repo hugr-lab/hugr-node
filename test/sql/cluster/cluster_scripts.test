@@ -1,0 +1,255 @@
+# name: test/sql/cluster/cluster_scripts.test
+# description: spec 047 - the administrator's scripts in the profile (CLUSTER ADD | ALTER | DROP SCRIPT): written
+#   with their place and their policy, refused where they cannot run, held by the source they follow, never a drift;
+#   a script after a lazy source runs at each attach of it, with the node's group in its variables, and its failure
+#   refuses the statement and leaves the source detached
+# group: [sql]
+
+require hugr_node
+
+statement ok
+ATTACH ':memory:' AS store;
+
+statement ok
+SELECT acl_use_db('store', 'acl', true);
+
+statement ok
+SET GLOBAL acl_allow_anonymous_admin=true;
+
+statement ok
+ATTACH '{TEST_DIR}/scripts_archive.duckdb' AS seed;
+
+statement ok
+CREATE OR REPLACE TABLE seed.main.t AS SELECT 1 AS a;
+
+statement ok
+DETACH seed;
+
+# the scripts write their marks here: a database of the node's, outside the profile
+statement ok
+ATTACH ':memory:' AS marks;
+
+statement ok
+ACL ADMIN CLUSTER ATTACH '{TEST_DIR}/scripts_archive.duckdb' AS archive (TYPE duckdb) LAZY;
+
+# --- written: the place, the SQL as written, the policy (a place's default) ------------------------------------------
+
+query TT
+SELECT (r).class, (r).message LIKE 'restart class%' FROM (SELECT acl_cluster_script('add', '', '10_vars',
+    'before_sources', '', 'SET GLOBAL threads = 2', '', '') AS r);
+----
+restart	true
+
+statement ok
+ACL ADMIN CLUSTER ADD SCRIPT 20_after_archive AFTER SOURCE archive
+    AS 'CREATE OR REPLACE TABLE marks.main.after_archive AS SELECT getvariable(''acl_node_group'') AS grp, count(*) AS n FROM archive.main.t'
+    COMMENT 'marks the attach';
+
+statement ok
+ACL ADMIN CLUSTER ADD SCRIPT 30_last AFTER SOURCES AS 'SELECT 1' ON ERROR RETRY;
+
+query TTTT
+SELECT name, regexp_extract(spec, '"place": "([^"]*)"', 1), regexp_extract(spec, '"source": "([^"]*)"', 1),
+       regexp_extract(spec, '"on_error": "([^"]*)"', 1)
+FROM acl_cluster_items() WHERE kind = 'script' ORDER BY name;
+----
+10_vars	before_sources	(empty)	fail_node
+20_after_archive	after_source	archive	detach_source
+30_last	after_sources	(empty)	retry
+
+# --- refused where it cannot run ------------------------------------------------------------------------------------
+
+statement error
+ACL ADMIN CLUSTER ADD SCRIPT x BEFORE SOURCES AS 'SELECT 1' ON ERROR RETRY;
+----
+<REGEX>:.*ON ERROR retry is not for a script before_sources.*FAIL NODE or CONTINUE.*
+
+statement error
+ACL ADMIN CLUSTER ADD SCRIPT x AFTER SOURCES AS 'SELECT 1' ON ERROR DETACH SOURCE;
+----
+<REGEX>:.*ON ERROR detach_source is not for a script after_sources.*
+
+statement error
+ACL ADMIN CLUSTER ADD SCRIPT x AFTER SOURCE nowhere AS 'SELECT 1';
+----
+<REGEX>:.*AFTER SOURCE "nowhere" names no source of the profile.*
+
+statement error
+ACL ADMIN CLUSTER ADD SCRIPT x ON SESSION AS 'SELECT 1';
+----
+<REGEX>:.*a session's script is the policy's, not the profile's.*
+
+statement error
+ACL ADMIN CLUSTER ADD SCRIPT x BEFORE SOURCES;
+----
+<REGEX>:.*a script's SQL is written.*
+
+statement error
+ACL ADMIN CLUSTER ADD SCRIPT 10_vars BEFORE SOURCES AS 'SELECT 2';
+----
+<REGEX>:.*script "10_vars" is in the profile already.*
+
+statement error
+ACL ADMIN CLUSTER ALTER SCRIPT nothing AS 'SELECT 2';
+----
+<REGEX>:.*script "nothing" is not in the profile.*
+
+statement error
+ACL ADMIN CLUSTER DROP SCRIPT 10_vars AS 'SELECT 1';
+----
+<REGEX>:.*CLUSTER DROP SCRIPT <name> \[IN GROUP <group>\] takes nothing else.*
+
+# an update keeps what it does not give; a new place takes that place's default
+statement ok
+ACL ADMIN CLUSTER ALTER SCRIPT 10_vars AS 'SET GLOBAL threads = 3';
+
+query TT
+SELECT regexp_extract(spec, '"sql": "([^"]*)"', 1), regexp_extract(spec, '"place": "([^"]*)"', 1)
+FROM acl_cluster_items() WHERE name = '10_vars';
+----
+SET GLOBAL threads = 3	before_sources
+
+# --- a script is never a drift, nor an item's statements -------------------------------------------------------------
+
+query I
+SELECT count(*) FROM acl_platform_drift() WHERE name IN ('10_vars', '20_after_archive', '30_last');
+----
+0
+
+# --- the source it follows holds it: DETACH refused, CASCADE takes both ---------------------------------------------
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS other (TYPE duckdb);
+
+statement ok
+ACL ADMIN CLUSTER ADD SCRIPT 40_after_other AFTER SOURCE other AS 'SELECT 1';
+
+statement error
+ACL ADMIN CLUSTER DETACH other;
+----
+<REGEX>:.*script "40_after_other" runs AFTER SOURCE "other" - remove it first, or DETACH other CASCADE.*
+
+statement ok
+ACL ADMIN CLUSTER DETACH other CASCADE;
+
+query I
+SELECT count(*) FROM acl_cluster_items() WHERE name IN ('other', '40_after_other');
+----
+0
+
+# --- a lazy source's attach runs its script first, with the node's group --------------------------------------------
+
+statement ok
+SET GLOBAL acl_node_group = 'etl';
+
+statement ok
+ACL ADMIN CREATE ROLE analyst;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL CATALOG c;
+
+statement ok
+ACL ADMIN CREATE VIRTUAL TABLE c.t AS archive.main.t;
+
+statement ok
+ACL ADMIN GRANT CATALOG c TO ROLE analyst WITH (select) MAIN;
+
+query TI
+SELECT grp, n FROM marks.main.after_archive;
+----
+etl	1
+
+# as if it went idle: the next read attaches it again, and the script runs again
+statement ok
+DETACH archive;
+
+statement ok
+DROP TABLE marks.main.after_archive;
+
+query I
+ACL ROLE 'analyst' SELECT a FROM t;
+----
+1
+
+query TI
+SELECT grp, n FROM marks.main.after_archive;
+----
+etl	1
+
+# --- a script that fails: DETACH SOURCE refuses the read and leaves the source detached ----------------------------
+
+statement ok
+ACL ADMIN CLUSTER ALTER SCRIPT 20_after_archive AS 'SELECT * FROM marks.main.nowhere';
+
+statement ok
+DETACH archive;
+
+statement error
+ACL ROLE 'analyst' SELECT a FROM t;
+----
+<REGEX>:.*could not be attached \(its script failed\).*
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'archive';
+----
+0
+
+# CONTINUE: the read goes on with the source as it is
+statement ok
+ACL ADMIN CLUSTER ALTER SCRIPT 20_after_archive ON ERROR CONTINUE;
+
+query I
+ACL ROLE 'analyst' SELECT a FROM t;
+----
+1
+
+statement ok
+ACL ADMIN CLUSTER DROP SCRIPT 20_after_archive;
+
+query I
+SELECT count(*) FROM acl_cluster_items() WHERE kind = 'script';
+----
+2
+
+# --- the bootstrap's order, one listing (the owner, 2026-11-26): step 6 as the bootstrap walks it -----------------
+
+statement ok
+ACL ADMIN CLUSTER ATTACH ':memory:' AS eager (TYPE duckdb);
+
+statement ok
+ACL ADMIN CLUSTER ADD SCRIPT 50_after_eager AFTER SOURCE eager AS 'SELECT 5' ON ERROR RETRY;
+
+query ITT
+SELECT pos, step, sql FROM acl_cluster_bootstrap_order() ORDER BY pos;
+----
+1	6 profile: script 10_vars (before_sources, on error fail_node)	SET GLOBAL threads = 3
+2	6 profile: source archive (lazy: attached when a statement first reads it)	ATTACH '{TEST_DIR}/scripts_archive.duckdb' AS "archive" (TYPE duckdb)
+3	6 profile: source eager	ATTACH ':memory:' AS "eager" (TYPE duckdb)
+4	6 profile: script 50_after_eager (after_source eager, on error retry)	SELECT 5
+5	6 profile: script 30_last (after_sources, on error retry)	SELECT 1
+
+# the profile's statements are the same order
+query T
+SELECT step FROM hugr_node_profile_statements();
+----
+6 profile: script 10_vars (before_sources, on error fail_node)
+6 profile: source archive (lazy: attached when a statement first reads it)
+6 profile: source eager
+6 profile: script 50_after_eager (after_source eager, on error retry)
+6 profile: script 30_last (after_sources, on error retry)
+
+# platform.bootstrap_order(): the cluster bundle's; an analyst reads none of it
+statement ok
+ACL ADMIN CREATE ROLE ops;
+
+statement ok
+ACL ADMIN GRANT ADMIN cluster TO ROLE ops;
+
+query I
+ACL ROLE 'ops' SELECT count(*) FROM platform.bootstrap_order();
+----
+5
+
+statement error
+ACL ROLE 'analyst' SELECT count(*) FROM platform.bootstrap_order();
+----
