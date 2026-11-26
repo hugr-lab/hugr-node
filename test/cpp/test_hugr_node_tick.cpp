@@ -208,5 +208,24 @@ int main(int argc, char *argv[]) {
 			idle.idle_seconds = 0;
 			Check(!DecideIdleDetach(idle), "LAZY without IDLE: never detached by itself");
 		});
+
+		// spec 047: a script runs at a boot - written, changed or dropped after it, it waits for the restart
+		Scenario("a script is a restart's", [&] {
+			const std::string RAN = R"({"place":"after_sources","sql":"SELECT 1"})";
+			const std::string CHANGED = R"({"place":"after_sources","sql":"SELECT 2"})";
+			TickTaken taken = {{{"script", "10_ran"}, RAN}, {{"script", "20_dropped"}, RAN}};
+			std::vector<TickItem> items = {
+			    {"script", "10_ran", RAN}, {"script", "15_changed", CHANGED}, {"script", "30_new", RAN}};
+			taken[{"script", "15_changed"}] = RAN;
+			auto decision = DecideTick(items, {}, taken);
+			Check(decision.apply.empty() && decision.detach.empty(), "a script is never applied live");
+			Check(!Has(decision.pending, "script", "10_ran", "restart"), "the script the node ran, unchanged: nothing");
+			Check(Has(decision.pending, "script", "15_changed", "restart"), "a changed script waits for a restart");
+			Check(Has(decision.pending, "script", "30_new", "restart"), "a script written after the boot too");
+			Check(Has(decision.pending, "script", "20_dropped", "restart"), "and a script dropped after it");
+			Check(decision.needs_restart, "the node says it needs a restart");
+			auto none = DecideTick({{"script", "10_ran", RAN}}, {}, {{{"script", "10_ran"}, RAN}});
+			Check(none.pending.empty() && !none.needs_restart, "the scripts it ran, as the profile has them: nothing");
+		});
 	});
 }

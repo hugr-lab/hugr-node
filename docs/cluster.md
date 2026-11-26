@@ -216,11 +216,15 @@ ACL CLUSTER ADD SCRIPT 30_views AFTER SOURCES
   | --- | --- | --- |
   | `FAIL NODE` (default before and after the sources) | the bootstrap stops, naming the script; the node never serves | the same at boot; once the node serves, it holds the source as `DETACH SOURCE` does |
   | `CONTINUE` | logged, and the boot goes on | the source stays attached, as the script left it |
-  | `DETACH SOURCE` (default after a source) | refused | the source is detached and the node serves without it until its profile changes or the node restarts; a lazy source's read is refused (`could not be attached (its script failed)`) and the next read tries again |
-  | `RETRY` | after the sources only (refused before them: nothing serves on an initialisation still pending); the node serves, and the tick retries it from 10 s, doubling, up to 5 min | the source stays detached, and each try attaches it and runs the script again |
+  | `DETACH SOURCE` (default after a source) | refused | the source is detached and the node serves without it until it or its scripts change in the profile (then the next tick attaches it again) or the node restarts; a lazy source's read is refused (`could not be attached (its script failed)`) and the next read tries again; a source that `DEPENDS ON` it is held with it |
+  | `RETRY` | after the sources only (refused before them: nothing serves on an initialisation still pending); the place's other scripts run on, the node serves, and the tick retries it from 10 s, doubling, up to 5 min | the source stays detached, and each try attaches it and runs the script again |
 
   The log names every run, `hugr_node: script <name> (<place>) ran | failed (<class>)`, never its text or its error's
-  message. A script failing now is listed by the heartbeat as pending, class `error`.
+  message. A script failing now is listed by the heartbeat as pending, class `error`, which never holds back the
+  profile's version as applied. On a serving node an eager source the tick attaches is visible from its ATTACH until
+  its scripts end; a lazy source's attach and scripts run under the lock its readers wait on.
+- **It is the node's power**: whoever writes scripts (the `cluster` bundle) can, through one, do anything the node
+  can - grant themselves `passthrough`, write the policy. Give that bundle to whom you would give passthrough.
 - **A changed script applies at a restart.** A new, changed or dropped script is a restart item, like a setting:
   running nodes keep what they ran, and the node reports it pending until it restarts (the orchestrator rolls it).
 - **A source holds the scripts that follow it**: `CLUSTER DETACH` of it is refused while one does, and `CASCADE` drops
@@ -237,7 +241,8 @@ a node's whole bootstrap in its order, as `(pos, step, sql)`. Step 6 is expanded
 - each source, followed by its scripts (a lazy source marked as attached on demand);
 - the scripts after the sources.
 
-Each script row names its place and its `ON ERROR`, and carries its SQL. The other steps are the node's own, from the
+Each script row names its place and its `ON ERROR`, and carries its SQL; a lazy source's scripts are marked "at its
+attach". The listing shows the profile as it is now - a node runs what it held at its boot, until it restarts. The other steps are the node's own, from the
 document it booted with (names and paths only, never a credential). A document given as the argument is listed
 instead, and a node that did not boot (a test) lists step 6 alone. The bootstrap walks the same order, so the listing
 is what a node runs.

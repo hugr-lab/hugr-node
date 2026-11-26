@@ -75,8 +75,10 @@ vector<PolicyStore::ClusterItem> ClusterScriptsIn(const vector<PolicyStore::Clus
                                                   const string &source = string());
 //! '' when the script ran, else its error's class (logged with its name and place)
 string RunClusterScript(DatabaseInstance &db, const PolicyStore::ClusterItem &script);
-//! every script at a place (a source's for after_source); false at the first whose policy stops (not continue)
-bool RunClusterScripts(DatabaseInstance &db, const string &place, const string &source, ClusterScriptFailure &failure);
+//! every script at a place (a source's for after_source); false at the first whose policy stops (not continue). With
+//! `queued`, a RETRY failure is queued there and the place goes on (the scripts after the sources)
+bool RunClusterScripts(DatabaseInstance &db, const string &place, const string &source, ClusterScriptFailure &failure,
+                       vector<ClusterScriptFailure> *queued = nullptr);
 
 //! spec 118: a setting the cluster bundle may put in the profile - the node's resources and tuning (an
 //! allowlist); a data path, a trust or audit setting and anything else is passthrough's

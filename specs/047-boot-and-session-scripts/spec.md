@@ -75,14 +75,20 @@ The bootstrap's step 6 applies the profile. Scripts join it in their places:
 | --- | --- | --- |
 | `FAIL NODE` (default for `BEFORE` / `AFTER SOURCES`) | the bootstrap fails and the node never serves: the pod is not ready, and its log names the script | the same |
 | `CONTINUE` | a log line and an event, then boot goes on | the source stays attached, uninitialised: the administrator's choice |
-| `DETACH SOURCE` (default for `AFTER SOURCE`) | not allowed | the source is detached and the node serves without it. Its readers get the "could not be attached" refusal of a lazy source; the next tick tries again |
-| `RETRY` | `AFTER SOURCES` only (refused for `BEFORE SOURCES`, the owner: nothing serves on an initialisation still pending): the node serves, and the script is retried at each tick with a backoff up to 5 min until it passes | the source is detached until its script passes, and each try attaches it and runs the script again |
+| `DETACH SOURCE` (default for `AFTER SOURCE`) | not allowed | the source is detached and the node serves without it, held until the source or its scripts change in the profile (the next tick then attaches it and runs its scripts as they are), or the node restarts. A lazy source's reader gets "could not be attached (its script failed)", and its next reader tries again; an eager source's reader gets the source's own catalog error. A source that `DEPENDS ON` a held one is held with it |
+| `RETRY` | `AFTER SOURCES` only (refused for `BEFORE SOURCES`, the owner: nothing serves on an initialisation still pending): the script is queued for the tick and the place's other scripts run on; the node serves, and the tick retries it (10 s, doubling, up to 5 min) until it passes, or until the profile changes or drops it | the source is detached until its script passes, and each try attaches it and runs the script again |
 
 - **Each run is a log line**: `hugr_node: script <name> (<place>) ran | failed (<class>)`. It never carries the text,
   which may name things, nor the error's message, which a source's may fill with its connection string.
 - **The heartbeat carries what fails now** as pending items of class `error`: a source a script holds detached, an
   `AFTER SOURCES` script awaiting its retry. A restart does not mend them, so they do not count toward
   `needs_restart`. The group's status showing them is hugr-platform's part (stage 4).
+- **A hold is never a block.** A source held detached is reported, and the node still records the profile's version
+  as applied: the rest holds, and a restart does not mend it.
+- **A failed DETACH** (the source in use): the node keeps it as attached and reports it pending a drain.
+- **The tick's attach is not gated.** On a serving node, an eager source the tick attaches (a new one, a `RETRY`'s next
+  try) is visible from its ATTACH until its scripts end. A lazy source is gated: its attach and its scripts run under
+  the lock every reader takes. At boot nothing serves until step 8.
 - **Once the node serves**, `FAIL NODE` after a source cannot stop it. At a later attach (the tick's, a lazy one) it
   holds the source detached, as `DETACH SOURCE` does.
 - **`RETRY`'s backoff** starts at 10 s and doubles, up to 5 min.
@@ -137,7 +143,13 @@ The bootstrap's step 6 applies the profile. Scripts join it in their places:
   holds before the principal's first statement, and it is written by the `cluster` bundle, not by the principal.
 - **No secret in the text.** The profile's lint does not apply to a script (the owner: unchecked), so the docs say
   it: credentials go into the secrets service, and a script names them (`SECRET s`).
-- **Every run is an event**; a failing script is in the status. Nothing a script does is hidden from the audit.
+- **Every run is a log line** naming the script, its place and the error's class, and a failing script is in the
+  heartbeat's pending list. An audit event per run is a follow-up.
+- **A script can raise its writer's rights.** It runs as the node, so a `cluster` bundle holder can, through a
+  script, do what passthrough does: grant themselves `passthrough` (`acl_grant_admin`) or write the policy catalog.
+  An `AFTER SOURCE` script on a lazy source runs at the next read of it, not at a restart, so this is immediate. It
+  is the owner's decision (a script is the node's own power, and the `cluster` bundle writes it); whoever holds
+  that bundle is trusted like passthrough.
 
 ## Testing
 
@@ -191,7 +203,20 @@ The bootstrap's step 6 applies the profile. Scripts join it in their places:
   - step 6 is expanded by `WalkProfileOrder`, the one function the bootstrap walks too;
   - the other steps come from the document the node booted with (`BootRecord`).
 
-  `hugr_node_profile_statements()` follows the same order.
+  `hugr_node_profile_statements()` follows the same order. A lazy source's scripts are marked "at its attach". The
+  listing shows the profile as it is now; a node runs what it held at its boot, and the change is pending until it
+  restarts.
+- **Found by its review, fixed:**
+  - a `RETRY` failure after the sources stopped the place's later scripts for the node's life;
+  - a failed DETACH was ignored and the source stayed attached and untracked;
+  - a hold outlived its source or its script, so a re-added source never attached;
+  - a hold blocked the profile's version as applied;
+  - a source depending on a held one failed the boot;
+  - the listing showed a lazy source's scripts as boot steps;
+  - the e2e's label check passed on no rows.
+
+  Tests added: `DecideTick`'s script rule (`test/cpp/test_hugr_node_tick.cpp`), and in the e2e a `RETRY` after the
+  sources queued while the place goes on.
 - **Docs**: `docs/cluster.md`, "Scripts" and "The bootstrap, one listing".
 
 ## Stages

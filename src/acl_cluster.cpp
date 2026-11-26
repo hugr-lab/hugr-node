@@ -609,7 +609,8 @@ string RunClusterScript(DatabaseInstance &db, const PolicyStore::ClusterItem &sc
 	return error;
 }
 
-bool RunClusterScripts(DatabaseInstance &db, const string &place, const string &source, ClusterScriptFailure &failure) {
+bool RunClusterScripts(DatabaseInstance &db, const string &place, const string &source, ClusterScriptFailure &failure,
+                       vector<ClusterScriptFailure> *queued) {
 	for (auto &script : ClusterScriptsAt(db, place, source)) {
 		auto error = RunClusterScript(db, script);
 		if (error.empty()) {
@@ -617,6 +618,10 @@ bool RunClusterScripts(DatabaseInstance &db, const string &place, const string &
 		}
 		auto policy = ClusterScriptField(script, "on_error");
 		if (policy == "continue") {
+			continue;
+		}
+		if (policy == "retry" && queued) {
+			queued->push_back({script.name, policy, error}); // retried by itself; the place goes on
 			continue;
 		}
 		failure = {script.name, policy, error};
@@ -728,7 +733,12 @@ void AttachLazySource(DatabaseInstance &db, const string &alias) {
 	ClusterScriptFailure failure;
 	if (!RunClusterScripts(db, "after_source", item.name, failure)) {
 		Connection undo(db);
-		undo.Query("DETACH " + Ident(item.name));
+		auto detached = undo.Query("DETACH " + Ident(item.name));
+		if (detached->HasError()) {
+			fprintf(stderr, "hugr_node: lazy source %s could not be detached after its script failed (%s)\n",
+			        item.name.c_str(), Exception::ExceptionTypeToString(detached->GetErrorType()).c_str());
+			fflush(stderr);
+		}
 		throw InvalidInputException("acl: a source this statement reads could not be attached (its script failed)");
 	}
 	source->last_use = std::chrono::steady_clock::now();
@@ -1336,9 +1346,10 @@ PolicyStore::ClusterAnswer PolicyStore::ClusterAttach(const string &scope, const
 		    ClusterScriptFailure failure;
 		    if (!RunClusterScripts(*db, "after_source", alias, failure)) {
 			    Connection undo(*db);
-			    undo.Query("DETACH " + Ident(alias));
-			    answer.note = "script " + failure.name + " after it failed here (" + failure.error_class +
-			                  ") - detached on this node";
+			    auto detached = undo.Query("DETACH " + Ident(alias));
+			    answer.note =
+			        "script " + failure.name + " after it failed here (" + failure.error_class + ") - " +
+			        (detached->HasError() ? "and it could not be detached here (in use)" : "detached on this node");
 			    return;
 		    }
 		    answer.applied_here = true;

@@ -997,10 +997,20 @@ vector<PlanStep> ProfileOrder(const vector<acl::PolicyStore::ClusterItem> &effec
 		    }
 	    },
 	    [&](const string &place, const string &source) {
+		    // a lazy source's scripts run at its attach on demand, not here
+		    bool at_attach = false;
+		    for (auto &item : effective) {
+			    int64_t idle_seconds = 0;
+			    if (item.kind == "source" && StringUtil::CIEquals(item.name, source) &&
+			        acl::ClusterSourceLazy(item, idle_seconds)) {
+				    at_attach = true;
+			    }
+		    }
 		    for (auto &script : acl::ClusterScriptsIn(effective, place, source)) {
 			    out.push_back({"6 profile: script " + script.name + " (" + place +
 			                       (source.empty() ? "" : " " + source) + ", on error " +
-			                       acl::ClusterScriptField(script, "on_error") + ")",
+			                       acl::ClusterScriptField(script, "on_error") + (at_attach ? ", at its attach" : "") +
+			                       ")",
 			                   acl::ClusterScriptField(script, "sql")});
 		    }
 	    });
@@ -1362,6 +1372,31 @@ void Backoff(TickState::Held &held) {
 	held.next_try = std::chrono::steady_clock::now() + std::chrono::seconds(held.backoff_s);
 }
 
+//! spec 047: what a held source is held for - its identity and the scripts after it; a change of either lets it go
+//! (the source attached again with its scripts as they are now); '' when the profile has no such source
+string HoldSignature(const vector<acl::PolicyStore::ClusterItem> &items, const string &alias) {
+	for (auto &item : items) {
+		if (item.kind == "source" && StringUtil::CIEquals(item.name, alias)) {
+			auto out = acl::ClusterSourceIdentity(item.spec);
+			for (auto &script : acl::ClusterScriptsIn(items, "after_source", item.name)) {
+				out += "|" + StringUtil::Lower(script.name) + "=" + script.spec;
+			}
+			return out;
+		}
+	}
+	return string();
+}
+
+//! spec 047: an AFTER SOURCES script queued for its retry, still the profile's as it was
+bool ScriptStill(const vector<acl::PolicyStore::ClusterItem> &items, const string &name, const string &spec) {
+	for (auto &item : items) {
+		if (item.kind == "script" && StringUtil::Lower(item.name) == name) {
+			return item.spec == spec;
+		}
+	}
+	return false;
+}
+
 //! an item as the tick reads it: an extension by its canonical name (`postgres` is loaded as `postgres_scanner`)
 TickItem TickItemOf(const acl::PolicyStore::ClusterItem &item) {
 	auto name = item.kind == "extension" ? ExtensionHelper::ApplyExtensionAlias(item.name) : item.name;
@@ -1467,20 +1502,24 @@ void Converge(DatabaseInstance &db, acl::PolicyStore &store, const AgentEnvironm
 	}
 	bool hot_failed = false;
 	auto now = std::chrono::steady_clock::now();
+	// spec 047: a hold or a retry the profile no longer backs goes - the source or its scripts changed or left, the
+	// script changed or left - and the item is then applied as the profile has it now
+	for (auto it = state.held.begin(); it != state.held.end();) {
+		it = HoldSignature(items, it->first) == it->second.spec ? std::next(it) : state.held.erase(it);
+	}
+	for (auto it = state.scripts_retry.begin(); it != state.scripts_retry.end();) {
+		it = ScriptStill(items, it->first, it->second.spec) ? std::next(it) : state.scripts_retry.erase(it);
+	}
 	for (auto index : decision.apply) {
 		auto &item = items[index];
 		// spec 047: a source its script holds detached - until its spec changes (DETACH SOURCE), or its next try
 		// (RETRY)
 		if (item.kind == "source") {
 			auto held = state.held.find(StringUtil::Lower(item.name));
-			if (held != state.held.end()) {
-				if (held->second.spec != tick_items[index].spec) {
-					state.held.erase(held); // re-pointed: a new source, its scripts run again
-				} else if (!held->second.retry || now < held->second.next_try) {
-					decision.pending.push_back({item.kind, item.name, "error", held->second.why});
-					hot_failed = true;
-					continue;
-				}
+			if (held != state.held.end() && (!held->second.retry || now < held->second.next_try)) {
+				// reported, never a block on the version applied: the rest of the profile holds
+				decision.pending.push_back({item.kind, item.name, "error", held->second.why});
+				continue;
 			}
 		}
 		auto error = ApplyHot(db, item, env.pod);
@@ -1495,17 +1534,24 @@ void Converge(DatabaseInstance &db, acl::PolicyStore &store, const AgentEnvironm
 			acl::ClusterScriptFailure failure;
 			if (!acl::RunClusterScripts(db, "after_source", item.name, failure)) {
 				// once serving, FAIL NODE holds the source as DETACH SOURCE does: the node stays up without it
+				auto why = "script " + failure.name + " failed (" + failure.error_class + ")";
 				Connection con(db);
-				con.Query("DETACH " + Ident(item.name));
+				auto detached = con.Query("DETACH " + Ident(item.name));
+				if (detached->HasError()) {
+					// in use: the node keeps it as attached (taken) and it goes with a drain
+					state.taken[TickKeyOf(tick_items[index])] = tick_items[index].spec;
+					decision.pending.push_back({item.kind, item.name, "drain", why + "; in use, not detached"});
+					Log("tick: source " + item.name + " - " + why + ", and in use: not detached");
+					continue;
+				}
 				auto &held = state.held[StringUtil::Lower(item.name)];
-				held.spec = tick_items[index].spec;
+				held.spec = HoldSignature(items, item.name);
 				held.retry = failure.policy == "retry";
-				held.why = "script " + failure.name + " failed (" + failure.error_class + ")";
+				held.why = why;
 				if (held.retry) {
 					Backoff(held);
 				}
 				decision.pending.push_back({item.kind, item.name, "error", held.why});
-				hot_failed = true;
 				Log("tick: source " + item.name + " detached - " + held.why);
 				continue;
 			}
@@ -1822,7 +1868,22 @@ string RunPragma(ClientContext &context, const FunctionParameters &parameters) {
 	// the sources, each source followed by its scripts, the scripts after the sources
 	auto scripts_at = [&](const string &place, const string &source) {
 		acl::ClusterScriptFailure failure;
-		if (acl::RunClusterScripts(db, place, source, failure)) {
+		vector<acl::ClusterScriptFailure> queued;
+		bool passed = acl::RunClusterScripts(db, place, source, failure, place == "after_sources" ? &queued : nullptr);
+		// RETRY after the sources: the node serves, the tick tries each again; the place's other scripts ran
+		for (auto &retry : queued) {
+			auto &held = tick.scripts_retry[StringUtil::Lower(retry.name)];
+			held.retry = true;
+			held.why = "script " + retry.name + " failed (" + retry.error_class + ")";
+			for (auto &item : effective) {
+				if (item.kind == "script" && StringUtil::CIEquals(item.name, retry.name)) {
+					held.spec = item.spec;
+				}
+			}
+			Backoff(held);
+			Log("step 6 profile: " + held.why + " - retried by the tick");
+		}
+		if (passed) {
 			return true;
 		}
 		if (failure.policy == "fail_node") {
@@ -1830,14 +1891,6 @@ string RunPragma(ClientContext &context, const FunctionParameters &parameters) {
 			    "hugr_node: bootstrap step 6 profile: script %s (%s) failed (%s) - its ON ERROR "
 			    "FAIL NODE stops the node",
 			    failure.name, place, failure.error_class);
-		}
-		if (place == "after_sources") { // RETRY: the node serves, the tick tries it again
-			auto &held = tick.scripts_retry[StringUtil::Lower(failure.name)];
-			held.retry = true;
-			held.why = "script " + failure.name + " failed (" + failure.error_class + ")";
-			Backoff(held);
-			Log("step 6 profile: " + held.why + " - retried by the tick");
-			return true;
 		}
 		auto &held = tick.held[StringUtil::Lower(source)];
 		held.retry = failure.policy == "retry";
@@ -1855,6 +1908,21 @@ string RunPragma(ClientContext &context, const FunctionParameters &parameters) {
 	WalkProfileOrder(
 	    effective,
 	    [&](const acl::PolicyStore::ClusterItem &item) {
+		    if (item.kind == "source") {
+			    // what loads through a source a script holds detached is held with it (its ATTACH would fail)
+			    for (auto &dependency : item.depends_on) {
+				    auto held = tick.held.find(StringUtil::Lower(dependency));
+				    if (held != tick.held.end()) {
+					    auto &own = tick.held[StringUtil::Lower(item.name)];
+					    own.retry = held->second.retry;
+					    own.next_try = held->second.next_try;
+					    own.why = "it depends on " + dependency + ", held: " + held->second.why;
+					    own.spec = HoldSignature(effective, item.name);
+					    Log("step 6 profile: source " + item.name + " not attached - " + own.why);
+					    return;
+				    }
+			    }
+		    }
 		    bool cut = false;
 		    for (auto &sql : ProfileItemStatements(item, env.pod, cut)) {
 			    RunStep(db, "6 profile: " + item.kind + " " + item.name, sql);
@@ -1884,13 +1952,10 @@ string RunPragma(ClientContext &context, const FunctionParameters &parameters) {
 		    RunStep(db, "6 profile: source " + source + " detached", "DETACH " + Ident(source));
 		    tick.taken.erase({"source", TickLower(source)});
 		    auto &held = tick.held[StringUtil::Lower(source)];
-		    for (auto &item : effective) {
-			    if (item.kind == "source" && StringUtil::CIEquals(item.name, source)) {
-				    held.spec = TickItemOf(item).spec;
-			    }
-		    }
+		    held.spec = HoldSignature(effective, source);
 		    Log("step 6 profile: source " + source + " detached - " + held.why +
-		        (held.retry ? ", retried by the tick" : ", held until its profile changes or the node restarts"));
+		        (held.retry ? ", retried by the tick"
+		                    : ", held until it or its scripts change in the profile, or the node restarts"));
 	    });
 	for (auto &item : effective) {
 		if (item.kind == "script") {

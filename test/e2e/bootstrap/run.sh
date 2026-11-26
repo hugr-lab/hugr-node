@@ -265,7 +265,8 @@ ACL ADMIN CLUSTER ATTACH ':memory:' AS e2e_src (TYPE duckdb);
 -- spec 047: the scripts in their places - the last reads what the one after e2e_src wrote
 ACL ADMIN CLUSTER ADD SCRIPT 10_first BEFORE SOURCES AS 'SET GLOBAL preserve_insertion_order = true';
 ACL ADMIN CLUSTER ADD SCRIPT 20_after_src AFTER SOURCE e2e_src AS 'CREATE TABLE e2e_src.main.marked AS SELECT getvariable(''acl_node_label'') IS NOT NULL AS labelled';
-ACL ADMIN CLUSTER ADD SCRIPT 30_last AFTER SOURCES AS 'SELECT * FROM e2e_src.main.marked WHERE labelled';
+ACL ADMIN CLUSTER ADD SCRIPT 25_retry AFTER SOURCES AS 'SELECT * FROM e2e_later' ON ERROR RETRY;
+ACL ADMIN CLUSTER ADD SCRIPT 30_last AFTER SOURCES AS 'SELECT CASE WHEN (SELECT labelled FROM e2e_src.main.marked) THEN 1 ELSE error(''unlabelled'') END';
 SELECT 'version:' || acl_cluster_version();
 EOF
 "$DUCKDB" -no-agent -unsigned -bail -csv -noheader <"$TMP/seed.sql" >"$TMP/seed.log" 2>&1 || true
@@ -363,7 +364,11 @@ last="$(grep -n 'script 30_last (after_sources) ran' "$TMP/node.log" | cut -d: -
 	grep 'script \|step 6' "$TMP/node.log" >&2
 	fail "the profile's scripts did not run in their places"
 }
-echo "ok: the scripts ran in their places - before the sources, after e2e_src (its write read by the last), after the sources"
+grep -q 'script 25_retry (after_sources) failed' "$TMP/node.log" && grep -q 'script 25_retry failed (.*) - retried by the tick' "$TMP/node.log" || {
+	grep 'script \|step 6' "$TMP/node.log" >&2
+	fail "the RETRY script after the sources was not queued for the tick"
+}
+echo "ok: the scripts ran in their places - before the sources, after e2e_src (its write, with the node's label, read by the last), after the sources; a RETRY there failed, was queued, and the place went on"
 port_open || fail "the Flight port is not open"
 echo "ok: the node serves Flight on localhost:$FLIGHT_PORT"
 # spec 043: the load report is served over the Handshake, and only to a bearer holding observe - a Handshake without
@@ -433,6 +438,7 @@ NODE_PID=""
 	fail "a failed FAIL NODE script did not stop the bootstrap (exit $status)"
 }
 script_sql "ACL ADMIN CLUSTER DROP SCRIPT 05_broken;"
+script_sql "ACL ADMIN CLUSTER DROP SCRIPT 25_retry;" # the later nodes boot with nothing pending
 echo "ok: a script whose ON ERROR is FAIL NODE failed, and the node never served"
 
 # --- spec 010: the orchestrated entry - two nodes, one catalog, a fake orchestrator ---------------------------------------
