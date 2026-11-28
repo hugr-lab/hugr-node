@@ -274,7 +274,8 @@ The class says how each kind of change reaches a running node:
 | `UPDATE` / `REMOVE EXTENSION`, `SET` / `RESET` | restart |
 
 duckdb cannot unload an extension from a running process. A node's configuration is locked after its
-bootstrap. Each node applies hot changes on its own tick and reports drain and restart changes pending
+bootstrap, but for what a client may SET on its own session (duckdb-acl spec 068: `TimeZone`, `Calendar`, the trace
+and lineage context, a lower `acl_metadata_max_rows`), which the lock leaves open (spec 048). Each node applies hot changes on its own tick and reports drain and restart changes pending
 in its heartbeat; the orchestrator rolls the nodes (hugr-node spec 010, hugr-platform spec 001).
 
 - **No credentials, anywhere.** A path with a credential key is refused. That covers a conninfo
@@ -282,7 +283,7 @@ in its heartbeat; the orchestrator rolls the nodes (hugr-node spec 010, hugr-pla
   key (`ENCRYPTION_KEY` too). A postgres, mysql, mssql or hugr ([another platform](federation.md)) source - by its
   `TYPE`, or by its path's prefix without one (`'postgres:dbname=…'`) - must name a `SECRET`, and the node resolves
   it from its secrets service. The refusal names the key, never its value.
-- **The node's hardening is not a profile item.** `allow_unsigned_extensions`, `lock_configuration`,
+- **The node's hardening is not a profile item.** `allow_unsigned_extensions`, `lock_configuration`, `allowed_configs`,
   `allow_persistent_secrets`, `allow_extension_repositories`, the extension and secret directories
   and the like are refused - and (spec 118) the node's trust: `acl_allow_anonymous_admin`, the quack door's
   `acl_quack_authentication_function` / `acl_quack_authorization_function`,

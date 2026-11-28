@@ -35,6 +35,7 @@ SELECT step, sql FROM hugr_node_bootstrap_plan('{"version": 1, "node_group": "an
 5 policy catalog	SET GLOBAL acl_node_group = 'analytics'
 5 policy catalog	SELECT acl_use_db('hugr_policy', 'acl')
 6 profile	-- each item of acl_cluster_effective() in its order: hugr_node_profile_statements()
+7 lock	SET GLOBAL allowed_configs = ['TimeZone', 'Calendar', 'acl_metadata_max_rows', 'acl_correlation_id', 'acl_traceparent', 'acl_lineage_parent', 'acl_lineage_root_parent', 'acl_lineage_job']
 7 lock	SET GLOBAL lock_configuration = true
 8 serve	SELECT acl_cluster_applied(<the profile version read in step 6>)
 8 serve	SELECT acl_flight_serve('grpc+tls://0.0.0.0:32010', '/etc/hugr/tls.crt', '/etc/hugr/tls.key')
@@ -176,6 +177,7 @@ SELECT step, sql FROM hugr_node_bootstrap_plan('{"version": 2, "node_group": "et
 6 engine	SET GLOBAL threads = '16'
 6 engine	SET GLOBAL max_temp_directory_size = '552960MiB'
 6 profile	-- each item of acl_cluster_effective() in its order: hugr_node_profile_statements()
+7 lock	SET GLOBAL allowed_configs = ['TimeZone', 'Calendar', 'acl_metadata_max_rows', 'acl_correlation_id', 'acl_traceparent', 'acl_lineage_parent', 'acl_lineage_root_parent', 'acl_lineage_job']
 7 lock	SET GLOBAL lock_configuration = true
 8 serve	SELECT acl_cluster_applied(<the profile version read in step 6>)
 8 serve	SELECT acl_flight_serve('grpc+tls://0.0.0.0:32010', '/tls/tls.crt', '/tls/tls.key')

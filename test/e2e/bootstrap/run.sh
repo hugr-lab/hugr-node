@@ -790,11 +790,13 @@ echo "ok: the first node on an empty catalog wrote the first policy and serves"
 LAZY_ADBC=""
 python3 -c 'import adbc_driver_flightsql.dbapi' 2>/dev/null && LAZY_ADBC=1
 cat >"$TMP/flight_sql.py" <<'PY'
-import sys
+import os, sys
 import adbc_driver_flightsql.dbapi as flightsql
 port, token = sys.argv[1:3]
-con = flightsql.connect("grpc://localhost:" + port,
-                        db_kwargs={"adbc.flight.sql.authorization_header": "Bearer " + token}, autocommit=True)
+kwargs = {"adbc.flight.sql.authorization_header": "Bearer " + token}
+if os.environ.get("FLIGHT_SESSION"):  # the node's cookie kept: every statement on one session of the client's own
+    kwargs["adbc.flight.sql.rpc.with_cookie_middleware"] = "true"
+con = flightsql.connect("grpc://localhost:" + port, db_kwargs=kwargs, autocommit=True)
 for sql in sys.argv[3:]:
     cur = con.cursor()
     try:
@@ -825,6 +827,14 @@ if [ -n "$LAZY_ADBC" ]; then
 		"SELECT state FROM platform.drift WHERE name = 'e2e_lazy'")"
 	[[ "$got" != *ERROR* && "$got" == *same ]] ||
 		fail "a policy write over the lazy source did not have it attached on node a: $got"
+fi
+# spec 048: the node locked its configuration at step 7 - a client still SETs what spec 068 leaves it, on its session
+if [ -n "$LAZY_ADBC" ]; then
+	# a SET answers no row, a refusal its ERROR line; the zone is read back as a TIMESTAMPTZ renders in it
+	got="$(FLIGHT_SESSION=1 admin_sql "$FLIGHT_A_PORT" "SET TimeZone = 'Asia/Tokyo'" "SET acl_correlation_id = 'e2e-048'" \
+		"SELECT CAST(TIMESTAMPTZ '2026-01-01 00:00:00+00' AS VARCHAR)")"
+	[ "$got" = "2026-01-01 09:00:00+09" ] || fail "a client's SET of its own session settings on a locked node: $got"
+	echo "ok: on a locked node a client SETs its session's TimeZone and correlation id"
 fi
 start_orchestrated_node b "$FLIGHT_B_PORT" "$TMP/node-b-first.log"
 grep_ready() { grep -q 'hugr_node: ready' "$TMP/node-b-first.log"; }

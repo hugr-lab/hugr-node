@@ -235,6 +235,12 @@ ACL ADMIN CLUSTER SET lock_configuration = true;
 ----
 <REGEX>:.*node's hardening.*
 
+# spec 048: what the lock leaves open is the bootstrap's - a profile item could otherwise open any setting after it
+statement error
+ACL ADMIN CLUSTER SET allowed_configs = 'enable_external_access';
+----
+<REGEX>:.*node's hardening.*
+
 # spec 006: which certificates the node trusts and where code may come from are its bootstrap's (found 2026-10-15:
 # ca_cert_file was missing, so a profile item could hand every node a new CA)
 foreach name ca_cert_file autoinstall_known_extensions autoload_known_extensions custom_extension_repository autoinstall_extension_repository tresor_http_client CA_CERT_FILE
