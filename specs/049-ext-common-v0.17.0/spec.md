@@ -12,13 +12,19 @@ unless the three copies of `contracts/*` (and, for tresor, `oidc/include/*`) are
 `tresor_audit.hpp`.
 
 - **duckdb-acl** d2388a3 → 3bcb862, its spec 184 (#325): the submodule only, no code.
-- **tresor** 9958f06 → f6cbfd0, its spec 048 (#93, #94): computed parameters. A secret declares an operation, and
+- **tresor** 9958f06 → 199671e: its spec 048 (#93, #94), computed parameters, then its tests in DuckDB 2.0's
+  sqllogictest syntax (#95) and spec 024's addendum (#97, below). A secret declares an operation, and
   `unwrap` (a SQL Server backup's content key) runs in the secrets service with the key in a KMS; a consumer such as
   mssql reaches it through `secret_compute` without naming tresor. A new translation unit, `tresor_mint.cpp`, comes in
   through tresor's own source list. `corp.mint(…)` is a function of the tresor catalog: under a principal it is the
   function gate's, as `corp.whoami()` is (duckdb-acl spec 082). The operator grants it by a category or by name.
 - **acl-otel** 3916552 → 650651d, its spec 028 (#59): the submodule only, and its Marquez e2e in acl's spec 158
   column model. A tresor event's new kind, `mint`, is passed through as an attribute.
+
+- **Found here**: the shared-header check in `tresor_sources.cmake` globbed `contracts/*` with directories, and
+  v0.17.0 adds `contracts/test/`. On Linux `file(SHA256)` of a directory fails, so this PR's first CI run failed to
+  configure; macOS hashes a directory as an empty file, so the local build passed. tresor #97 lists files only, as
+  acl-otel's check already did.
 
 No setting is added to the node, and nothing changes in the cluster profile, the hardening list or the never set.
 Schema stays v29, `min_reader` 28. duckdb stays v2.0.0.
