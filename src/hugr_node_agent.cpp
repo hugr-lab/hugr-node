@@ -18,6 +18,7 @@
 #include "acl_node_label.hpp"
 #include "acl_platform.hpp"
 #include "acl_result_rows.hpp"
+#include "acl_session_state.hpp"
 #include "hugr_node_extension.hpp"
 #include "hugr_node_tick.hpp"
 #include "duckdb/common/exception.hpp"
@@ -751,6 +752,19 @@ vector<PlanStep> EngineSteps(const AgentEnvironment &env) {
 	return steps;
 }
 
+//! spec 048: the lock leaves a client what spec 068 lets it SET on its own session - acl's one list (the session
+//! state's PORTABLE_SETTINGS, what a moved session carries) and nothing more: without it a locked node refused a
+//! client's SET TimeZone. duckdb's lock knows no scope, so the list is open to SET GLOBAL too - by whoever runs SQL as
+//! the node
+vector<PlanStep> LockSteps() {
+	string names;
+	for (auto name : acl::PORTABLE_SETTINGS) {
+		names += (names.empty() ? "" : ", ") + Quoted(name);
+	}
+	return {{"7 lock", "SET GLOBAL allowed_configs = [" + names + "]"},
+	        {"7 lock", "SET GLOBAL lock_configuration = true"}};
+}
+
 vector<PlanStep> ServeSteps(const AgentEnvironment &env, const string &quack_token) {
 	vector<PlanStep> steps;
 	auto flight = env.flight_cert.empty() ? "SELECT acl_flight_serve(" + Quoted(env.flight) + ")"
@@ -854,7 +868,9 @@ vector<PlanStep> BootstrapPlan(const AgentEnvironment &env_p, const BootstrapDoc
 	}
 	plan.push_back(
 	    {"6 profile", "-- each item of acl_cluster_effective() in its order: hugr_node_profile_statements()"});
-	plan.push_back({"7 lock", "SET GLOBAL lock_configuration = true"});
+	for (auto &step : LockSteps()) {
+		plan.push_back(step);
+	}
 	plan.push_back({"8 serve", "SELECT acl_cluster_applied(<the profile version read in step 6>)"});
 	for (auto &step : ServeSteps(env, quack_token)) {
 		plan.push_back(step);
@@ -1962,7 +1978,9 @@ string RunPragma(ClientContext &context, const FunctionParameters &parameters) {
 			take(item); // a change of it is a restart's (the owner): the tick lists it pending
 		}
 	}
-	RunStep(db, "7 lock", "SET GLOBAL lock_configuration = true");
+	for (auto &step : LockSteps()) {
+		RunStep(db, step.step, step.sql);
+	}
 	RunStep(db, "8 serve", "SELECT acl_cluster_applied(" + std::to_string(version) + ")");
 	tick.applied = version;
 

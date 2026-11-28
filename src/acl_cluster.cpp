@@ -73,9 +73,10 @@ const case_insensitive_set_t CREDENTIAL_KEYS = {"password",
 //! The node's hardening, fixed by its bootstrap - never a profile item
 const case_insensitive_set_t HARDENING_SETTINGS = {
     "allow_unsigned_extensions", "allow_community_extensions", "allow_extension_repositories",
-    "allow_persistent_secrets", "allow_unredacted_secrets", "lock_configuration", "extension_repository_directory",
-    "allow_parser_override_extension", "enable_external_access", "secret_directory", "extension_directory",
-    "extension_directories", "home_directory", "acl_observe_unauthenticated", "allowed_directories", "allowed_paths",
+    "allow_persistent_secrets", "allow_unredacted_secrets", "lock_configuration", "allowed_configs",
+    "extension_repository_directory", "allow_parser_override_extension", "enable_external_access", "secret_directory",
+    "extension_directory", "extension_directories", "home_directory", "acl_observe_unauthenticated",
+    "allowed_directories", "allowed_paths",
     // spec 118 review: the node's trust - who authorizes a door's
     // statement, whether the anonymous hatch opens, what a TLS peer
     // must prove, which filesystems exist
